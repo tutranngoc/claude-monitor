@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -14,6 +16,7 @@ var (
 			"Otherwise a comma-separated list of paths; each path can be a single "+
 			"Claude config dir or a parent directory containing several.")
 	flagVersion = flag.Bool("version", false, "Print version and exit")
+	flagUpgrade = flag.Bool("upgrade", false, "Download and install the latest release, then exit")
 )
 
 // version is wired by ldflags via the Makefile.
@@ -36,12 +39,38 @@ func main() {
 		return
 	}
 
+	if *flagUpgrade {
+		if err := runUpgrade(); err != nil {
+			die("upgrade failed: %v", err)
+		}
+		return
+	}
+
 	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
 
 	p := tea.NewProgram(initialModel(*flagRoot, cfg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		die("tui error: %v", err)
 	}
+}
+
+func runUpgrade() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	info, err := fetchLatestRelease(ctx)
+	if err != nil {
+		return err
+	}
+	if !isNewerVersion(info.LatestTag, version) {
+		fmt.Printf("already on latest (%s)\n", version)
+		return nil
+	}
+	fmt.Printf("upgrading %s → %s\n", version, info.LatestTag)
+	if err := PerformUpgrade(ctx, info); err != nil {
+		return err
+	}
+	fmt.Printf("✓ upgraded to %s\n", info.LatestTag)
+	return nil
 }
 
 func die(format string, a ...any) {

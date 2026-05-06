@@ -40,6 +40,23 @@ type refreshMsg struct {
 // "kick toggled", etc).
 type flashClearMsg struct{}
 
+// updateCheckMsg carries the result of the background GitHub-Releases
+// check that fires once on Init. info==nil means "no update available
+// or the check failed silently"; either way the banner stays hidden.
+type updateCheckMsg struct {
+	info *UpdateInfo
+}
+
+// upgradeDoneMsg is the result of a [u]-triggered self-replace.
+type upgradeDoneMsg struct {
+	tag string
+	err error
+}
+
+// upgradeQuitMsg fires a few seconds after a successful upgrade so the
+// user has time to read "✓ upgraded" before the TUI tears down.
+type upgradeQuitMsg struct{}
+
 // ----------------------------------------------------------------------
 // Model
 // ----------------------------------------------------------------------
@@ -72,6 +89,12 @@ type model struct {
 	flash       string
 	flashExpiry time.Time
 
+	// Update state. updateInfo is populated asynchronously on Init by
+	// CheckForUpdate; nil means no banner. upgrading is true while a
+	// [u]-triggered self-replace is downloading.
+	updateInfo *UpdateInfo
+	upgrading  bool
+
 	width    int
 	height   int
 	showHelp bool
@@ -99,7 +122,26 @@ func (m model) Init() tea.Cmd {
 		m.refreshCmd(m.inflight),
 		tickCmd(RefreshIntervalSeconds),
 		secondTickCmd(),
+		updateCheckCmd(version),
 	)
+}
+
+func updateCheckCmd(currentVersion string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		info, _ := CheckForUpdate(ctx, currentVersion)
+		return updateCheckMsg{info: info}
+	}
+}
+
+func upgradeCmd(info *UpdateInfo) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+		err := PerformUpgrade(ctx, info)
+		return upgradeDoneMsg{tag: info.LatestTag, err: err}
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -245,6 +287,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Re-arm; the tick exists purely to force a re-render so live
 		// countdowns advance. View() recomputes everything from state.
 		return m, secondTickCmd()
+
+	case updateCheckMsg:
+		m.updateInfo = msg.info
+		return m, nil
+
+	case upgradeDoneMsg:
+		m.upgrading = false
+		if msg.err != nil {
+			m.flash = "upgrade failed: " + truncate(msg.err.Error(), 80)
+			m.flashExpiry = time.Now().Add(5 * time.Second)
+			return m, flashClearCmd(5 * time.Second)
+		}
+		m.flash = fmt.Sprintf("✓ upgraded to %s — restart claude-monitor", msg.tag)
+		m.flashExpiry = time.Now().Add(4 * time.Second)
+		m.updateInfo = nil
+		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return upgradeQuitMsg{} })
+
+	case upgradeQuitMsg:
+		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -289,6 +350,18 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.editor = editorState{}
 		}
 		return m, nil
+
+	case "u":
+		// Visible-only hotkey: ignore unless an update is genuinely
+		// available and we're not already mid-upgrade. The help bar
+		// only advertises [u] when m.updateInfo != nil.
+		if m.updateInfo == nil || m.upgrading {
+			return m, nil
+		}
+		m.upgrading = true
+		m.flash = "downloading " + m.updateInfo.LatestTag + "…"
+		m.flashExpiry = time.Now().Add(150 * time.Second)
+		return m, upgradeCmd(m.updateInfo)
 
 	case "?":
 		m.showHelp = !m.showHelp
@@ -357,7 +430,17 @@ func (m model) header(st styles) string {
 		flash = "   " + st.flash.Render(m.flash)
 	}
 
-	return st.headerBar.Render(title+"   "+status) + flash
+	// Update banner sits between header and flash so it stays visible
+	// even when transient flashes come and go.
+	upd := ""
+	switch {
+	case m.upgrading:
+		upd = "   " + st.accent.Render("upgrading…")
+	case m.updateInfo != nil:
+		upd = "   " + st.warn.Render(fmt.Sprintf("⬆ %s available — press [u]", m.updateInfo.LatestTag))
+	}
+
+	return st.headerBar.Render(title+"   "+status) + upd + flash
 }
 
 func (m model) table(st styles) string {
@@ -458,6 +541,14 @@ func (m model) helpBar(st styles) string {
 		st.key.Render("[r]") + " refresh",
 		st.key.Render("[?]") + " toggle help",
 		st.key.Render("[q]") + " quit",
+	}
+	// [u] is intentionally hidden when no update is advertised; surface
+	// it (prepended so it leads the row) only when CheckForUpdate
+	// returned a non-nil UpdateInfo.
+	if m.updateInfo != nil && !m.upgrading {
+		parts = append([]string{
+			fmt.Sprintf("%s upgrade %s", st.key.Render("[u]"), m.updateInfo.LatestTag),
+		}, parts...)
 	}
 	return st.helpBar.Render(strings.Join(parts, "   "))
 }

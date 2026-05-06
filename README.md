@@ -49,6 +49,14 @@ make install              # -> $HOME/bin/claude-monitor
 make install INSTALL_DIR=/usr/local/bin
 ```
 
+### Upgrades
+
+The TUI checks GitHub Releases once on launch (cached for 24h at `~/.claude-monitor/update-check.json`). When a newer tag exists you'll see a `⬆ vX.Y.Z available — press [u]` banner in the header; pressing `u` downloads the binary, ad-hoc codesigns it, and atomically replaces the running executable. From the shell:
+
+```sh
+claude-monitor --upgrade   # same flow without the TUI
+```
+
 ## Run
 
 ```sh
@@ -82,14 +90,15 @@ Paths are deduped by canonical (symlink-resolved) absolute path.
 
 ## Hotkeys
 
-| Key | Action                                                                |
-|-----|-----------------------------------------------------------------------|
-| `r` | Refresh now (interrupts an in-flight refresh; feels instant)          |
-| `k` | Toggle **auto-kick** — start the 5h window when an account is at 0%   |
-| `s` | Toggle **auto-swap** — rotate the OAuth slot among accounts           |
-| `e` | Open the settings editor (swap thresholds, pick order, rebalance)     |
-| `?` | Show / hide the help bar                                              |
-| `q` | Quit (also `Esc`, `Ctrl+C`)                                           |
+| Key | Action                                                                   |
+|-----|--------------------------------------------------------------------------|
+| `r` | Refresh now (interrupts an in-flight refresh; feels instant)             |
+| `k` | Toggle **auto-kick** — start the 5h window when an account is at 0%      |
+| `s` | Toggle **auto-swap** — rotate the OAuth slot among accounts              |
+| `e` | Open the settings editor (swap thresholds, pick order, rebalance)        |
+| `u` | Upgrade to the latest release *(only shown when an update is available)* |
+| `?` | Show / hide the help bar                                                 |
+| `q` | Quit (also `Esc`, `Ctrl+C`)                                              |
 
 ## Output
 
