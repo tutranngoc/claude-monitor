@@ -27,10 +27,13 @@ type secondTickMsg struct{}
 // refresh was launched so that stale results from a superseded refresh
 // can be dropped silently.
 type refreshMsg struct {
-	rows    []AccountUsage
-	err     error
-	at      time.Time
-	version uint64
+	rows      []AccountUsage
+	activeDir string
+	swap      *SwapEvent
+	swapErr   error
+	err       error
+	at        time.Time
+	version   uint64
 }
 
 // flashClearMsg clears a transient status banner (used for "config saved",
@@ -46,6 +49,10 @@ type model struct {
 	root string
 
 	rows        []AccountUsage
+	activeDir   string
+	lastSwap    *SwapEvent
+	swapErr     error
+	prevUtil    map[string]float64
 	err         error
 	lastRefresh time.Time
 	refreshing  bool
@@ -68,6 +75,9 @@ type model struct {
 	width    int
 	height   int
 	showHelp bool
+
+	editing bool
+	editor  editorState
 }
 
 func initialModel(root string, cfg Config) model {
@@ -80,13 +90,14 @@ func initialModel(root string, cfg Config) model {
 		inflight:   1,
 		refreshing: true,
 		backoff:    map[string]time.Time{},
+		prevUtil:   map[string]float64{},
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		m.refreshCmd(m.inflight),
-		tickCmd(m.cfg.IntervalSeconds),
+		tickCmd(RefreshIntervalSeconds),
 		secondTickCmd(),
 	)
 }
@@ -97,18 +108,36 @@ func (m model) Init() tea.Cmd {
 
 func (m *model) refreshCmd(version uint64) tea.Cmd {
 	root := m.root
-	autoKick := m.cfg.AutoKick
-	// Snapshot the backoff map so the goroutine has a stable view, even
-	// if the user presses 'R' (which mutates m.backoff) while in flight.
+	cfg := m.cfg
+	// Snapshot the backoff map and prev-util map so the goroutine has a
+	// stable view, even if the user presses 'R' (which mutates
+	// m.backoff) or another tick fires while in flight.
 	skipUntil := make(map[string]time.Time, len(m.backoff))
 	for k, v := range m.backoff {
 		skipUntil[k] = v
 	}
+	prev := make(map[string]float64, len(m.prevUtil))
+	for k, v := range m.prevUtil {
+		prev[k] = v
+	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Auto-swap involves keychain writes (~hundreds of ms each), so
+		// give a more generous deadline when swapping is enabled.
+		deadline := 30 * time.Second
+		if cfg.AutoSwap {
+			deadline = 60 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		defer cancel()
-		rows, err := FetchAll(ctx, root, autoKick, skipUntil)
-		return refreshMsg{rows: rows, err: err, at: time.Now(), version: version}
+		res, err := FetchAll(ctx, root, cfg, skipUntil, prev)
+		msg := refreshMsg{err: err, at: time.Now(), version: version}
+		if res != nil {
+			msg.rows = res.Rows
+			msg.activeDir = res.ActiveDir
+			msg.swap = res.Swap
+			msg.swapErr = res.SwapErr
+		}
+		return msg
 	}
 }
 
@@ -140,13 +169,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.editing {
+			if next, cmd, consumed := m.handleEditKey(msg); consumed {
+				return next, cmd
+			}
+		}
 		return m.handleKey(msg)
 
 	case tickMsg:
 		// Schedule the next tick + kick a refresh if one isn't already in
 		// flight. We always re-arm the tick so the cadence stays steady
 		// even when the user has just done a manual refresh.
-		cmds := []tea.Cmd{tickCmd(m.cfg.IntervalSeconds)}
+		cmds := []tea.Cmd{tickCmd(RefreshIntervalSeconds)}
 		if !m.refreshing {
 			m.refreshing = true
 			m.inflight++
@@ -164,11 +198,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshing = false
 		m.rows = msg.rows
+		m.activeDir = msg.activeDir
 		m.err = msg.err
 		m.lastRefresh = msg.at
+		var swapCmd tea.Cmd
+		if msg.swap != nil {
+			m.lastSwap = msg.swap
+			m.flash = msg.swap.String()
+			m.flashExpiry = time.Now().Add(5 * time.Second)
+			swapCmd = flashClearCmd(5 * time.Second)
+		} else if msg.swapErr != nil {
+			m.swapErr = msg.swapErr
+			m.flash = "swap failed: " + truncate(msg.swapErr.Error(), 80)
+			m.flashExpiry = time.Now().Add(5 * time.Second)
+			swapCmd = flashClearCmd(5 * time.Second)
+		}
 		// Update backoff state from the row results: 429 errors
 		// arm/extend the window, while a successful row clears any
 		// pre-existing backoff for that account (recovery path).
+		// Also refresh prev-util so the next swap pass can detect
+		// fresh window resets.
+		next := make(map[string]float64, len(msg.rows))
 		for _, r := range msg.rows {
 			if r.ConfigDir == "" {
 				continue
@@ -179,9 +229,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if r.Err == nil && r.Usage != nil {
 				delete(m.backoff, r.ConfigDir)
+				next[r.ConfigDir] = fiveHourUtil(r.Usage)
 			}
 		}
-		return m, nil
+		m.prevUtil = next
+		return m, swapCmd
 
 	case flashClearMsg:
 		if time.Now().After(m.flashExpiry) {
@@ -217,41 +269,26 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			flashClearCmd(800*time.Millisecond),
 		)
 
-	case "R":
-		// Capital R: ignore backoff and force-retry every account. Use
-		// when you've manually waited out a 429 and don't want to wait
-		// for the cached window to expire.
-		for k := range m.backoff {
-			delete(m.backoff, k)
-		}
-		m.refreshing = true
-		m.inflight++
-		m.flash = "force refresh (cleared backoff)"
-		m.flashExpiry = time.Now().Add(2 * time.Second)
-		return m, tea.Batch(
-			m.refreshCmd(m.inflight),
-			flashClearCmd(2*time.Second),
-		)
-
 	case "k":
 		m.cfg.AutoKick = !m.cfg.AutoKick
 		m.persistAndFlash(fmt.Sprintf("auto-kick: %s", onOff(m.cfg.AutoKick)))
 		return m, flashClearCmd(2 * time.Second)
 
-	case "c":
-		m.cfg.Color = !m.cfg.Color
-		m.persistAndFlash(fmt.Sprintf("color: %s", onOff(m.cfg.Color)))
+	case "s":
+		m.cfg.AutoSwap = !m.cfg.AutoSwap
+		// When toggling swap on/off, drop the cached prev-util so the
+		// reset-rebalance trigger doesn't fire spuriously on the next
+		// refresh based on stale data from the previous mode.
+		m.prevUtil = map[string]float64{}
+		m.persistAndFlash(fmt.Sprintf("auto-swap: %s", onOff(m.cfg.AutoSwap)))
 		return m, flashClearCmd(2 * time.Second)
 
-	case "+", "=":
-		m.cfg.IntervalSeconds = stepInterval(m.cfg.IntervalSeconds, +1)
-		m.persistAndFlash(fmt.Sprintf("interval: %s", fmtInterval(m.cfg.IntervalSeconds)))
-		return m, tea.Batch(tickCmd(m.cfg.IntervalSeconds), flashClearCmd(2*time.Second))
-
-	case "-", "_":
-		m.cfg.IntervalSeconds = stepInterval(m.cfg.IntervalSeconds, -1)
-		m.persistAndFlash(fmt.Sprintf("interval: %s", fmtInterval(m.cfg.IntervalSeconds)))
-		return m, tea.Batch(tickCmd(m.cfg.IntervalSeconds), flashClearCmd(2*time.Second))
+	case "e":
+		m.editing = !m.editing
+		if !m.editing {
+			m.editor = editorState{}
+		}
+		return m, nil
 
 	case "?":
 		m.showHelp = !m.showHelp
@@ -275,13 +312,16 @@ func (m *model) persistAndFlash(text string) {
 
 func (m model) View() string {
 	var b strings.Builder
-	st := newStyles(m.cfg.Color)
+	st := newStyles(true)
 
 	b.WriteString(m.header(st))
 	b.WriteString("\n")
 	b.WriteString(m.table(st))
 	b.WriteString(m.peakLine(st))
-	if m.showHelp {
+	if m.editing {
+		b.WriteString("\n")
+		b.WriteString(m.editorView(st))
+	} else if m.showHelp {
 		b.WriteString("\n")
 		b.WriteString(m.helpBar(st))
 	}
@@ -302,7 +342,7 @@ func (m model) header(st styles) string {
 		status = st.errText.Render("error: " + m.err.Error())
 	default:
 		ago := now.Sub(m.lastRefresh).Truncate(time.Second)
-		next := time.Duration(m.cfg.IntervalSeconds)*time.Second - ago
+		next := time.Duration(RefreshIntervalSeconds)*time.Second - ago
 		if next < 0 {
 			next = 0
 		}
@@ -344,7 +384,7 @@ func (m model) table(st styles) string {
 		// backoff map so the seconds tick down on screen.
 		if until, ok := m.backoff[r.ConfigDir]; ok && now.Before(until) {
 			remaining := until.Sub(now).Round(time.Second)
-			label := accountLabel(r)
+			label := m.decorateLabel(st, r, accountLabel(r))
 			msg := fmt.Sprintf("rate limited (retry in %s)", remaining)
 			line := padRight(st.colHeader.Render(label), widths[0]) +
 				"  " + st.warn.Render(msg)
@@ -353,7 +393,7 @@ func (m model) table(st styles) string {
 			continue
 		}
 		if r.Err != nil {
-			label := accountLabel(r)
+			label := m.decorateLabel(st, r, accountLabel(r))
 			line := padRight(st.colHeader.Render(label), widths[0]) +
 				"  " + st.errText.Render(truncate(r.Err.Error(), m.width-widths[0]-4))
 			b.WriteString(line)
@@ -362,7 +402,7 @@ func (m model) table(st styles) string {
 		}
 		u := r.Usage
 		cells := []string{
-			st.account.Render(accountLabel(r)),
+			st.account.Render(m.decorateLabel(st, r, accountLabel(r))),
 			renderBarPct(st, fiveHourUtil(u), bw),
 			renderResetsAt(st, getResets(u.FiveHour), now),
 			renderBarPct(st, getUtil(u.SevenDay), bw),
@@ -413,10 +453,9 @@ func (m model) peakLine(st styles) string {
 func (m model) helpBar(st styles) string {
 	parts := []string{
 		fmt.Sprintf("%s auto-kick: %s", st.key.Render("[k]"), boolBadge(st, m.cfg.AutoKick)),
-		fmt.Sprintf("%s color: %s", st.key.Render("[c]"), boolBadge(st, m.cfg.Color)),
-		fmt.Sprintf("%s interval: %s", st.key.Render("[+/-]"), st.value.Render(fmtInterval(m.cfg.IntervalSeconds))),
+		fmt.Sprintf("%s auto-swap: %s", st.key.Render("[s]"), boolBadge(st, m.cfg.AutoSwap)),
+		st.key.Render("[e]") + " edit",
 		st.key.Render("[r]") + " refresh",
-		st.key.Render("[R]") + " force (clear backoff)",
 		st.key.Render("[?]") + " toggle help",
 		st.key.Render("[q]") + " quit",
 	}
@@ -517,9 +556,19 @@ func sumWidths(w []int) int {
 
 func accountLabel(r AccountUsage) string {
 	if r.Email != "" {
-		return fmt.Sprintf("%s (%s)", r.Name, r.Email)
+		return r.Email
 	}
 	return r.Name
+}
+
+// decorateLabel prefixes a ★ to the label of whichever row currently
+// owns the plain keychain slot, so the user can tell at a glance which
+// account a default `claude` tab is talking to right now.
+func (m model) decorateLabel(st styles, r AccountUsage, label string) string {
+	if r.ConfigDir != "" && r.ConfigDir == m.activeDir {
+		return st.kicked.Render("★ ") + label
+	}
+	return "  " + label
 }
 
 func getUtil(w *Window) float64 {
@@ -538,17 +587,6 @@ func getResets(w *Window) *time.Time {
 
 func fmtPct(p float64) string {
 	return fmt.Sprintf("%3.0f%%", p)
-}
-
-func fmtInterval(s int) string {
-	d := time.Duration(s) * time.Second
-	if d >= time.Hour {
-		return d.Truncate(time.Hour).String()
-	}
-	if d >= time.Minute {
-		return d.Truncate(time.Minute).String()
-	}
-	return d.String()
 }
 
 func onOff(b bool) string {

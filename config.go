@@ -7,23 +7,56 @@ import (
 )
 
 // Config is persisted to ~/.claude-monitor/config.json so that toggles set
-// in the TUI (auto-kick, refresh interval, color) survive restarts.
+// in the TUI (auto-kick, auto-swap, swap thresholds, …) survive restarts.
+//
+// Refresh interval is hardcoded to 60s and color rendering is always on
+// — both used to be user-configurable but the toggles weren't earning
+// their keep, so the surface area shrank to the things the user
+// actually wants to tweak (the auto-swap behavior).
 type Config struct {
-	AutoKick        bool `json:"autoKick"`
-	IntervalSeconds int  `json:"intervalSeconds"`
-	Color           bool `json:"color"`
+	AutoKick bool `json:"autoKick"`
+
+	// Auto-swap rotates the OAuth token in the default keychain slot
+	// ("Claude Code-credentials") among the discovered accounts so a
+	// running plain `claude` tab transparently picks up a fresh quota
+	// when the active account is near its 5h limit.
+	AutoSwap bool `json:"autoSwap"`
+
+	// SwapThresholds is an ascending cascade of 5h utilization tiers.
+	// Default [90, 99, 100]: try to swap when the active account hits
+	// 90% to a candidate below 90; if no candidate exists, wait until
+	// 99% and retry against candidates < 99; finally 100% / < 100.
+	SwapThresholds []float64 `json:"swapThresholds"`
+
+	// PickOrder controls how a swap target is chosen among eligible
+	// candidates. "lowest" prefers the freshest account (default,
+	// spreads load); "highest" drains accounts one at a time.
+	PickOrder string `json:"pickOrder"`
+
+	// RebalanceOnReset, when true, swaps to any non-active account
+	// whose 5h window just reset (util went from positive to ~0
+	// between refreshes). Independent of the threshold cascade —
+	// fires even when active is well below 90%.
+	RebalanceOnReset bool `json:"rebalanceOnReset"`
 }
 
-// IntervalChoices is the set of refresh intervals the +/- hotkeys cycle
-// through. Min is 60s on purpose — /api/oauth/usage is undocumented and
-// hammering it would invite rate-limiting.
-var IntervalChoices = []int{60, 120, 300, 600}
+const (
+	PickOrderLowest  = "lowest"
+	PickOrderHighest = "highest"
+)
+
+// RefreshIntervalSeconds is the fixed cadence at which the dashboard
+// re-fetches /api/oauth/usage. Hardcoded because the API is undocumented
+// and 60s was the safe lower bound we settled on against rate-limiting.
+const RefreshIntervalSeconds = 60
 
 func defaultConfig() Config {
 	return Config{
-		AutoKick:        false,
-		IntervalSeconds: 60,
-		Color:           true,
+		AutoKick:         false,
+		AutoSwap:         false,
+		SwapThresholds:   []float64{90, 99, 100},
+		PickOrder:        PickOrderLowest,
+		RebalanceOnReset: true,
 	}
 }
 
@@ -50,8 +83,48 @@ func LoadConfig() (Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return defaultConfig(), err
 	}
-	cfg.IntervalSeconds = clampInterval(cfg.IntervalSeconds)
+	cfg.SwapThresholds = sanitizeThresholds(cfg.SwapThresholds)
+	cfg.PickOrder = sanitizePickOrder(cfg.PickOrder)
 	return cfg, nil
+}
+
+// sanitizeThresholds clamps each value to [0, 100], drops duplicates and
+// sorts ascending. An empty list falls back to the default cascade so the
+// swap logic always has at least one tier to evaluate.
+func sanitizeThresholds(in []float64) []float64 {
+	if len(in) == 0 {
+		return []float64{90, 99, 100}
+	}
+	seen := map[float64]struct{}{}
+	out := make([]float64, 0, len(in))
+	for _, v := range in {
+		if v < 0 {
+			v = 0
+		}
+		if v > 100 {
+			v = 100
+		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}
+
+func sanitizePickOrder(s string) string {
+	switch s {
+	case PickOrderLowest, PickOrderHighest:
+		return s
+	default:
+		return PickOrderLowest
+	}
 }
 
 func SaveConfig(cfg Config) error {
@@ -69,49 +142,3 @@ func SaveConfig(cfg Config) error {
 	return os.WriteFile(path, b, 0o644)
 }
 
-// clampInterval snaps an arbitrary value to the nearest allowed choice
-// (defensive against hand-edited config files).
-func clampInterval(v int) int {
-	if v < IntervalChoices[0] {
-		return IntervalChoices[0]
-	}
-	for _, c := range IntervalChoices {
-		if v == c {
-			return v
-		}
-	}
-	// Pick the closest choice.
-	best := IntervalChoices[0]
-	bestDiff := abs(v - best)
-	for _, c := range IntervalChoices[1:] {
-		if d := abs(v - c); d < bestDiff {
-			best, bestDiff = c, d
-		}
-	}
-	return best
-}
-
-// stepInterval returns the next interval in IntervalChoices, dir > 0 for
-// "longer", dir < 0 for "shorter". Saturates at the ends.
-func stepInterval(cur, dir int) int {
-	for i, c := range IntervalChoices {
-		if c == cur {
-			j := i + dir
-			if j < 0 {
-				j = 0
-			}
-			if j >= len(IntervalChoices) {
-				j = len(IntervalChoices) - 1
-			}
-			return IntervalChoices[j]
-		}
-	}
-	return clampInterval(cur)
-}
-
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}

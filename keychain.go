@@ -88,12 +88,43 @@ func defaultClaudeDir() string {
 // account config dir. Returns an error when no candidate service name
 // matched — callers should treat that as "not authenticated".
 func LoadCredentials(configDir string) (*OAuthCreds, error) {
+	return loadCredsFromCandidates(keychainCandidates(configDir))
+}
+
+// LoadCredentialsHashedFirst is the variant used by the monitor when
+// auto-swap is on: it always reads the per-dir hashed entry first, even
+// for the default ~/.claude. After the first swap, the plain entry no
+// longer represents the default account (it's been overwritten with
+// some other account's creds), so reading hashed-first keeps the
+// dashboard row pointing at the original account's parked credentials.
+//
+// Falls back to plain when the hashed entry doesn't exist (clean install
+// pre-park, or AutoSwap was just turned on).
+func LoadCredentialsHashedFirst(configDir string) (*OAuthCreds, error) {
+	hashed := keychainServiceFor(configDir)
+	const plain = "Claude Code-credentials"
+	return loadCredsFromCandidates([]string{hashed, plain})
+}
+
+// LoadCredentialsByService reads creds for an explicit service name.
+// Used by the swap module to read source creds (the target account's
+// hashed entry) and to inspect the plain "active slot" without going
+// through the configDir → service-name machinery.
+func LoadCredentialsByService(svc string) (*OAuthCreds, error) {
+	u, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("user lookup: %w", err)
+	}
+	return readKeychainEntry(u.Username, svc)
+}
+
+func loadCredsFromCandidates(svcs []string) (*OAuthCreds, error) {
 	u, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("user lookup: %w", err)
 	}
 	var lastErr error
-	for _, svc := range keychainCandidates(configDir) {
+	for _, svc := range svcs {
 		creds, err := readKeychainEntry(u.Username, svc)
 		if err == nil {
 			return creds, nil
@@ -117,4 +148,34 @@ func readKeychainEntry(username, svc string) (*OAuthCreds, error) {
 		return nil, fmt.Errorf("no access token in keychain entry %q", svc)
 	}
 	return &env.ClaudeAiOauth, nil
+}
+
+// WriteKeychainEntry creates or updates a generic-password entry holding
+// the OAuth creds envelope Claude Code expects. -U makes the call
+// idempotent (update existing, create when missing); -A grants access to
+// any application without prompting, which mirrors how Claude Code's own
+// installer registers its entries — without it, the `claude` binary
+// would hit a Touch ID / "allow access" dialog on every read after we
+// rewrite the entry.
+func WriteKeychainEntry(svc string, creds *OAuthCreds) error {
+	u, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("user lookup: %w", err)
+	}
+	payload, err := json.Marshal(credsEnvelope{ClaudeAiOauth: *creds})
+	if err != nil {
+		return fmt.Errorf("encode credentials: %w", err)
+	}
+	cmd := exec.Command("security", "add-generic-password",
+		"-U",
+		"-A",
+		"-s", svc,
+		"-a", u.Username,
+		"-w", string(payload),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("keychain write %q: %w (%s)", svc, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

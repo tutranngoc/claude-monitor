@@ -25,18 +25,34 @@ type AccountUsage struct {
 	Kicked  bool
 	KickErr error
 
-	accessToken string // retained for the auto-kick pass; not exported
+	accessToken  string // retained for the auto-kick pass; not exported
+	refreshToken string // used by swap module to identify which account currently owns the plain keychain slot
+}
+
+// FetchResult bundles the per-snapshot data the TUI needs from a single
+// refresh: the rows, plus auto-swap outcome (which account is currently
+// behind the plain `claude` slot, and whether a rotation just happened).
+type FetchResult struct {
+	Rows      []AccountUsage
+	ActiveDir string
+	Swap      *SwapEvent
+	SwapErr   error
 }
 
 // FetchAll resolves accounts according to rootSpec, queries
 // /api/oauth/usage for each in parallel, optionally kicks any account
-// whose 5h window is at 0%, and returns the table rows. It is the single
-// data source the TUI calls on every tick.
+// whose 5h window is at 0%, and (when cfg.AutoSwap is on) rotates the
+// plain keychain slot to a fresher account. Returns the snapshot the
+// TUI renders.
 //
 // skipUntil maps a config dir to a "do not call API before" timestamp;
 // accounts in the backoff window get a synthetic row reflecting the
 // remaining wait, so the UI keeps showing them but no request goes out.
-func FetchAll(ctx context.Context, rootSpec string, autoKick bool, skipUntil map[string]time.Time) ([]AccountUsage, error) {
+//
+// prevUtil carries the previous tick's 5h utilization per config dir,
+// used by the swap module to detect window resets between refreshes.
+// Pass nil on the very first refresh.
+func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[string]time.Time, prevUtil map[string]float64) (*FetchResult, error) {
 	accts, err := ResolveAccountDirs(rootSpec)
 	if err != nil {
 		return nil, err
@@ -65,15 +81,50 @@ func FetchAll(ctx context.Context, rootSpec string, autoKick bool, skipUntil map
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rows[i] = fetchOne(ctx, a)
+			rows[i] = fetchOne(ctx, a, cfg.AutoSwap)
 		}()
 	}
 	wg.Wait()
 
-	if autoKick {
+	if cfg.AutoKick {
 		runAutoKick(ctx, rows)
 	}
-	return rows, nil
+
+	result := &FetchResult{Rows: rows}
+	result.ActiveDir = detectActiveDir(rows)
+	if cfg.AutoSwap {
+		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, cfg); target != nil {
+			active := findRow(rows, result.ActiveDir)
+			ev := &SwapEvent{
+				FromName: rowDisplayName(active),
+				ToName:   target.Name,
+				FromUtil: rowFiveHourUtil(active),
+				ToUtil:   fiveHourUtil(target.Usage),
+				Reason:   reason,
+			}
+			if err := executeSwap(rows, result.ActiveDir, target.ConfigDir); err != nil {
+				result.SwapErr = err
+			} else {
+				result.Swap = ev
+				result.ActiveDir = target.ConfigDir
+			}
+		}
+	}
+	return result, nil
+}
+
+func rowDisplayName(r *AccountUsage) string {
+	if r == nil {
+		return "?"
+	}
+	return r.Name
+}
+
+func rowFiveHourUtil(r *AccountUsage) float64 {
+	if r == nil {
+		return 0
+	}
+	return fiveHourUtil(r.Usage)
 }
 
 // runAutoKick fires a 1-token message at every account whose 5h window is
@@ -258,9 +309,16 @@ func dirExists(p string) bool {
 	return err == nil && info.IsDir()
 }
 
-func fetchOne(ctx context.Context, a discoveredAccount) AccountUsage {
+func fetchOne(ctx context.Context, a discoveredAccount, autoSwap bool) AccountUsage {
 	row := AccountUsage{Name: a.name, ConfigDir: a.configDir, Email: a.email}
-	creds, err := LoadCredentials(a.configDir)
+	// When auto-swap is on, prefer the per-dir hashed entry so the
+	// dashboard still shows each account's real usage even after the
+	// plain slot has been rotated to impersonate a different account.
+	loader := LoadCredentials
+	if autoSwap {
+		loader = LoadCredentialsHashedFirst
+	}
+	creds, err := loader(a.configDir)
 	if err != nil {
 		row.Err = fmt.Errorf("no token (run `claude` once to login)")
 		return row
@@ -276,6 +334,7 @@ func fetchOne(ctx context.Context, a discoveredAccount) AccountUsage {
 	}
 	row.Usage = usage
 	row.accessToken = creds.AccessToken
+	row.refreshToken = creds.RefreshToken
 	return row
 }
 
@@ -293,8 +352,35 @@ func looksLikeClaudeDir(path string) bool {
 
 // readAccountEmail extracts oauthAccount.emailAddress from .claude.json
 // without unmarshalling the whole 24KB blob.
+//
+// Claude Code stores the config file in two different layouts:
+//
+//   - With CLAUDE_CONFIG_DIR set (e.g. ~/.claude-gem): the file lives
+//     *inside* the config dir as <configDir>/.claude.json.
+//   - With no env override (the default ~/.claude account): the file
+//     lives in $HOME as ~/.claude.json — a sibling of the dir, not a
+//     child. The ~/.claude dir itself only holds sessions/projects.
+//
+// We try the in-dir path first and fall back to the sibling layout so
+// the default-account row gets a real email instead of just a folder
+// name.
 func readAccountEmail(configDir string) string {
-	b, err := os.ReadFile(filepath.Join(configDir, ".claude.json"))
+	candidates := []string{filepath.Join(configDir, ".claude.json")}
+	if configDir == defaultClaudeDir() {
+		if home, err := os.UserHomeDir(); err == nil {
+			candidates = append(candidates, filepath.Join(home, ".claude.json"))
+		}
+	}
+	for _, p := range candidates {
+		if email := emailFromClaudeJSON(p); email != "" {
+			return email
+		}
+	}
+	return ""
+}
+
+func emailFromClaudeJSON(path string) string {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
