@@ -91,9 +91,13 @@ type model struct {
 
 	// Update state. updateInfo is populated asynchronously on Init by
 	// CheckForUpdate; nil means no banner. upgrading is true while a
-	// [u]-triggered self-replace is downloading.
-	updateInfo *UpdateInfo
-	upgrading  bool
+	// [u]-triggered self-replace is downloading. UpgradeRestart is read
+	// by main() after Run() returns: true means "we successfully
+	// replaced the binary, please re-exec yourself so the user lands
+	// in the new version's TUI without typing the command again".
+	updateInfo     *UpdateInfo
+	upgrading      bool
+	UpgradeRestart bool
 
 	width    int
 	height   int
@@ -299,10 +303,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flashExpiry = time.Now().Add(5 * time.Second)
 			return m, flashClearCmd(5 * time.Second)
 		}
-		m.flash = fmt.Sprintf("✓ upgraded to %s — restart claude-monitor", msg.tag)
-		m.flashExpiry = time.Now().Add(4 * time.Second)
+		// On Unix main() will syscall.Exec back into the new binary
+		// after Quit tears down the alt-screen, so the user lands
+		// straight back in the dashboard. The 1.2s flash is just long
+		// enough for them to read the success line before the screen
+		// flips to the new TUI.
+		m.flash = fmt.Sprintf("✓ upgraded to %s — restarting…", msg.tag)
+		m.flashExpiry = time.Now().Add(2 * time.Second)
 		m.updateInfo = nil
-		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return upgradeQuitMsg{} })
+		m.UpgradeRestart = true
+		return m, tea.Tick(1200*time.Millisecond, func(time.Time) tea.Msg { return upgradeQuitMsg{} })
 
 	case upgradeQuitMsg:
 		return m, tea.Quit

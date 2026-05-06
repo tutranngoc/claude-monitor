@@ -53,8 +53,18 @@ func main() {
 	cfg, _ := LoadConfig() // missing/corrupt → defaults; not fatal
 
 	p := tea.NewProgram(initialModel(*flagRoot, cfg), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if err != nil {
 		die("tui error: %v", err)
+	}
+	// Auto-restart after a successful in-app [u]-upgrade so the user
+	// lands back in the dashboard running the new version, without
+	// having to re-type the command. On Windows this is a no-op
+	// (restartSelf prints a hint instead — see restart_windows.go).
+	if mm, ok := final.(model); ok && mm.UpgradeRestart {
+		if err := restartSelf(); err != nil {
+			fmt.Fprintf(os.Stderr, "auto-restart failed: %v\nrun `claude-monitor` to use the new version.\n", err)
+		}
 	}
 }
 
