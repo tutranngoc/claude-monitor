@@ -1,66 +1,36 @@
 # claude-monitor
 
-A real-time terminal dashboard for **multiple Claude Code accounts at once**, sharing the same data source as `/usage` inside Claude Code (`GET /api/oauth/usage`). Refreshes itself, persists settings, and can auto-kick a fresh 5h window when an account hits 0%.
+Real-time terminal dashboard for **multiple Claude Code accounts**, backed by the same data source as `/usage` inside Claude Code (`GET /api/oauth/usage`). Refreshes on a fixed cadence, persists settings, optionally kicks a fresh 5h window when an account is at 0%, and optionally rotates the OAuth slot a default `claude` tab reads from so the active account stays under quota.
 
 ```
  claude-monitor   refreshed 4s ago   next in 56s   accounts: 8
 
  ACCOUNT             5H                              RESETS      WEEKLY                          RESETS      SONNET WK  OPUS WK
  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- acc-be-1            92% ███████████████████████░░  in 1h37m     8% ██░░░░░░░░░░░░░░░░░░░░░░░  in 2d10h     0%        —
- acc-be-2            96% ████████████████████████░  in 1h07m    14% ███░░░░░░░░░░░░░░░░░░░░░░  in 3d1h      —         —
- acc-be-3           100% █████████████████████████  in 1h07m    14% ███░░░░░░░░░░░░░░░░░░░░░░  in 5d9h      —         —
- acc-data            41% ██████████░░░░░░░░░░░░░░░  in 47m      20% █████░░░░░░░░░░░░░░░░░░░░  in 5d16h     —         —
- acc-fe-1             0% ░░░░░░░░░░░░░░░░░░░░░░░░░  —            6% █░░░░░░░░░░░░░░░░░░░░░░░░  in 1d19h     0%        —    [kicked]
- acc-tester          51% ████████████░░░░░░░░░░░░░  in 2h07m     7% █░░░░░░░░░░░░░░░░░░░░░░░░  in 4d5h      —         —
- acc-shared          HTTP 403: OAuth not allowed for org…
- acc-personal        token expired (run `claude` once to refresh)
+ ★ acc-be-1          92% ███████████████████████░░  in 1h37m     8% ██░░░░░░░░░░░░░░░░░░░░░░░  in 2d10h     0%        —
+   acc-be-2          96% ████████████████████████░  in 1h07m    14% ███░░░░░░░░░░░░░░░░░░░░░░  in 3d1h      —         —
+   acc-be-3         100% █████████████████████████  in 1h07m    14% ███░░░░░░░░░░░░░░░░░░░░░░  in 5d9h      —         —
+   acc-data          41% ██████████░░░░░░░░░░░░░░░  in 47m      20% █████░░░░░░░░░░░░░░░░░░░░  in 5d16h     —         —
+   acc-fe-1           0% ░░░░░░░░░░░░░░░░░░░░░░░░░  —            6% █░░░░░░░░░░░░░░░░░░░░░░░░  in 1d19h     0%        —    [kicked]
+   acc-tester        51% ████████████░░░░░░░░░░░░░  in 2h07m     7% █░░░░░░░░░░░░░░░░░░░░░░░░  in 4d5h      —         —
+   acc-shared        rate limited (retry in 3m12s)
+   acc-personal      token expired (run `claude` once to refresh)
  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  PEAK across 6 account(s):  5h 100%   weekly  20%
 
- [k] auto-kick: ON   [c] color: ON   [+/-] interval: 1m0s   [r] refresh   [?] toggle help   [q] quit
+ [k] auto-kick: ON   [s] auto-swap: ON   [e] edit   [r] refresh   [?] toggle help   [q] quit
 ```
-
-## Use case
-
-You run multiple Claude Code accounts in parallel — either as separate top-level config dirs (`~/.claude`, `~/.claude-gem`, …) or grouped under one parent (`~/.claude-account/be-1`, `~/.claude-account/be-2`, …). `claude-monitor` figures out which layout you're using:
-
-```sh
-# Layout A — top-level dirs in $HOME (no setup needed; auto-discovered):
-~/.claude/
-~/.claude-gem/
-~/.claude-work/
-
-# Layout B — one parent containing several account subdirs:
-~/.claude-account/be-1/
-~/.claude-account/be-2/
-~/.claude-account/data/
-```
-
-Pulls each account's OAuth token from the macOS Keychain, calls Anthropic's `/api/oauth/usage` for each in parallel, and keeps a live dashboard updated on a tunable interval (default 60s).
-
-### Account discovery
-
-| `--root` value             | Behaviour                                                                            |
-|----------------------------|--------------------------------------------------------------------------------------|
-| _(omitted)_                | Auto-discover every `~/.claude*` directory in `$HOME`.                               |
-| `~/.claude-account`        | Treat as a parent; each subdir that looks like a Claude config dir is one account.   |
-| `~/.claude,~/.claude-gem`  | Comma-separated list. Each item can be a single config dir OR a parent.              |
-| `~/work-claudes`           | Single path. Same single-vs-parent autodetection applies.                            |
-
-Paths are deduped by their resolved (symlink-followed) absolute path.
 
 ## Requirements
 
-- macOS (uses the `security` CLI to read the Keychain — Linux/Windows not supported yet)
-- Go 1.22+ (we use Go 1.24 toolchain features)
-- `make` (optional)
-- Logged in at least once per account (`CLAUDE_CONFIG_DIR=... claude`) — Claude Code stores the OAuth token in the Keychain automatically
+- **macOS** — uses the `security` CLI to read the Keychain
+- **Go 1.22+**
+- Each account must have logged in once (`CLAUDE_CONFIG_DIR=… claude`) so its OAuth token is in the Keychain
 
-## Build & install
+## Install
 
 ```sh
-make build              # -> ./bin/claude-monitor (ad-hoc codesigned)
+make build              # -> ./bin/claude-monitor (ad-hoc codesigned on darwin)
 make install            # -> $HOME/bin/claude-monitor
 make install INSTALL_DIR=/usr/local/bin
 ```
@@ -69,102 +39,134 @@ make install INSTALL_DIR=/usr/local/bin
 
 ```sh
 claude-monitor                                  # auto-discover ~/.claude* in $HOME
-claude-monitor --root ~/.claude-account         # single parent dir holding sub-accounts
-claude-monitor --root ~/.claude,~/.claude-gem   # comma-separated list of dirs
+claude-monitor --root ~/.claude-account         # parent dir holding sub-accounts
+claude-monitor --root ~/.claude,~/.claude-gem   # comma-separated list
 claude-monitor --version
 ```
 
-That's it for flags — every other option is toggled in-app.
+Every other option is toggled in-app and persisted to `~/.claude-monitor/config.json`.
+
+## Account discovery
+
+Two layouts are supported and auto-detected:
+
+```sh
+# A — top-level dirs in $HOME (auto-discovered, no flag needed)
+~/.claude/  ~/.claude-gem/  ~/.claude-work/
+
+# B — one parent dir whose subdirectories are accounts
+~/.claude-account/be-1/  ~/.claude-account/be-2/  …
+```
+
+| `--root` value             | Behaviour                                                                          |
+|----------------------------|------------------------------------------------------------------------------------|
+| _(omitted)_                | Auto-discover every `~/.claude*` directory in `$HOME`.                             |
+| `~/.claude-account`        | Treat as a parent; each subdir that looks like a Claude config dir is one account. |
+| `~/.claude,~/.claude-gem`  | Comma-separated. Each item can be a single config dir OR a parent.                 |
+
+Paths are deduped by canonical (symlink-resolved) absolute path.
 
 ## Hotkeys
 
-| Key      | Action                                                 |
-|----------|--------------------------------------------------------|
-| `q`      | quit                                                   |
-| `r`      | refresh now (skipped if a refresh is already in flight) |
-| `k`      | toggle auto-kick (start the next 5h window when 0%)    |
-| `c`      | toggle color                                           |
-| `+` / `-`| cycle refresh interval: 1m → 2m → 5m → 10m             |
-| `?`      | show / hide the help bar                               |
-
-Every toggle is persisted immediately to `~/.claude-monitor/config.json`, so the next launch comes up with the same settings.
-
-## Auto-kick
-
-Anthropic's 5h usage window only starts counting **after the first message** sent following a reset. With auto-kick on (`[k]`), every refresh tick checks each account: if `5h_utilization == 0`, the tool sends a 1-token request to `/v1/messages` (Haiku, `max_tokens=1`) using that account's OAuth token. The row gets a green `[kicked]` annotation; on failure, a red `[kick failed: …]`.
-
-This is opt-in because it costs ~a fraction of a cent per kick — cheap, but not free. Keep it off if you don't want predictable window starts.
+| Key | Action                                                                |
+|-----|-----------------------------------------------------------------------|
+| `r` | Refresh now (interrupts an in-flight refresh; feels instant)          |
+| `k` | Toggle **auto-kick** — start the 5h window when an account is at 0%   |
+| `s` | Toggle **auto-swap** — rotate the OAuth slot among accounts           |
+| `e` | Open the settings editor (swap thresholds, pick order, rebalance)     |
+| `?` | Show / hide the help bar                                              |
+| `q` | Quit (also `Esc`, `Ctrl+C`)                                           |
 
 ## Output
 
-- `5H` / `WEEKLY` columns: % with a colored bar (green < 70%, yellow 70-89%, red ≥ 90%)
-- `RESETS` columns: time remaining until that window resets (yellow when < 1 hour)
-- `SONNET WK` / `OPUS WK`: per-model weekly % (`—` if the plan doesn't track them separately)
-- `PEAK`: max 5h / weekly across all successfully fetched accounts
+- `5H` / `WEEKLY`: utilization % + colored bar (green < 70, yellow 70–89, red ≥ 90)
+- `RESETS`: time remaining until the window resets (yellow when < 1h)
+- `SONNET WK` / `OPUS WK`: per-model weekly % (`—` if the plan doesn't track them)
+- `★`: account currently behind the plain `claude` keychain slot (the one a default `claude` tab will hit)
+- `PEAK`: max 5h / weekly across successful rows
 - Per-account errors render inline:
-  - `token expired …` → run `claude` once to refresh
-  - `HTTP 403 …` → org disallows OAuth (use an API key for that account)
-  - `no token …` → never logged in for that account
+  - `token expired …` — run `claude` once to refresh
+  - `HTTP 403 …` — org disallows OAuth (use an API key for that account)
+  - `no token …` — never logged in for that account
+  - `rate limited (retry in …)` — backoff applied; the countdown ticks live
+
+## Auto-kick
+
+Anthropic's 5h window only starts counting **after the first message** following a reset. With auto-kick on, every refresh tick fires a 1-token request to `/v1/messages` (Haiku 4.5, `max_tokens=1`) at any account whose `five_hour.utilization == 0`. The row gets a green `[kicked]`; on failure, a red `[kick failed: …]`.
+
+Costs ~a fraction of a cent per kick — leave it off if you don't want predictable window starts.
+
+## Auto-swap
+
+When you run `claude` without `CLAUDE_CONFIG_DIR`, it reads OAuth creds from one fixed keychain slot (`Claude Code-credentials`). Auto-swap rewrites that slot in place, rotating it among your discovered accounts so a long-running `claude` tab transparently picks up a fresh quota when the active account is near its 5h limit.
+
+Configurable in the `[e]` settings editor:
+
+- **Thresholds** — ascending cascade (default `90, 99, 100`). At each tier, swap when the active account ≥ tier and any candidate is below tier.
+- **Pick order** — `lowest` (default, spreads load) or `highest` (drains accounts one at a time).
+- **Rebalance on reset** — when on, swap to any account whose 5h window just reset, even when the active account is well below threshold.
+
+Tabs invoked with an explicit `CLAUDE_CONFIG_DIR=…` bypass the plain slot and are intentionally left alone.
 
 ## How it works
 
 ```
 ~/.claude-account/<name>/
-└─ .claude.json (account email, surfaced as the row label)
+└─ .claude.json (account email → row label)
 
 macOS Keychain:
-└─ "Claude Code-credentials-<sha256(abs_path)[:8]>"
+├─ "Claude Code-credentials"                       (plain slot — what default `claude` reads)
+└─ "Claude Code-credentials-<sha256(abs_path)[:8]>"  (per-account slot)
    { "claudeAiOauth": { "accessToken": "sk-ant-oat01-…", "expiresAt": <ms> } }
 
-~/.claude-monitor/
-└─ config.json     (auto-kick, intervalSeconds, color)
+~/.claude-monitor/config.json    (auto-kick, auto-swap, thresholds, …)
 ```
 
-On every tick:
+Each tick:
 
-1. Scan `~/.claude-account/*` for directories that look like Claude Code config dirs.
-2. For each account, compute `sha256(absolute_path_no_trailing_slash)[:8]` → service name in the Keychain, read the token via `security find-generic-password`.
-3. Fetch `GET https://api.anthropic.com/api/oauth/usage` in parallel with `Authorization: Bearer <token>` + `anthropic-beta: oauth-2025-04-20`.
-4. If auto-kick is on, fire `POST /v1/messages` (Haiku 4.5, `max_tokens=1`) at every account whose `five_hour.utilization == 0`.
+1. Resolve account dirs from `--root` (or auto-discovery).
+2. For each account in parallel, read the OAuth token from the Keychain via `security find-generic-password`, then `GET /api/oauth/usage` with `Authorization: Bearer …` + `anthropic-beta: oauth-2025-04-20`.
+3. If auto-kick is on, fire a 1-token Haiku message at every account with 5h util == 0.
+4. If auto-swap is on, evaluate the threshold cascade + reset-rebalance and, if a swap is warranted, park the previous active creds into its hashed slot and copy the target's creds into the plain slot.
 5. Render the table and schedule the next tick.
+
+Refresh interval is fixed at 60s (the safe lower bound against rate-limiting on the undocumented endpoint).
 
 ## Source layout
 
 ```
 main.go      flag parsing, bubbletea bootstrap
-tui.go       bubbletea Model/Update/View, lipgloss styles, hotkeys
-config.go    load/save ~/.claude-monitor/config.json + interval cycling
+tui.go       Model / Update / View, lipgloss styles, hotkeys
+editor.go    [e] settings form
+config.go    ~/.claude-monitor/config.json load/save
 snapshot.go  account discovery + parallel fetch + auto-kick pass
-api.go       HTTP client + decoder for /api/oauth/usage
-keychain.go  sha256[:8] hash → service name → security CLI → OAuth creds
+swap.go      threshold cascade, reset rebalance, keychain-slot rotation
+api.go       /api/oauth/usage HTTP client + decoder
+keychain.go  service-name hashing → security CLI → OAuth creds
 kick.go      POST /v1/messages with the account's OAuth token
 format.go    string helpers (truncate, padRight, visibleLen)
 ```
 
 ## Make targets
 
-```sh
-make help
-```
-
-| Target | Description |
-|---|---|
-| `build` | Build the binary into `./bin/claude-monitor` (ad-hoc codesigned on darwin) |
-| `run` | Build + launch the TUI |
-| `install` | Copy the binary to `$INSTALL_DIR` (default `~/bin`) |
-| `release` | Cross-compile darwin/linux × amd64/arm64 |
-| `fmt` / `vet` / `tidy` | gofmt / go vet / go mod tidy |
-| `clean` | Remove `./bin/` |
+| Target                 | Description                                                                        |
+|------------------------|------------------------------------------------------------------------------------|
+| `build`                | Build the binary into `./bin/claude-monitor` (ad-hoc codesigned on darwin)         |
+| `run`                  | Build and launch the TUI                                                           |
+| `install`              | Copy the binary to `$INSTALL_DIR` (default `~/bin`)                                |
+| `release`              | Cross-compile darwin/linux × amd64/arm64                                           |
+| `fmt` / `vet` / `tidy` | gofmt / go vet / go mod tidy                                                       |
+| `clean`                | Remove `./bin/`                                                                    |
 
 ## Security
 
-The tool does not store, log, or transmit tokens anywhere except over HTTPS to `api.anthropic.com`. Tokens are read from the Keychain via the `security` CLI on every refresh — depending on the entry's ACL, macOS may prompt for Touch ID or a password the first time.
+Tokens are read from the Keychain via the `security` CLI on every refresh and sent only over HTTPS to `api.anthropic.com`. Nothing is logged, cached, or transmitted elsewhere. macOS may prompt for Touch ID or a password depending on the entry's ACL.
 
-The `/api/oauth/usage` endpoint is internal to Claude Code (not in Anthropic's public docs); its format/URL may change without notice. If it breaks, debug with `claude --debug api 2> log` and `grep oauth/usage log`.
+`/api/oauth/usage` is internal to Claude Code (not in Anthropic's public docs); its format may change without notice. To debug if it breaks: `claude --debug api 2> log && grep oauth/usage log`.
 
 ## Limitations
 
-- **macOS only** — depends on the `security` CLI. Linux would need libsecret/D-Bus (not implemented).
+- **macOS only** — depends on the `security` CLI. Linux would need libsecret/D-Bus.
 - **Undocumented endpoint** — `/api/oauth/usage` may change without notice.
-- **No auto OAuth refresh** — when a token expires, run `CLAUDE_CONFIG_DIR=… claude` once to refresh.
-- **OAuth disabled for org** — returns 403 (`"OAuth authentication is currently not allowed for this organization"`); that account must use an API key instead.
+- **No automatic OAuth refresh** — when a token expires, run `CLAUDE_CONFIG_DIR=… claude` once.
+- **OAuth disabled for org** — returns 403; that account must use an API key.
