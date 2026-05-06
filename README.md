@@ -24,14 +24,28 @@ Real-time terminal dashboard for **multiple Claude Code accounts**, backed by th
 ## Requirements
 
 - **macOS** — uses the `security` CLI to read the Keychain
-- **Go 1.22+**
 - Each account must have logged in once (`CLAUDE_CONFIG_DIR=… claude`) so its OAuth token is in the Keychain
 
 ## Install
 
 ```sh
-make build              # -> ./bin/claude-monitor (ad-hoc codesigned on darwin)
-make install            # -> $HOME/bin/claude-monitor
+curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh | sh
+```
+
+Downloads the latest pre-built binary into `~/.local/bin/claude-monitor`, ad-hoc codesigns it, and adds the dir to your `~/.zshrc` if it isn't on `PATH` yet. Override with env vars:
+
+```sh
+INSTALL_DIR=/usr/local/bin SHELL_RC=~/.bashrc \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/Tungify/claude-monitor/main/install.sh)"
+```
+
+### Build from source
+
+Go 1.22+ required.
+
+```sh
+git clone https://github.com/Tungify/claude-monitor && cd claude-monitor
+make install              # -> $HOME/bin/claude-monitor
 make install INSTALL_DIR=/usr/local/bin
 ```
 
