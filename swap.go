@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -81,10 +84,17 @@ func detectActiveDir(rows []AccountUsage) string {
 // detection. Pass nil on the first refresh.
 //
 // manualPickDir is the configDir of the user's most recent manual pick
-// (empty when none). When the active account matches it, rebalance-
-// on-reset is bypassed; the threshold cascade still applies, so the
-// pick sticks until the next tier is hit.
-func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float64, manualPickDir string, cfg Config) (*AccountUsage, string) {
+// (empty when none). manualPickUtil is the 5h utilization of that
+// account at the moment the user pinned it. While the active account
+// matches manualPickDir, two relaxations apply:
+//
+//   - rebalance-on-reset is suppressed entirely.
+//   - threshold cascade skips any tier <= manualPickUtil — i.e. the
+//     pin "consumes" thresholds the picked account had already
+//     crossed at pin time, so a deliberate pick at 52% with thresholds
+//     [50, 80, 100] sticks until 80 (not 50, which would fire on the
+//     very next tick).
+func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float64, manualPickDir string, manualPickUtil float64, cfg Config) (*AccountUsage, string) {
 	var active *AccountUsage
 	candidates := make([]*AccountUsage, 0, len(rows))
 	for i := range rows {
@@ -118,6 +128,14 @@ func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float
 
 	activeUtil := fiveHourUtil(active.Usage)
 	for _, t := range cfg.SwapThresholds {
+		// While the user's manual pin is still in effect, skip any
+		// threshold the picked account had already exceeded at pin
+		// time. Without this, picking a 52% account with thresholds
+		// [50, 80, 100] would auto-revert on the very next tick (52
+		// >= 50, candidate < 50 found, swap fires).
+		if stickyManual && t <= manualPickUtil {
+			continue
+		}
 		if activeUtil < t {
 			return nil, ""
 		}
@@ -202,7 +220,76 @@ func executeSwap(rows []AccountUsage, activeDir, targetDir string) error {
 	if err := WriteKeychainEntry(plainKeychainSvc, targetCreds); err != nil {
 		return fmt.Errorf("promote target into plain slot: %w", err)
 	}
+
+	// Sync $HOME/.claude.json's `oauthAccount` block so the `claude`
+	// CLI (no CLAUDE_CONFIG_DIR) shows the now-active target's email
+	// and displayName instead of the previous account's. Best-effort:
+	// the keychain rotation above is the load-bearing change, so a
+	// failure here (file missing, JSON corrupt, EPERM) only leaves
+	// the banner stale — it doesn't break the swap itself.
+	syncHomeOAuthAccount(activeDir, targetDir)
+
 	return nil
+}
+
+// syncHomeOAuthAccount keeps $HOME/.claude.json's `oauthAccount` field
+// pointing at whichever account currently owns the plain keychain
+// slot. Without it, `claude` (no CLAUDE_CONFIG_DIR) keeps showing the
+// previously logged-in email even after a rotation — tokens flip but
+// the displayed identity lags until the next `/login`.
+//
+// Two writes happen, in order:
+//
+//  1. Backup. If we're leaving the default ~/.claude account and no
+//     ~/.claude/.claude.json exists yet, snapshot the home file's
+//     oauthAccount to that in-dir path so a later swap *back* to
+//     default has a place to read default's identity from (the home
+//     file will have been overwritten by step 2 below). When an
+//     in-dir .claude.json already exists, we leave it untouched on
+//     the assumption it's Claude Code's own (some setups keep the
+//     default config in-dir) and rely on it as the restore source —
+//     overwriting it with our minimal one-field JSON would
+//     obliterate numStartups/projects/etc.
+//
+//  2. Patch. Read the target's oauthAccount block from its canonical
+//     .claude.json (in-dir for non-default accounts; for the default,
+//     the in-dir backup created above, with $HOME/.claude.json as a
+//     last-ditch fallback) and write it into $HOME/.claude.json's
+//     oauthAccount field. Every other top-level field is preserved.
+//
+// Best-effort throughout: any failure is swallowed. Surfacing errors
+// here would push noisy banner text in front of the user for a purely
+// cosmetic concern (the keychain rotation already succeeded).
+func syncHomeOAuthAccount(activeDir, targetDir string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	homePath := filepath.Join(home, ".claude.json")
+	defaultDir := defaultClaudeDir()
+
+	if activeDir == defaultDir && targetDir != defaultDir {
+		backup := filepath.Join(defaultDir, ".claude.json")
+		// Defensive: if ~/.claude/.claude.json already exists, assume
+		// Claude Code authored it with the full default-account
+		// config (some setups keep it in-dir rather than at $HOME)
+		// and leave it alone. Its oauthAccount is already default's,
+		// so readOAuthAccountBlock(defaultDir) — which prefers in-dir
+		// — will recover the right block on a future restore without
+		// our backup. Writing our minimal one-field JSON over a real
+		// config file would obliterate numStartups/projects/etc.
+		if _, err := os.Stat(backup); errors.Is(err, os.ErrNotExist) {
+			if block, err := readOAuthAccountBlockFromFile(homePath); err == nil && block != nil {
+				_ = writeMinimalClaudeJSON(backup, block)
+			}
+		}
+	}
+
+	block, err := readOAuthAccountBlock(targetDir)
+	if err != nil || block == nil {
+		return
+	}
+	_ = patchOAuthAccountInFile(homePath, block)
 }
 
 func findRow(rows []AccountUsage, configDir string) *AccountUsage {
@@ -322,7 +409,7 @@ func ListAccounts(rootSpec string) error {
 	cfg, _ := LoadConfig()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	res, err := FetchAll(ctx, rootSpec, cfg, nil, nil, "")
+	res, err := FetchAll(ctx, rootSpec, cfg, nil, nil, "", 0)
 	if err != nil {
 		return err
 	}

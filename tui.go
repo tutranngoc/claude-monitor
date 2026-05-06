@@ -58,14 +58,18 @@ type upgradeDoneMsg struct {
 type upgradeQuitMsg struct{}
 
 // manualSwapDoneMsg is the result of a [m]-triggered keychain rewrite.
-// targetDir identifies the account the user picked; err is non-nil
-// when the keychain write failed (in which case the active account
-// is unchanged and a flash banner reports the error).
+// targetDir identifies the account the user picked; targetUtil is the
+// 5h utilization of that account at the moment of pin (used by
+// decideSwap to decide which threshold tiers to skip while the pin is
+// in effect). err is non-nil when the keychain write failed (in which
+// case the active account is unchanged and a flash banner reports the
+// error).
 type manualSwapDoneMsg struct {
-	targetDir string
-	targetTag string
-	fromTag   string
-	err       error
+	targetDir  string
+	targetTag  string
+	fromTag    string
+	targetUtil float64
+	err        error
 }
 
 // ----------------------------------------------------------------------
@@ -127,6 +131,11 @@ type model struct {
 	picking        bool
 	pickCursor     int
 	manualPickDir  string
+	// manualPickUtil is the 5h util of the picked account at the
+	// moment of pin. decideSwap uses it to skip threshold tiers the
+	// user already saw at pin time — so a deliberate pick at 52%
+	// with thresholds [50, 80, 100] sticks until 80, not 50.
+	manualPickUtil float64
 	manualSwapping bool
 }
 
@@ -179,6 +188,7 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 	root := m.root
 	cfg := m.cfg
 	manualPick := m.manualPickDir
+	manualPickUtil := m.manualPickUtil
 	// Snapshot the backoff map and prev-util map so the goroutine has a
 	// stable view, even if the user presses 'R' (which mutates
 	// m.backoff) or another tick fires while in flight.
@@ -199,7 +209,7 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		defer cancel()
-		res, err := FetchAll(ctx, root, cfg, skipUntil, prev, manualPick)
+		res, err := FetchAll(ctx, root, cfg, skipUntil, prev, manualPick, manualPickUtil)
 		msg := refreshMsg{err: err, at: time.Now(), version: version}
 		if res != nil {
 			msg.rows = res.Rows
@@ -222,13 +232,15 @@ func (m *model) manualSwapCmd(target AccountUsage) tea.Cmd {
 		fromTag = accountLabel(*active)
 	}
 	targetTag := accountLabel(target)
+	targetUtil := fiveHourUtil(target.Usage)
 	return func() tea.Msg {
 		err := executeSwap(rows, activeDir, target.ConfigDir)
 		return manualSwapDoneMsg{
-			targetDir: target.ConfigDir,
-			targetTag: targetTag,
-			fromTag:   fromTag,
-			err:       err,
+			targetDir:  target.ConfigDir,
+			targetTag:  targetTag,
+			fromTag:    fromTag,
+			targetUtil: targetUtil,
+			err:        err,
 		}
 	}
 }
@@ -286,14 +298,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case refreshMsg:
+		// Whichever in-flight goroutine produced this message is now
+		// done, so clear the refreshing flag regardless of whether
+		// we end up applying the data. Without this, a manual swap
+		// that bumps m.inflight (without kicking a new refresh) can
+		// strand the flag at true forever — the next tick sees
+		// m.refreshing and skips firing, refreshes stop entirely.
+		m.refreshing = false
 		// Discard results from a refresh that has been superseded by a
 		// newer one (e.g. user mashed `r` while a tick was already in
-		// flight). Keeping the newer in-flight refresh marked as such is
-		// what makes the screen show "refreshing…" continuously.
+		// flight, or a manual swap invalidated this refresh's view of
+		// activeDir).
 		if msg.version != m.inflight {
 			return m, nil
 		}
-		m.refreshing = false
 		m.rows = msg.rows
 		m.activeDir = msg.activeDir
 		m.err = msg.err
@@ -336,6 +354,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// honest about whether rebalance-on-reset should fire.
 		if m.manualPickDir != "" && m.activeDir != m.manualPickDir {
 			m.manualPickDir = ""
+			m.manualPickUtil = 0
 		}
 		// Keep the picker cursor in range when row count changes.
 		if m.picking {
@@ -352,10 +371,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.activeDir = msg.targetDir
 		m.manualPickDir = msg.targetDir
+		m.manualPickUtil = msg.targetUtil
 		// Drop the cached prev-util — the rebalance-on-reset detector
 		// would otherwise compare across the swap boundary and emit
 		// spurious "window reset" decisions.
 		m.prevUtil = map[string]float64{}
+		// Bump inflight to invalidate any pre-swap refresh that's
+		// still mid-flight (otherwise its stale activeDir overwrites
+		// ours, the pin gets auto-cleared, and the swap appears to
+		// "revert" within a few seconds). We deliberately do NOT
+		// kick a fresh refresh here — firing /api/oauth/usage right
+		// after a swap empirically piles onto the just-promoted
+		// account's rate-limit budget (it's already the busy one,
+		// being actively used by `claude`) and triggers a 429 burst.
+		// The next 60s tick refreshes naturally; util numbers can be
+		// stale for up to a tick, which is fine.
+		m.inflight++
 		m.flash = fmt.Sprintf("swapped: %s → %s", msg.fromTag, msg.targetTag)
 		m.flashExpiry = time.Now().Add(3 * time.Second)
 		return m, flashClearCmd(3 * time.Second)
@@ -433,6 +464,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// turning it back on should start with a clean slate.
 		m.prevUtil = map[string]float64{}
 		m.manualPickDir = ""
+		m.manualPickUtil = 0
 		m.persistAndFlash(fmt.Sprintf("auto-swap: %s", onOff(m.cfg.AutoSwap)))
 		return m, flashClearCmd(2 * time.Second)
 
@@ -517,16 +549,18 @@ func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		target := m.rows[m.pickCursor]
-		if target.refreshToken == "" {
-			m.flash = "cannot swap: " + accountLabel(target) + " has no stored credentials"
-			m.flashExpiry = time.Now().Add(3 * time.Second)
-			return m, flashClearCmd(3 * time.Second), true
-		}
+		// Don't gate on row.refreshToken here — a row may have an
+		// empty refreshToken because the API call was skipped (rate-
+		// limit backoff) or failed transiently, even though the
+		// underlying keychain entry is fine. executeSwap reads the
+		// target's creds fresh from the keychain at swap time and
+		// will return a real error if they're genuinely missing.
 		if target.ConfigDir == m.activeDir {
 			// Picking the row that's already active is a no-op but
 			// also the natural "set this as my pin" gesture — record
 			// it so rebalance-on-reset is suppressed going forward.
 			m.manualPickDir = target.ConfigDir
+			m.manualPickUtil = fiveHourUtil(target.Usage)
 			m.picking = false
 			m.flash = "pinned: " + accountLabel(target)
 			m.flashExpiry = time.Now().Add(2 * time.Second)

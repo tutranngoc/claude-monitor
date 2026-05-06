@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,9 +57,11 @@ type FetchResult struct {
 //
 // manualPickDir is the configDir the user most recently pinned via the
 // in-TUI [m] picker; while it matches the active account, auto-swap's
-// rebalance-on-reset is suppressed (only the threshold cascade can
-// move off the pick). Pass "" when there is no active manual pick.
-func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[string]time.Time, prevUtil map[string]float64, manualPickDir string) (*FetchResult, error) {
+// rebalance-on-reset is suppressed and threshold tiers <= the pinned
+// account's util at pin time (manualPickUtil) are skipped — so the
+// pin sticks until the *next* tier above where the user picked. Pass
+// "" / 0 when there is no active manual pick.
+func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[string]time.Time, prevUtil map[string]float64, manualPickDir string, manualPickUtil float64) (*FetchResult, error) {
 	accts, err := ResolveAccountDirs(rootSpec)
 	if err != nil {
 		return nil, err
@@ -75,12 +79,24 @@ func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[st
 	for i, a := range accts {
 		i, a := i, a
 		if t, ok := skipUntil[a.configDir]; ok && now.Before(t) {
-			rows[i] = AccountUsage{
+			row := AccountUsage{
 				Name:      a.name,
 				ConfigDir: a.configDir,
 				Email:     a.email,
 				Err:       fmt.Errorf("rate limited (retry in %s)", time.Until(t).Round(time.Second)),
 			}
+			// Populate refreshToken from the per-dir hashed keychain
+			// entry even though we're skipping the API call. Without
+			// this, detectActiveDir can't match the plain slot's
+			// RefreshToken against any row when the actually-active
+			// account is the one in 429 backoff — and silently
+			// reverts the ★ marker to defaultClaudeDir, making a
+			// just-completed manual swap look like it "lost"
+			// itself the moment Anthropic returns a 429.
+			if creds, err := LoadCredentialsHashedFirst(a.configDir); err == nil {
+				row.refreshToken = creds.RefreshToken
+			}
+			rows[i] = row
 			continue
 		}
 		wg.Add(1)
@@ -98,7 +114,7 @@ func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[st
 	result := &FetchResult{Rows: rows}
 	result.ActiveDir = detectActiveDir(rows)
 	if cfg.AutoSwap {
-		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, manualPickDir, cfg); target != nil {
+		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, manualPickDir, manualPickUtil, cfg); target != nil {
 			active := findRow(rows, result.ActiveDir)
 			ev := &SwapEvent{
 				FromName: rowDisplayName(active),
@@ -332,14 +348,20 @@ func fetchOne(ctx context.Context, a discoveredAccount, autoSwap bool) AccountUs
 		row.Err = fmt.Errorf("token expired (run `claude` once to refresh)")
 		return row
 	}
+	// Populate refreshToken/accessToken before the network call so a
+	// transient API failure (rate limit, 5xx) doesn't strand the row
+	// without identity. detectActiveDir and the manual-swap picker
+	// both compare against refreshToken — leaving it empty made the
+	// ★ marker drift and blocked swaps to rate-limited rows even
+	// though the underlying creds were perfectly fine.
+	row.accessToken = creds.AccessToken
+	row.refreshToken = creds.RefreshToken
 	usage, err := FetchUsage(ctx, creds.AccessToken)
 	if err != nil {
 		row.Err = err
 		return row
 	}
 	row.Usage = usage
-	row.accessToken = creds.AccessToken
-	row.refreshToken = creds.RefreshToken
 	return row
 }
 
@@ -355,10 +377,8 @@ func looksLikeClaudeDir(path string) bool {
 	return false
 }
 
-// readAccountEmail extracts oauthAccount.emailAddress from .claude.json
-// without unmarshalling the whole 24KB blob.
-//
-// Claude Code stores the config file in two different layouts:
+// claudeJSONPaths returns the candidate .claude.json paths for an
+// account's config dir, in priority order. Two cases matter:
 //
 //   - With CLAUDE_CONFIG_DIR set (e.g. ~/.claude-gem): the file lives
 //     *inside* the config dir as <configDir>/.claude.json.
@@ -366,17 +386,25 @@ func looksLikeClaudeDir(path string) bool {
 //     lives in $HOME as ~/.claude.json — a sibling of the dir, not a
 //     child. The ~/.claude dir itself only holds sessions/projects.
 //
-// We try the in-dir path first and fall back to the sibling layout so
-// the default-account row gets a real email instead of just a folder
-// name.
-func readAccountEmail(configDir string) string {
-	candidates := []string{filepath.Join(configDir, ".claude.json")}
+// In-dir is tried first so the default account's row keeps reading
+// the right email after the home-side $HOME/.claude.json has been
+// rewritten by an oauthAccount-sync swap (executeSwap stashes the
+// pre-swap default identity into ~/.claude/.claude.json before
+// overwriting the home file — see syncHomeOAuthAccount).
+func claudeJSONPaths(configDir string) []string {
+	paths := []string{filepath.Join(configDir, ".claude.json")}
 	if configDir == defaultClaudeDir() {
 		if home, err := os.UserHomeDir(); err == nil {
-			candidates = append(candidates, filepath.Join(home, ".claude.json"))
+			paths = append(paths, filepath.Join(home, ".claude.json"))
 		}
 	}
-	for _, p := range candidates {
+	return paths
+}
+
+// readAccountEmail extracts oauthAccount.emailAddress from .claude.json
+// without unmarshalling the whole 24KB blob.
+func readAccountEmail(configDir string) string {
+	for _, p := range claudeJSONPaths(configDir) {
 		if email := emailFromClaudeJSON(p); email != "" {
 			return email
 		}
@@ -389,15 +417,164 @@ func emailFromClaudeJSON(path string) string {
 	if err != nil {
 		return ""
 	}
-	const key = `"emailAddress":"`
-	i := strings.Index(string(b), key)
+	// Locate `"emailAddress"`, then skip whitespace + `:` + whitespace
+	// before the opening quote of the value. Claude Code's JSON
+	// encoder writes the field with a space (`"emailAddress": "…"`)
+	// while the older shape did not (`"emailAddress":"…"`); the
+	// permissive walk handles both without paying for a full
+	// json.Unmarshal of the 24KB blob.
+	s := string(b)
+	const key = `"emailAddress"`
+	i := strings.Index(s, key)
 	if i < 0 {
 		return ""
 	}
-	rest := string(b)[i+len(key):]
-	end := strings.Index(rest, `"`)
+	j := i + len(key)
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+	if j >= len(s) || s[j] != ':' {
+		return ""
+	}
+	j++
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+	if j >= len(s) || s[j] != '"' {
+		return ""
+	}
+	j++
+	end := strings.Index(s[j:], `"`)
 	if end < 0 {
 		return ""
 	}
-	return rest[:end]
+	return s[j : j+end]
+}
+
+// readOAuthAccountBlock returns the raw JSON of the `oauthAccount`
+// field from the account's .claude.json (in-dir first, home fallback
+// for the default account). Returns (nil, nil) when the file or field
+// is missing — callers treat that as "no identity to copy" and skip
+// the sync silently.
+//
+// Used at swap time to copy the target account's identity (email,
+// displayName, accountUuid, organizationName, …) into the plain
+// slot's $HOME/.claude.json so `claude` running without
+// CLAUDE_CONFIG_DIR shows the right "logged in as <email>" banner
+// after the keychain rotation.
+func readOAuthAccountBlock(configDir string) (json.RawMessage, error) {
+	for _, p := range claudeJSONPaths(configDir) {
+		block, err := readOAuthAccountBlockFromFile(p)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if block != nil {
+			return block, nil
+		}
+	}
+	return nil, nil
+}
+
+func readOAuthAccountBlockFromFile(path string) (json.RawMessage, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(b, &data); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	block, ok := data["oauthAccount"]
+	if !ok || len(block) == 0 || string(block) == "null" {
+		return nil, nil
+	}
+	return block, nil
+}
+
+// patchOAuthAccountInFile rewrites the `oauthAccount` field in the
+// given .claude.json with `block`, preserving every other top-level
+// field. Atomic via write-temp-and-rename so a concurrent reader
+// (Claude Code itself) never sees a half-written file.
+//
+// No-op when the destination doesn't exist — we don't conjure a
+// .claude.json from scratch; that's Claude Code's responsibility on
+// first login.
+func patchOAuthAccountInFile(path string, block json.RawMessage) error {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(b, &data); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	data["oauthAccount"] = block
+	out, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	perm := os.FileMode(0o600)
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	return writeFileAtomic(path, out, perm)
+}
+
+// writeMinimalClaudeJSON writes a one-field `.claude.json` containing
+// only the oauthAccount block. Used to back up the default account's
+// identity to ~/.claude/.claude.json before the first swap-away
+// rewrites $HOME/.claude.json — without this stash, the original
+// default identity would be lost and a future swap-back-to-default
+// couldn't restore it.
+//
+// Idempotent: re-running with the same block produces an identical
+// file (modulo Go's map-key ordering on remarshal), so we don't bother
+// short-circuiting when the content already matches.
+func writeMinimalClaudeJSON(path string, block json.RawMessage) error {
+	payload := map[string]json.RawMessage{"oauthAccount": block}
+	out, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	return writeFileAtomic(path, out, 0o600)
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and
+// renames it over `path`. Avoids partial-write corruption of
+// .claude.json when Claude Code is concurrently reading or writing it.
+// Permissions on the final file match `perm` (we set them on the temp
+// file before the rename).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpName := f.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("chmod %s: %w", tmpName, err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %s -> %s: %w", tmpName, path, err)
+	}
+	return nil
 }
