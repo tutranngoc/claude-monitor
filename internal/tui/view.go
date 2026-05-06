@@ -19,6 +19,9 @@ func (m model) View() string {
 	b.WriteString(m.table(st))
 	b.WriteString(m.peakLine(st))
 	switch {
+	case m.addingAccount:
+		b.WriteString("\n")
+		b.WriteString(m.addAccountView(st))
 	case m.editing:
 		b.WriteString("\n")
 		b.WriteString(m.editorView(st))
@@ -165,8 +168,12 @@ func (m model) peakLine(st styles) string {
 
 func (m model) helpBar(st styles) string {
 	if m.picking {
-		hint := fmt.Sprintf("%s pick   %s confirm   %s cancel",
-			st.key.Render("↑/↓"), st.key.Render("[enter]"), st.key.Render("[esc]"))
+		verb := "swap to"
+		if m.pickerMode == pickerRelogin {
+			verb = "relogin"
+		}
+		hint := fmt.Sprintf("%s %s   %s confirm   %s cancel",
+			st.key.Render("↑/↓"), verb, st.key.Render("[enter]"), st.key.Render("[esc]"))
 		if m.pickCursor >= 0 && m.pickCursor < len(m.rows) {
 			label := account.Label(m.rows[m.pickCursor])
 			hint = st.accent.Render("▶ "+label) + "   " + hint
@@ -177,6 +184,8 @@ func (m model) helpBar(st styles) string {
 		fmt.Sprintf("%s auto-kick: %s", st.key.Render("[k]"), boolBadge(st, m.cfg.AutoKick)),
 		fmt.Sprintf("%s auto-swap: %s", st.key.Render("[s]"), boolBadge(st, m.cfg.AutoSwap)),
 		st.key.Render("[m]") + " switch",
+		st.key.Render("[a]") + " add",
+		st.key.Render("[L]") + " relogin",
 		st.key.Render("[e]") + " edit",
 		st.key.Render("[r]") + " refresh",
 		st.key.Render("[?]") + " toggle help",

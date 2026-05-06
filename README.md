@@ -18,7 +18,7 @@ Real-time terminal dashboard for **multiple Claude Code accounts**, backed by th
  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  PEAK across 6 account(s):  5h 100%   weekly  20%
 
- [k] auto-kick: ON   [s] auto-swap: ON   [e] edit   [r] refresh   [?] toggle help   [q] quit
+ [k] auto-kick: ON   [s] auto-swap: ON   [m] switch   [a] add   [L] relogin   [e] edit   [r] refresh   [?] help   [q] quit
 ```
 
 ## Requirements
@@ -31,7 +31,7 @@ claude-monitor reads OAuth tokens from the same OS credential store Claude Code 
 | **Linux**   | Secret Service API / libsecret (via `secret-tool`)                                   | `libsecret-tools` + a running keyring (gnome-keyring on most desktops) |
 | **Windows** | Windows Credential Manager (via [`wincred`](https://github.com/danieljoos/wincred))  | none                                                                   |
 
-Each account must have logged in once (`CLAUDE_CONFIG_DIR=… claude`) so its OAuth token is stored — claude-monitor only reads.
+Each account must have logged in once so its OAuth token is stored. The dashboard's `[a]` hotkey provisions a new `~/.claude-<name>` and hands off to `claude auth login` for you; `[L]` does the same for a row whose token has expired.
 
 ## Install
 
@@ -119,6 +119,8 @@ Paths are deduped by canonical (symlink-resolved) absolute path.
 | `k` | Toggle **auto-kick** — start the 5h window when an account is at 0%      |
 | `s` | Toggle **auto-swap** — rotate the OAuth slot among accounts              |
 | `m` | **Manual switch** — pick an account to swap to, pin until next threshold |
+| `a` | **Add account** — provision `~/.claude-<name>` and run `claude auth login` |
+| `L` | **Relogin** — pick a row, hand off to `claude auth login` for that dir   |
 | `e` | Open the settings editor (swap thresholds, pick order, rebalance)        |
 | `u` | Upgrade to the latest release *(only shown when an update is available)* |
 | `?` | Show / hide the help bar                                                 |
@@ -132,9 +134,9 @@ Paths are deduped by canonical (symlink-resolved) absolute path.
 - `★`: account currently behind the plain `claude` keychain slot (the one a default `claude` tab will hit)
 - `PEAK`: max 5h / weekly across successful rows
 - Per-account errors render inline:
-  - `token expired …` — run `claude` once to refresh
+  - `token expired …` — press `[L]` and pick the row to relogin in place
   - `HTTP 403 …` — org disallows OAuth (use an API key for that account)
-  - `no token …` — never logged in for that account
+  - `no token …` — never logged in for that account (`[L]` to login)
   - `rate limited (retry in …)` — backoff applied; the countdown ticks live
 
 ## Auto-kick
@@ -169,6 +171,29 @@ The picked account becomes a **pin** (`★` turns blue, `📌 pin: <name>` shows
 - The threshold cascade still applies — when the pinned account hits 90% (or whatever your lowest threshold is), auto-swap takes over and rotates to a fresh candidate. The pin clears the moment auto-swap moves the active dir.
 
 In other words: "use this account until the next threshold."
+
+## Add account / relogin
+
+Press `[a]` to add a new account without leaving the dashboard:
+
+```
+ ┌─ add account ─────────────────────────────────────┐
+ │   ➤ short name              acc-be-4▌             │
+ │     email (optional)        foo@bar.com           │
+ │     config dir              ~/.claude-acc-be-4    │
+ │   tab move   enter submit   esc cancel            │
+ └───────────────────────────────────────────────────┘
+```
+
+`enter` does three things, in order:
+
+1. `mkdir ~/.claude-<name>/projects` — enough for auto-discovery to surface the row immediately.
+2. Suspend the TUI and run `CLAUDE_CONFIG_DIR=~/.claude-<name> claude auth login [--email <email>]`. Your terminal hands off to `claude`, which opens the browser flow (or accepts a pasted code).
+3. Resume the TUI and fire a refresh — the new account appears with live usage on the next tick.
+
+`[L]` opens the same picker as `[m]`, but `enter` runs `claude auth login` against the highlighted row's config dir. Use it to clear a `token expired` row in place.
+
+Cancelling the OAuth flow leaves the dir on disk; the row shows up as "not authenticated" until you press `[L]` to retry.
 
 ### macOS keychain setup (silence the password prompt)
 
@@ -271,6 +296,6 @@ Tokens are read from the OS credential store on every refresh and sent only over
 ## Limitations
 
 - **Undocumented endpoint** — `/api/oauth/usage` may change without notice.
-- **No automatic OAuth refresh** — when a token expires, run `CLAUDE_CONFIG_DIR=… claude` once.
+- **No automatic OAuth refresh** — when a token expires, press `[L]` to relogin (delegates to `claude auth login`; refresh tokens are not handled in-process).
 - **OAuth disabled for org** — returns 403; that account must use an API key.
 - **Linux**: requires libsecret + a running keyring daemon. Headless servers without a Secret Service don't work yet.

@@ -8,14 +8,29 @@ import (
 	"claude-monitor/internal/account"
 )
 
-// handlePickKey is the inner mode active while the [m] manual-swap
-// picker is open. Up/Down move the cursor, Enter executes the swap
-// against the highlighted row, Esc/m close the picker. Returns
+// handlePickKey is the inner mode active while the picker overlay is
+// open. Up/Down move the cursor, Enter executes the action for the
+// current pickerMode (swap vs relogin), Esc closes. Returns
 // consumed=true so dashboard hotkeys don't fire under the picker.
+//
+// "m" closes the picker only when it was opened via [m] (swap mode);
+// "L" closes it only when opened via [L]. This avoids a confusing
+// scenario where the user opened relogin with [L], hits [m] thinking
+// "open swap" and instead just dismisses the overlay.
 func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 	switch msg.String() {
-	case "esc", "m", "q":
+	case "esc", "q":
 		m.picking = false
+		return m, nil, true
+	case "m":
+		if m.pickerMode == pickerSwap {
+			m.picking = false
+		}
+		return m, nil, true
+	case "L":
+		if m.pickerMode == pickerRelogin {
+			m.picking = false
+		}
 		return m, nil, true
 	case "up", "k":
 		if len(m.rows) == 0 {
@@ -42,6 +57,13 @@ func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		target := m.rows[m.pickCursor]
+		if m.pickerMode == pickerRelogin {
+			m.picking = false
+			m.loggingIn = true
+			m.flash = "relogin: " + account.Label(target) + "…"
+			m.flashExpiry = time.Now().Add(24 * time.Hour)
+			return m, loginCmd(target.ConfigDir, target.Email, account.Label(target), false), true
+		}
 		// Don't gate on row.RefreshToken here — a row may have an
 		// empty refreshToken because the API call was skipped (rate-
 		// limit backoff) or failed transiently, even though the

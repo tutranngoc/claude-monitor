@@ -52,6 +52,21 @@ type upgradeDoneMsg struct {
 // user has time to read "✓ upgraded" before the TUI tears down.
 type upgradeQuitMsg struct{}
 
+// loginDoneMsg is delivered after a tea.ExecProcess running `claude
+// auth login` (with CLAUDE_CONFIG_DIR set) returns. Always followed by
+// a fresh refresh tick so the new/relogged-in account picks up its
+// usage row immediately. label is the short name we showed in the
+// "logging in: <name>…" flash; the done flash reuses it.
+//
+// fresh is true when this came from the [a] add flow (so the success
+// message reads "added"), false from [L] relogin ("relogin").
+type loginDoneMsg struct {
+	configDir string
+	label     string
+	fresh     bool
+	err       error
+}
+
 // manualSwapDoneMsg is the result of a [m]-triggered keychain rewrite.
 // targetDir identifies the account the user picked; targetUtil is the
 // 5h utilization of that account at the moment of pin (used by

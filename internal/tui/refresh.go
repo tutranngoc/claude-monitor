@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -74,6 +76,41 @@ func (m *model) manualSwapCmd(target account.Row) tea.Cmd {
 	}
 }
 
+// loginCmd suspends the bubbletea program, hands off the terminal to
+// `claude auth login`, then resumes and emits a loginDoneMsg so the
+// model can fire a refresh.
+//
+//   - configDir is the absolute path passed via CLAUDE_CONFIG_DIR. The
+//     subprocess writes the OAuth creds to that dir's hashed keychain
+//     entry (and creates .claude.json with the real oauthAccount block
+//     on success).
+//   - email, when non-empty, is forwarded as --email so the web flow
+//     pre-populates the email field.
+//   - label is the short name we surface in the post-completion flash
+//     ("✓ added: foo" or "✓ relogin: foo").
+//   - fresh distinguishes [a] (true → "added") from [L] (false →
+//     "relogin") in the flash, no behavioral difference.
+func loginCmd(configDir, email, label string, fresh bool) tea.Cmd {
+	args := []string{"auth", "login"}
+	if email != "" {
+		args = append(args, "--email", email)
+	}
+	c := exec.Command("claude", args...)
+	// Inherit the parent env, then override CLAUDE_CONFIG_DIR. Order
+	// matters: a later assignment wins, so prepending os.Environ() and
+	// appending our override is the documented pattern for scoping a
+	// child process to a different config dir.
+	c.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+configDir)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return loginDoneMsg{
+			configDir: configDir,
+			label:     label,
+			fresh:     fresh,
+			err:       err,
+		}
+	})
+}
+
 func tickCmd(secs int) tea.Cmd {
 	return tea.Tick(time.Duration(secs)*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -107,4 +144,3 @@ func upgradeCmd(info *update.Info) tea.Cmd {
 		return upgradeDoneMsg{tag: info.LatestTag, err: err}
 	}
 }
-

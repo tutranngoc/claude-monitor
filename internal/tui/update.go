@@ -20,6 +20,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Drop keypresses while a tea.ExecProcess is running — the
+		// subprocess owns the tty until it exits, so any key we see
+		// here was queued before resume and would otherwise fire
+		// dashboard hotkeys on the very next frame.
+		if m.loggingIn {
+			return m, nil
+		}
+		if m.addingAccount {
+			if next, cmd, consumed := m.handleAddKey(msg); consumed {
+				return next, cmd
+			}
+		}
 		if m.editing {
 			if next, cmd, consumed := m.handleEditKey(msg); consumed {
 				return next, cmd
@@ -108,6 +120,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPickCursor()
 		}
 		return m, swapCmd
+
+	case loginDoneMsg:
+		m.loggingIn = false
+		if msg.err != nil {
+			m.flash = "login failed: " + format.Truncate(msg.err.Error(), 80)
+			m.flashExpiry = time.Now().Add(6 * time.Second)
+			return m, flashClearCmd(6 * time.Second)
+		}
+		verb := "added"
+		if !msg.fresh {
+			verb = "relogin"
+		}
+		m.flash = fmt.Sprintf("✓ %s: %s", verb, msg.label)
+		m.flashExpiry = time.Now().Add(4 * time.Second)
+		// Force a fresh refresh so the new/relogged account picks up
+		// its usage row immediately. Bump inflight first so any
+		// pre-login refresh that's still in flight gets discarded.
+		m.refreshing = true
+		m.inflight++
+		return m, tea.Batch(
+			m.refreshCmd(m.inflight),
+			flashClearCmd(4*time.Second),
+		)
 
 	case manualSwapDoneMsg:
 		m.manualSwapping = false
@@ -230,6 +265,35 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.picking = true
+		m.pickerMode = pickerSwap
+		m.pickCursor = m.indexOfActive()
+		m.clampPickCursor()
+		return m, nil
+
+	case "a":
+		// Add-account form. Refuses to open while another overlay is
+		// active or while the manual-swap goroutine still holds the
+		// keychain lock — both invariants are also enforced by their
+		// respective handlers, but bouncing the open early avoids a
+		// flickering empty form.
+		if m.editing || m.picking || m.manualSwapping {
+			return m, nil
+		}
+		m.addingAccount = true
+		m.addState = addState{}
+		return m, nil
+
+	case "L":
+		// Relogin picker. Reuses the [m] picker UI but with
+		// pickerMode=relogin so Enter dispatches loginCmd against the
+		// highlighted row's config dir instead of swap.Execute.
+		// Useful for "token expired" rows — the user lands directly
+		// in claude auth login without leaving the dashboard.
+		if m.manualSwapping || len(m.rows) == 0 {
+			return m, nil
+		}
+		m.picking = true
+		m.pickerMode = pickerRelogin
 		m.pickCursor = m.indexOfActive()
 		m.clampPickCursor()
 		return m, nil

@@ -81,7 +81,36 @@ type model struct {
 	// with thresholds [50, 80, 100] sticks until 80, not 50.
 	manualPickUtil float64
 	manualSwapping bool
+
+	// pickerMode toggles what [enter] does in the picker overlay.
+	// pickerSwap (default) wires Enter to manualSwapCmd; pickerRelogin
+	// wires it to loginCmd against the highlighted row's config dir.
+	// Both modes share picker.go's cursor-and-arrow handling.
+	pickerMode pickerMode
+
+	// Add-account form state. addingAccount mirrors editing/picking —
+	// only one overlay is active at a time. addState owns the text
+	// buffers and validation feedback.
+	addingAccount bool
+	addState      addState
+
+	// loggingIn is true while a tea.ExecProcess for `claude auth login`
+	// is running (terminal handed off, TUI suspended). Set when we
+	// dispatch loginCmd, cleared by loginDoneMsg. Used to gate hotkeys
+	// so a stray keypress queued before resume doesn't fire on the
+	// next frame.
+	loggingIn bool
 }
+
+// pickerMode is what the [enter] key does inside the picker overlay.
+// Both modes use the same row-cursor UI; only the action on confirm
+// differs.
+type pickerMode int
+
+const (
+	pickerSwap pickerMode = iota
+	pickerRelogin
+)
 
 func initialModel(root string, cfg config.Config, version string) model {
 	// Start at inflight=1, refreshing=true so the first frame already
