@@ -83,6 +83,8 @@ claude-monitor --upgrade   # same flow without the TUI
 claude-monitor                                  # auto-discover ~/.claude* in $HOME
 claude-monitor --root ~/.claude-account         # parent dir holding sub-accounts
 claude-monitor --root ~/.claude,~/.claude-gem   # comma-separated list
+claude-monitor --list-accounts                  # print accounts and exit (CLI mode)
+claude-monitor --swap-to acc-be-2               # rewrite the keychain slot and exit
 claude-monitor --version
 ```
 
@@ -115,6 +117,7 @@ Paths are deduped by canonical (symlink-resolved) absolute path.
 | `r` | Refresh now (interrupts an in-flight refresh; feels instant)             |
 | `k` | Toggle **auto-kick** — start the 5h window when an account is at 0%      |
 | `s` | Toggle **auto-swap** — rotate the OAuth slot among accounts              |
+| `m` | **Manual switch** — pick an account to swap to, pin until next threshold |
 | `e` | Open the settings editor (swap thresholds, pick order, rebalance)        |
 | `u` | Upgrade to the latest release *(only shown when an update is available)* |
 | `?` | Show / hide the help bar                                                 |
@@ -150,6 +153,45 @@ Configurable in the `[e]` settings editor:
 - **Rebalance on reset** — when on, swap to any account whose 5h window just reset, even when the active account is well below threshold.
 
 Tabs invoked with an explicit `CLAUDE_CONFIG_DIR=…` bypass the plain slot and are intentionally left alone.
+
+## Manual switch
+
+Press `[m]` in the dashboard to override auto-swap and pick an account yourself:
+
+- `↑/↓` (or `j/k`, or number keys `1-9`) move the cursor
+- `enter` swaps the plain slot to the highlighted row — the next API call from any default-flow `claude` tab uses the new account immediately, no restart
+- `esc`/`m`/`q` cancels
+
+The picked account becomes a **pin** (`★` turns blue, `📌 pin: <name>` shows in the help bar). While pinned:
+
+- `RebalanceOnReset` is suppressed — the dashboard won't auto-swap off your pick when some other account's window resets.
+- The threshold cascade still applies — when the pinned account hits 90% (or whatever your lowest threshold is), auto-swap takes over and rotates to a fresh candidate. The pin clears the moment auto-swap moves the active dir.
+
+In other words: "use this account until the next threshold."
+
+### From a `claude` slash command
+
+Two CLI entry points let you drive the swap from outside the TUI — useful for a `/switch-account` slash command:
+
+```sh
+claude-monitor --list-accounts            # name, email, 5h util, active marker
+claude-monitor --swap-to acc-be-2         # by short name
+claude-monitor --swap-to alice@corp.com   # or by email
+```
+
+A sample slash command lives in [`commands/switch-account.md`](commands/switch-account.md). Drop it into your Claude Code commands dir:
+
+```sh
+mkdir -p ~/.claude/commands
+cp commands/switch-account.md ~/.claude/commands/
+```
+
+Then in any Claude Code tab:
+
+- `/switch-account` — Claude lists accounts and asks which to pick.
+- `/switch-account acc-be-2` — Claude swaps directly.
+
+The next API call from that session picks up the new bearer token because Claude Code re-reads the keychain on each request.
 
 ## How it works
 

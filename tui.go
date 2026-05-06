@@ -57,6 +57,17 @@ type upgradeDoneMsg struct {
 // user has time to read "✓ upgraded" before the TUI tears down.
 type upgradeQuitMsg struct{}
 
+// manualSwapDoneMsg is the result of a [m]-triggered keychain rewrite.
+// targetDir identifies the account the user picked; err is non-nil
+// when the keychain write failed (in which case the active account
+// is unchanged and a flash banner reports the error).
+type manualSwapDoneMsg struct {
+	targetDir string
+	targetTag string
+	fromTag   string
+	err       error
+}
+
 // ----------------------------------------------------------------------
 // Model
 // ----------------------------------------------------------------------
@@ -105,6 +116,18 @@ type model struct {
 
 	editing bool
 	editor  editorState
+
+	// Manual-swap picker state. When picking is true, [m] is open and
+	// pickCursor is the index into m.rows of the highlighted row;
+	// arrow keys move it, Enter executes the swap. manualPickDir is
+	// the configDir of the user's most recent manual pick — while
+	// it equals the active dir, auto-swap's rebalance-on-reset is
+	// suppressed (the threshold cascade still applies, so the pick
+	// sticks until the next tier is hit).
+	picking        bool
+	pickCursor     int
+	manualPickDir  string
+	manualSwapping bool
 }
 
 func initialModel(root string, cfg Config) model {
@@ -155,6 +178,7 @@ func upgradeCmd(info *UpdateInfo) tea.Cmd {
 func (m *model) refreshCmd(version uint64) tea.Cmd {
 	root := m.root
 	cfg := m.cfg
+	manualPick := m.manualPickDir
 	// Snapshot the backoff map and prev-util map so the goroutine has a
 	// stable view, even if the user presses 'R' (which mutates
 	// m.backoff) or another tick fires while in flight.
@@ -175,7 +199,7 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		defer cancel()
-		res, err := FetchAll(ctx, root, cfg, skipUntil, prev)
+		res, err := FetchAll(ctx, root, cfg, skipUntil, prev, manualPick)
 		msg := refreshMsg{err: err, at: time.Now(), version: version}
 		if res != nil {
 			msg.rows = res.Rows
@@ -184,6 +208,28 @@ func (m *model) refreshCmd(version uint64) tea.Cmd {
 			msg.swapErr = res.SwapErr
 		}
 		return msg
+	}
+}
+
+// manualSwapCmd runs executeSwap off the UI goroutine. We snapshot the
+// rows + activeDir so the keychain writes don't race with concurrent
+// refreshes mutating m.rows.
+func (m *model) manualSwapCmd(target AccountUsage) tea.Cmd {
+	rows := append([]AccountUsage(nil), m.rows...)
+	activeDir := m.activeDir
+	fromTag := "?"
+	if active := findRow(rows, activeDir); active != nil {
+		fromTag = accountLabel(*active)
+	}
+	targetTag := accountLabel(target)
+	return func() tea.Msg {
+		err := executeSwap(rows, activeDir, target.ConfigDir)
+		return manualSwapDoneMsg{
+			targetDir: target.ConfigDir,
+			targetTag: targetTag,
+			fromTag:   fromTag,
+			err:       err,
+		}
 	}
 }
 
@@ -217,6 +263,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.editing {
 			if next, cmd, consumed := m.handleEditKey(msg); consumed {
+				return next, cmd
+			}
+		}
+		if m.picking {
+			if next, cmd, consumed := m.handlePickKey(msg); consumed {
 				return next, cmd
 			}
 		}
@@ -279,7 +330,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.prevUtil = next
+		// Auto-swap took over (or the active dir drifted out from
+		// under us for any other reason) — the manual pin no longer
+		// applies. Clearing here keeps the next decideSwap call
+		// honest about whether rebalance-on-reset should fire.
+		if m.manualPickDir != "" && m.activeDir != m.manualPickDir {
+			m.manualPickDir = ""
+		}
+		// Keep the picker cursor in range when row count changes.
+		if m.picking {
+			m.clampPickCursor()
+		}
 		return m, swapCmd
+
+	case manualSwapDoneMsg:
+		m.manualSwapping = false
+		if msg.err != nil {
+			m.flash = "swap failed: " + truncate(msg.err.Error(), 80)
+			m.flashExpiry = time.Now().Add(5 * time.Second)
+			return m, flashClearCmd(5 * time.Second)
+		}
+		m.activeDir = msg.targetDir
+		m.manualPickDir = msg.targetDir
+		// Drop the cached prev-util — the rebalance-on-reset detector
+		// would otherwise compare across the swap boundary and emit
+		// spurious "window reset" decisions.
+		m.prevUtil = map[string]float64{}
+		m.flash = fmt.Sprintf("swapped: %s → %s", msg.fromTag, msg.targetTag)
+		m.flashExpiry = time.Now().Add(3 * time.Second)
+		return m, flashClearCmd(3 * time.Second)
 
 	case flashClearMsg:
 		if time.Now().After(m.flashExpiry) {
@@ -349,8 +428,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cfg.AutoSwap = !m.cfg.AutoSwap
 		// When toggling swap on/off, drop the cached prev-util so the
 		// reset-rebalance trigger doesn't fire spuriously on the next
-		// refresh based on stale data from the previous mode.
+		// refresh based on stale data from the previous mode. Also
+		// drop any manual pin: with AutoSwap off the pin is moot, and
+		// turning it back on should start with a clean slate.
 		m.prevUtil = map[string]float64{}
+		m.manualPickDir = ""
 		m.persistAndFlash(fmt.Sprintf("auto-swap: %s", onOff(m.cfg.AutoSwap)))
 		return m, flashClearCmd(2 * time.Second)
 
@@ -359,6 +441,18 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.editing {
 			m.editor = editorState{}
 		}
+		return m, nil
+
+	case "m":
+		// Manual account picker. Disabled while another mid-flight
+		// swap is in progress so we don't queue racing keychain
+		// writes against each other.
+		if m.manualSwapping || len(m.rows) == 0 {
+			return m, nil
+		}
+		m.picking = true
+		m.pickCursor = m.indexOfActive()
+		m.clampPickCursor()
 		return m, nil
 
 	case "u":
@@ -389,6 +483,95 @@ func (m *model) persistAndFlash(text string) {
 	m.flashExpiry = time.Now().Add(2 * time.Second)
 }
 
+// handlePickKey is the inner mode active while the [m] manual-swap
+// picker is open. Up/Down move the cursor, Enter executes the swap
+// against the highlighted row, Esc/m close the picker. Returns
+// consumed=true so dashboard hotkeys don't fire under the picker.
+func (m model) handlePickKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "esc", "m", "q":
+		m.picking = false
+		return m, nil, true
+	case "up", "k":
+		if len(m.rows) == 0 {
+			return m, nil, true
+		}
+		m.pickCursor = (m.pickCursor - 1 + len(m.rows)) % len(m.rows)
+		return m, nil, true
+	case "down", "j", "tab":
+		if len(m.rows) == 0 {
+			return m, nil, true
+		}
+		m.pickCursor = (m.pickCursor + 1) % len(m.rows)
+		return m, nil, true
+	case "home", "g":
+		m.pickCursor = 0
+		return m, nil, true
+	case "end", "G":
+		if len(m.rows) > 0 {
+			m.pickCursor = len(m.rows) - 1
+		}
+		return m, nil, true
+	case "enter", " ":
+		if m.pickCursor < 0 || m.pickCursor >= len(m.rows) {
+			return m, nil, true
+		}
+		target := m.rows[m.pickCursor]
+		if target.refreshToken == "" {
+			m.flash = "cannot swap: " + accountLabel(target) + " has no stored credentials"
+			m.flashExpiry = time.Now().Add(3 * time.Second)
+			return m, flashClearCmd(3 * time.Second), true
+		}
+		if target.ConfigDir == m.activeDir {
+			// Picking the row that's already active is a no-op but
+			// also the natural "set this as my pin" gesture — record
+			// it so rebalance-on-reset is suppressed going forward.
+			m.manualPickDir = target.ConfigDir
+			m.picking = false
+			m.flash = "pinned: " + accountLabel(target)
+			m.flashExpiry = time.Now().Add(2 * time.Second)
+			return m, flashClearCmd(2 * time.Second), true
+		}
+		m.picking = false
+		m.manualSwapping = true
+		m.flash = "swapping → " + accountLabel(target) + "…"
+		m.flashExpiry = time.Now().Add(10 * time.Second)
+		return m, m.manualSwapCmd(target), true
+	}
+	// Number keys jump the cursor to that row index (1-based for
+	// keyboard ergonomics; row 1 is the first account).
+	if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+		idx := int(s[0]-'1')
+		if idx < len(m.rows) {
+			m.pickCursor = idx
+		}
+		return m, nil, true
+	}
+	return m, nil, true
+}
+
+func (m *model) clampPickCursor() {
+	if len(m.rows) == 0 {
+		m.pickCursor = 0
+		return
+	}
+	if m.pickCursor < 0 {
+		m.pickCursor = 0
+	}
+	if m.pickCursor >= len(m.rows) {
+		m.pickCursor = len(m.rows) - 1
+	}
+}
+
+func (m model) indexOfActive() int {
+	for i, r := range m.rows {
+		if r.ConfigDir == m.activeDir {
+			return i
+		}
+	}
+	return 0
+}
+
 // ----------------------------------------------------------------------
 // View
 // ----------------------------------------------------------------------
@@ -401,10 +584,13 @@ func (m model) View() string {
 	b.WriteString("\n")
 	b.WriteString(m.table(st))
 	b.WriteString(m.peakLine(st))
-	if m.editing {
+	switch {
+	case m.editing:
 		b.WriteString("\n")
 		b.WriteString(m.editorView(st))
-	} else if m.showHelp {
+	case m.picking, m.showHelp:
+		// Picker mode forces the help bar on so the picker controls
+		// are always visible regardless of the [?] toggle.
 		b.WriteString("\n")
 		b.WriteString(m.helpBar(st))
 	}
@@ -471,13 +657,13 @@ func (m model) table(st styles) string {
 	b.WriteString("\n")
 
 	now := time.Now()
-	for _, r := range m.rows {
+	for i, r := range m.rows {
 		// Live-countdown override: even if the row carries an old
 		// "rate limited" error string, prefer the deadline from the
 		// backoff map so the seconds tick down on screen.
 		if until, ok := m.backoff[r.ConfigDir]; ok && now.Before(until) {
 			remaining := until.Sub(now).Round(time.Second)
-			label := m.decorateLabel(st, r, accountLabel(r))
+			label := m.decorateLabel(st, i, r, accountLabel(r))
 			msg := fmt.Sprintf("rate limited (retry in %s)", remaining)
 			line := padRight(st.colHeader.Render(label), widths[0]) +
 				"  " + st.warn.Render(msg)
@@ -486,7 +672,7 @@ func (m model) table(st styles) string {
 			continue
 		}
 		if r.Err != nil {
-			label := m.decorateLabel(st, r, accountLabel(r))
+			label := m.decorateLabel(st, i, r, accountLabel(r))
 			line := padRight(st.colHeader.Render(label), widths[0]) +
 				"  " + st.errText.Render(truncate(r.Err.Error(), m.width-widths[0]-4))
 			b.WriteString(line)
@@ -495,7 +681,7 @@ func (m model) table(st styles) string {
 		}
 		u := r.Usage
 		cells := []string{
-			st.account.Render(m.decorateLabel(st, r, accountLabel(r))),
+			st.account.Render(m.decorateLabel(st, i, r, accountLabel(r))),
 			renderBarPct(st, fiveHourUtil(u), bw),
 			renderResetsAt(st, getResets(u.FiveHour), now),
 			renderBarPct(st, getUtil(u.SevenDay), bw),
@@ -544,9 +730,19 @@ func (m model) peakLine(st styles) string {
 }
 
 func (m model) helpBar(st styles) string {
+	if m.picking {
+		hint := fmt.Sprintf("%s pick   %s confirm   %s cancel",
+			st.key.Render("↑/↓"), st.key.Render("[enter]"), st.key.Render("[esc]"))
+		if m.pickCursor >= 0 && m.pickCursor < len(m.rows) {
+			label := accountLabel(m.rows[m.pickCursor])
+			hint = st.accent.Render("▶ "+label) + "   " + hint
+		}
+		return st.helpBar.Render(hint)
+	}
 	parts := []string{
 		fmt.Sprintf("%s auto-kick: %s", st.key.Render("[k]"), boolBadge(st, m.cfg.AutoKick)),
 		fmt.Sprintf("%s auto-swap: %s", st.key.Render("[s]"), boolBadge(st, m.cfg.AutoSwap)),
+		st.key.Render("[m]") + " switch",
 		st.key.Render("[e]") + " edit",
 		st.key.Render("[r]") + " refresh",
 		st.key.Render("[?]") + " toggle help",
@@ -559,6 +755,14 @@ func (m model) helpBar(st styles) string {
 		parts = append([]string{
 			fmt.Sprintf("%s upgrade %s", st.key.Render("[u]"), m.updateInfo.LatestTag),
 		}, parts...)
+	}
+	// Pin indicator: when a manual pick is in effect, surface its
+	// label so the user remembers why their high-util account isn't
+	// being auto-rebalanced away.
+	if m.manualPickDir != "" {
+		if r := findRow(m.rows, m.manualPickDir); r != nil {
+			parts = append(parts, st.accent.Render("📌 pin: "+accountLabel(*r)))
+		}
 	}
 	return st.helpBar.Render(strings.Join(parts, "   "))
 }
@@ -662,12 +866,21 @@ func accountLabel(r AccountUsage) string {
 	return r.Name
 }
 
-// decorateLabel prefixes a ★ to the label of whichever row currently
-// owns the plain keychain slot, so the user can tell at a glance which
-// account a default `claude` tab is talking to right now.
-func (m model) decorateLabel(st styles, r AccountUsage, label string) string {
+// decorateLabel prefixes a marker to the label of whichever row is
+// noteworthy: ▶ for the [m] picker cursor, ★ for the row that owns
+// the plain keychain slot. When the active row is also a manual pin,
+// ★ is rendered in the accent color instead of the kicked color so
+// the user can see at a glance that auto-rebalance is suppressed.
+func (m model) decorateLabel(st styles, idx int, r AccountUsage, label string) string {
+	if m.picking && idx == m.pickCursor {
+		return st.accent.Render("▶ ") + label
+	}
 	if r.ConfigDir != "" && r.ConfigDir == m.activeDir {
-		return st.kicked.Render("★ ") + label
+		marker := st.kicked.Render("★ ")
+		if r.ConfigDir == m.manualPickDir {
+			marker = st.accent.Render("★ ")
+		}
+		return marker + label
 	}
 	return "  " + label
 }

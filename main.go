@@ -17,6 +17,11 @@ var (
 			"Claude config dir or a parent directory containing several.")
 	flagVersion = flag.Bool("version", false, "Print version and exit")
 	flagUpgrade = flag.Bool("upgrade", false, "Download and install the latest release, then exit")
+	flagSwapTo  = flag.String("swap-to", "",
+		"Rewrite the default keychain slot to the given account (by name, email, or config dir) and exit. "+
+			"Lets a `/switch-account` slash command flip the running `claude` tab to a different account.")
+	flagListAccounts = flag.Bool("list-accounts", false,
+		"Print discovered accounts (name, email, 5h utilization, active marker) and exit.")
 )
 
 // version is wired by ldflags via the Makefile.
@@ -42,6 +47,20 @@ func main() {
 	if *flagUpgrade {
 		if err := runUpgrade(); err != nil {
 			die("upgrade failed: %v", err)
+		}
+		return
+	}
+
+	if *flagListAccounts {
+		if err := ListAccounts(*flagRoot); err != nil {
+			die("%v", err)
+		}
+		return
+	}
+
+	if *flagSwapTo != "" {
+		if err := SwapTo(*flagRoot, *flagSwapTo); err != nil {
+			die("%v", err)
 		}
 		return
 	}

@@ -52,7 +52,12 @@ type FetchResult struct {
 // prevUtil carries the previous tick's 5h utilization per config dir,
 // used by the swap module to detect window resets between refreshes.
 // Pass nil on the very first refresh.
-func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[string]time.Time, prevUtil map[string]float64) (*FetchResult, error) {
+//
+// manualPickDir is the configDir the user most recently pinned via the
+// in-TUI [m] picker; while it matches the active account, auto-swap's
+// rebalance-on-reset is suppressed (only the threshold cascade can
+// move off the pick). Pass "" when there is no active manual pick.
+func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[string]time.Time, prevUtil map[string]float64, manualPickDir string) (*FetchResult, error) {
 	accts, err := ResolveAccountDirs(rootSpec)
 	if err != nil {
 		return nil, err
@@ -93,7 +98,7 @@ func FetchAll(ctx context.Context, rootSpec string, cfg Config, skipUntil map[st
 	result := &FetchResult{Rows: rows}
 	result.ActiveDir = detectActiveDir(rows)
 	if cfg.AutoSwap {
-		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, cfg); target != nil {
+		if target, reason := decideSwap(rows, result.ActiveDir, prevUtil, manualPickDir, cfg); target != nil {
 			active := findRow(rows, result.ActiveDir)
 			ev := &SwapEvent{
 				FromName: rowDisplayName(active),

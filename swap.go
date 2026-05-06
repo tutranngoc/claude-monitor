@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 )
 
 // plainKeychainSvc is the OAuth slot that a `claude` invocation reads
@@ -70,10 +73,18 @@ func detectActiveDir(rows []AccountUsage) string {
 //     account just transitioned from positive util to ~0 since the last
 //     refresh, swap to that fresh account regardless of the threshold.
 //     This keeps load spread across accounts as their windows reset.
+//     Suppressed while the active account matches manualPickDir — once
+//     the user has manually pinned an account, only the threshold
+//     cascade is allowed to move off it.
 //
 // prevUtil maps configDir → previous-tick util, used only for the reset
 // detection. Pass nil on the first refresh.
-func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float64, cfg Config) (*AccountUsage, string) {
+//
+// manualPickDir is the configDir of the user's most recent manual pick
+// (empty when none). When the active account matches it, rebalance-
+// on-reset is bypassed; the threshold cascade still applies, so the
+// pick sticks until the next tier is hit.
+func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float64, manualPickDir string, cfg Config) (*AccountUsage, string) {
 	var active *AccountUsage
 	candidates := make([]*AccountUsage, 0, len(rows))
 	for i := range rows {
@@ -94,7 +105,8 @@ func decideSwap(rows []AccountUsage, activeDir string, prevUtil map[string]float
 		return nil, ""
 	}
 
-	if cfg.RebalanceOnReset && len(prevUtil) > 0 {
+	stickyManual := manualPickDir != "" && active.ConfigDir == manualPickDir
+	if cfg.RebalanceOnReset && len(prevUtil) > 0 && !stickyManual {
 		for _, c := range candidates {
 			cur := fiveHourUtil(c.Usage)
 			prev, hadPrev := prevUtil[c.ConfigDir]
@@ -200,4 +212,161 @@ func findRow(rows []AccountUsage, configDir string) *AccountUsage {
 		}
 	}
 	return nil
+}
+
+// findRowByIdent matches an account by name, email, or absolute config
+// dir — in that order, exact match only. Returns nil when no row
+// matches. Used by the CLI swap entry point so the slash command can
+// hand us whichever identifier is most convenient (name is the
+// shortest, email is the most stable).
+func findRowByIdent(rows []AccountUsage, ident string) *AccountUsage {
+	ident = strings.TrimSpace(ident)
+	if ident == "" {
+		return nil
+	}
+	for i := range rows {
+		if rows[i].Name == ident {
+			return &rows[i]
+		}
+	}
+	for i := range rows {
+		if rows[i].Email != "" && rows[i].Email == ident {
+			return &rows[i]
+		}
+	}
+	for i := range rows {
+		if rows[i].ConfigDir == ident {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+// snapshotAccountsLite resolves accounts and loads their per-dir
+// keychain creds, without making any network calls. Used by the CLI
+// helpers (--list-accounts, --swap-to) that don't need live
+// /api/oauth/usage data — only the credentials needed to identify the
+// active account and to write the plain slot.
+//
+// Rows that fail to load creds are still returned (with refreshToken
+// empty) so listing shows them as "not authenticated" rather than
+// silently dropping them.
+func snapshotAccountsLite(rootSpec string) ([]AccountUsage, error) {
+	accts, err := ResolveAccountDirs(rootSpec)
+	if err != nil {
+		return nil, err
+	}
+	if len(accts) == 0 {
+		if rootSpec == "" {
+			return nil, fmt.Errorf("no Claude config dirs found in $HOME (looked for ~/.claude*)")
+		}
+		return nil, fmt.Errorf("no accounts found under %s", rootSpec)
+	}
+	rows := make([]AccountUsage, len(accts))
+	for i, a := range accts {
+		rows[i] = AccountUsage{Name: a.name, ConfigDir: a.configDir, Email: a.email}
+		// Hashed-first because after a swap the plain entry no longer
+		// represents the default account; only the hashed entries are
+		// reliable per-account identities.
+		if creds, err := LoadCredentialsHashedFirst(a.configDir); err == nil {
+			rows[i].refreshToken = creds.RefreshToken
+		}
+	}
+	return rows, nil
+}
+
+// SwapTo is the non-TUI entry point that a slash command (or any
+// shell caller) hits via `claude-monitor --swap-to <ident>`. It writes
+// the plain keychain slot to point at the named account so the next
+// API call from any default-flow `claude` tab transparently picks up
+// the new bearer token.
+//
+// ident may be the account's short name ("acc-be-1"), its email, or
+// its absolute config dir.
+func SwapTo(rootSpec, ident string) error {
+	rows, err := snapshotAccountsLite(rootSpec)
+	if err != nil {
+		return err
+	}
+	target := findRowByIdent(rows, ident)
+	if target == nil {
+		return fmt.Errorf("account %q not found (try --list-accounts)", ident)
+	}
+	if target.refreshToken == "" {
+		return fmt.Errorf("account %q has no stored credentials (run `claude` once for that account)", ident)
+	}
+	activeDir := detectActiveDir(rows)
+	if activeDir == target.ConfigDir {
+		fmt.Printf("already active: %s\n", displayIdent(target))
+		return nil
+	}
+	fromName := "?"
+	if active := findRow(rows, activeDir); active != nil {
+		fromName = displayIdent(active)
+	}
+	if err := executeSwap(rows, activeDir, target.ConfigDir); err != nil {
+		return err
+	}
+	fmt.Printf("swapped: %s → %s\n", fromName, displayIdent(target))
+	return nil
+}
+
+// ListAccounts prints a table of discovered accounts with live 5h
+// utilization (so a slash command can show the user which account is
+// least loaded). The active account is marked with a trailing "(active)".
+//
+// Network errors per row render inline as the row's status, mirroring
+// the TUI behavior; an account that hasn't been authenticated yet
+// shows "not authenticated" instead of a percentage.
+func ListAccounts(rootSpec string) error {
+	cfg, _ := LoadConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := FetchAll(ctx, rootSpec, cfg, nil, nil, "")
+	if err != nil {
+		return err
+	}
+	maxName, maxEmail := len("NAME"), len("EMAIL")
+	for _, r := range res.Rows {
+		if n := len(r.Name); n > maxName {
+			maxName = n
+		}
+		if n := len(r.Email); n > maxEmail {
+			maxEmail = n
+		}
+	}
+	fmt.Printf("%-*s  %-*s  %6s  %s\n",
+		maxName, "NAME", maxEmail, "EMAIL", "5H", "STATUS")
+	for _, r := range res.Rows {
+		util := "—"
+		status := ""
+		switch {
+		case r.refreshToken == "" && r.Err == nil:
+			status = "not authenticated"
+		case r.Err != nil:
+			status = truncate(r.Err.Error(), 60)
+		case r.Usage != nil:
+			util = fmt.Sprintf("%3.0f%%", fiveHourUtil(r.Usage))
+		}
+		if r.ConfigDir == res.ActiveDir {
+			if status != "" {
+				status = "active — " + status
+			} else {
+				status = "active"
+			}
+		}
+		fmt.Printf("%-*s  %-*s  %6s  %s\n",
+			maxName, r.Name, maxEmail, r.Email, util, status)
+	}
+	return nil
+}
+
+func displayIdent(r *AccountUsage) string {
+	if r == nil {
+		return "?"
+	}
+	if r.Email != "" {
+		return fmt.Sprintf("%s (%s)", r.Name, r.Email)
+	}
+	return r.Name
 }
