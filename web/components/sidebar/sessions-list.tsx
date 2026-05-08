@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Loader2,
   MessageSquare,
+  Moon,
   ShieldAlert,
   Square,
 } from "lucide-react";
@@ -85,6 +86,15 @@ function SessionRow({
   const running =
     session.status === "thinking" || session.status === "awaiting_permission";
   const awaiting = session.status === "awaiting_permission";
+  // "starting" = SDK Query is spinning up (fresh session OR a session
+  // that was just promoted from the interrupted shadow). Show the same
+  // spinner as `running` but a distinct label so the user knows the
+  // backend is booting, not yet doing model work.
+  const starting = session.status === "starting";
+  // "interrupted" = loaded from disk after a restart, no live Query.
+  // Render with a sleeping icon + muted label so the user can tell at
+  // a glance it's a stored session waiting to wake up on click.
+  const interrupted = session.status === "interrupted";
 
   const onStop = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -104,6 +114,9 @@ function SessionRow({
           // even when scanning a long list. Active row keeps its own
           // accent so the user doesn't lose track of where they are.
           running && !active && "bg-amber-500/[0.07]",
+          // Starting rows: same wash family but cooler, signaling
+          // "booting up" vs "actively working".
+          starting && !active && "bg-sky-500/[0.07]",
           active
             ? "bg-sidebar-accent text-sidebar-accent-foreground"
             : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
@@ -128,6 +141,19 @@ function SessionRow({
                 aria-hidden
               />
             )
+          ) : starting ? (
+            // Same spinner glyph as `running` but in sky to differentiate
+            // "booting" from "actively thinking". The transition from
+            // starting → idle (or → thinking) flips the color naturally.
+            <Loader2
+              className="mt-0.5 size-3.5 shrink-0 animate-spin text-sky-500"
+              aria-hidden
+            />
+          ) : interrupted ? (
+            <Moon
+              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden
+            />
           ) : (
             <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
           )}
@@ -149,15 +175,34 @@ function SessionRow({
                   {" · "}
                   <span>{subtitle}</span>
                 </>
+              ) : starting ? (
+                <>
+                  <span className="font-medium text-sky-600 dark:text-sky-400">
+                    Starting…
+                  </span>
+                  {" · "}
+                  <span>{subtitle}</span>
+                </>
+              ) : interrupted ? (
+                <>
+                  <span className="font-medium">Restored</span>
+                  {" · "}
+                  <span>{subtitle}</span>
+                </>
               ) : (
                 subtitle
               )}
             </div>
           </div>
           {/* Status dot still rides along when the session is NOT
-              running (errored / closed / idle) — small enough not to
-              compete with the spinner. */}
-          {!running && <StatusDot status={session.status} />}
+              running / starting / interrupted — those already carry
+              their own icon (spinner / moon) and a colored label, so
+              an extra dot would just be noise. Errored / closed / idle
+              keep the dot since they fall back to the generic
+              MessageSquare icon. */}
+          {!running && !starting && !interrupted && (
+            <StatusDot status={session.status} />
+          )}
         </Link>
 
         {/* Stop button: visible on hover for running rows. Click stops
