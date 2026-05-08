@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useTransition } from "react";
 import { useDaemon, type ConnectionStatus } from "@/hooks/use-daemon";
 import { swapTo, type AccountState, type Window } from "@/lib/daemon";
@@ -45,6 +46,10 @@ export function Dashboard() {
           <h1 className="text-2xl font-semibold tracking-tight">claude-monitor</h1>
           <p className="text-sm text-muted-foreground">
             {accounts.length} account{accounts.length === 1 ? "" : "s"}
+            <span className="mx-2">·</span>
+            <Link href="/chat" className="hover:underline">
+              Chat sessions →
+            </Link>
           </p>
         </div>
         <ConnectionPill status={status} fetchedAt={snapshot?.fetched_at} />
