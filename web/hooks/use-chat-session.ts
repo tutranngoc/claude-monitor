@@ -5,6 +5,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionRequest,
+  ContextUsageBreakdown,
   PermissionDecision,
   PermissionRequest,
   SessionStatus,
@@ -28,6 +29,11 @@ interface State {
   // when the full `assistant` SDKMessage arrives (history takes over) or
   // a fresh turn begins. Indexed by Anthropic's content_block_index.
   streamingBlocks: StreamingBlock[];
+  // Authoritative context-window breakdown from the SDK's
+  // get_context_usage control request. Server pushes a fresh one
+  // after every `result` (end-of-turn). Drives the meter directly so
+  // we don't have to re-derive from `usage` deltas.
+  contextUsage: ContextUsageBreakdown | null;
 }
 
 type Action =
@@ -38,6 +44,7 @@ type Action =
   | { kind: "ask_user_question"; req: AskUserQuestionRequest }
   | { kind: "ask_user_question_resolved" }
   | { kind: "plan"; plan: PlanRecord }
+  | { kind: "context_usage"; breakdown: ContextUsageBreakdown }
   | { kind: "chat_error"; message: string }
   | { kind: "connection"; state: ConnectionState };
 
@@ -185,6 +192,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, pendingQuestion: null };
     case "plan":
       return { ...state, latestPlan: action.plan };
+    case "context_usage":
+      return { ...state, contextUsage: action.breakdown };
     case "chat_error":
       return { ...state, errors: [action.message, ...state.errors].slice(0, ERROR_CAP) };
     case "connection":
@@ -201,6 +210,7 @@ const initial: State = {
   errors: [],
   connection: "connecting",
   streamingBlocks: [],
+  contextUsage: null,
 };
 
 export interface UseChatSession extends State {
@@ -263,6 +273,12 @@ export function useChatSession(sessionId: string): UseChatSession {
     es.addEventListener("plan_submitted", onPlan);
     es.addEventListener("plan_approved", onPlan);
     es.addEventListener("plan_failed", onPlan);
+    es.addEventListener("context_usage", (e) => {
+      const breakdown = JSON.parse(
+        (e as MessageEvent).data,
+      ) as ContextUsageBreakdown;
+      dispatch({ kind: "context_usage", breakdown });
+    });
     es.addEventListener("closed", () => {
       dispatch({ kind: "connection", state: "closed" });
       es.close();

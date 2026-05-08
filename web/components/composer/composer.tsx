@@ -12,7 +12,12 @@ import {
 import { ArrowUp, GitBranch, Mic, Paperclip } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { Attachment, Effort, SessionUsage } from "@/lib/chat-types";
+import type {
+  Attachment,
+  ContextUsageBreakdown,
+  Effort,
+  SessionUsage,
+} from "@/lib/chat-types";
 import { modelById } from "@/lib/models";
 import {
   matchSlashCommands,
@@ -42,8 +47,12 @@ interface CommonProps {
   disabled?: boolean;
   placeholder?: string;
   helper?: string;
-  // Optional usage payload used to render the context meter.
+  // Optional usage payload used as the context-meter fallback before
+  // the SDK has shipped a real breakdown.
   usage?: SessionUsage;
+  // Authoritative context breakdown from the SDK. When present, it
+  // drives the meter directly (matches the CLI's /context view).
+  contextUsage?: ContextUsageBreakdown | null;
   // Slash-command registry. When provided, the composer pops an
   // autocomplete menu while the user is typing a leading "/name". Command
   // execution itself stays the parent's responsibility — the composer
@@ -370,7 +379,11 @@ export function Composer(props: Props) {
 
         <div className="flex-1" />
 
-        <ContextMeter usage={props.usage} contextWindow={contextWindow} />
+        <ContextMeter
+          breakdown={props.contextUsage}
+          usage={props.usage}
+          contextWindow={contextWindow}
+        />
         {props.permMode && props.onPermModeChange && (
           <ModePicker mode={props.permMode} onChange={props.onPermModeChange} />
         )}

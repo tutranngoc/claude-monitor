@@ -40,6 +40,11 @@ export async function GET(req: Request, { params }: Ctx) {
         writeEvent({ type: "message", data: msg });
       }
       writeEvent({ type: "status", data: { status: snap.summary.status } });
+      // Replay the latest context-usage breakdown so a tab reload
+      // doesn't show an empty meter until the next turn finishes.
+      if (snap.summary.context_usage) {
+        writeEvent({ type: "context_usage", data: snap.summary.context_usage });
+      }
       if (snap.pending_permission) {
         writeEvent({ type: "permission_request", data: snap.pending_permission });
       }

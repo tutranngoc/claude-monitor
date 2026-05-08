@@ -25,6 +25,7 @@ import type {
   AskUserQuestionRequest,
   Attachment,
   ChatEvent,
+  ContextUsageBreakdown,
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
@@ -81,8 +82,14 @@ interface ChatSession {
   // a tool-heavy turn `cache_read_input_tokens` balloons to N x the
   // real cached prefix. Reading from the assistant message gives the
   // live cached/new-input split for that single call, which is what
-  // the context-window meter wants.
+  // the context-window meter falls back to when the SDK control
+  // channel is unavailable.
   latestUsage?: SessionUsage;
+  // Authoritative context breakdown from the SDK control channel
+  // (Query.getContextUsage). This is the same data Claude CLI's
+  // /context renders. Refreshed once per turn (after `result`).
+  // Preferred over derived `latestUsage` when present.
+  latestContextUsage?: ContextUsageBreakdown;
 }
 
 // Stash the registry on globalThis so it survives Next.js dev module
@@ -129,8 +136,83 @@ function summarize(session: ChatSession): SessionSummary {
     effort: session.effort,
     permission_mode: session.permissionMode,
     usage: session.latestUsage,
+    context_usage: session.latestContextUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
   };
+}
+
+// refreshContextUsage queries the SDK control channel for an
+// authoritative breakdown of what's currently in the context window
+// (system prompt, tools, MCP, memory files, skills, messages, ...).
+// This is the same data the CLI's /context shows. We call it after
+// `result` messages so the sidebar/meter always reflects the latest
+// turn. Failures are swallowed: SDK versions without the control
+// method just leave `latestContextUsage` undefined and the UI falls
+// back to deriving from `latestUsage`.
+async function refreshContextUsage(session: ChatSession): Promise<void> {
+  const q = session.query as unknown as {
+    getContextUsage?: () => Promise<{
+      categories: Array<{
+        name: string;
+        tokens: number;
+        color: string;
+        isDeferred?: boolean;
+      }>;
+      totalTokens: number;
+      maxTokens: number;
+      percentage: number;
+      model: string;
+      memoryFiles?: Array<{ path: string; type: string; tokens: number }>;
+      mcpTools?: Array<{
+        name: string;
+        serverName: string;
+        tokens: number;
+        isLoaded?: boolean;
+      }>;
+      systemTools?: Array<{ name: string; tokens: number }>;
+      deferredBuiltinTools?: Array<{
+        name: string;
+        tokens: number;
+        isLoaded: boolean;
+      }>;
+      systemPromptSections?: Array<{ name: string; tokens: number }>;
+    }>;
+  };
+  if (typeof q.getContextUsage !== "function") return;
+  try {
+    const r = await q.getContextUsage();
+    const breakdown: ContextUsageBreakdown = {
+      categories: r.categories.map((c) => ({
+        name: c.name,
+        tokens: c.tokens,
+        color: c.color,
+        is_deferred: c.isDeferred,
+      })),
+      total_tokens: r.totalTokens,
+      max_tokens: r.maxTokens,
+      percentage: r.percentage,
+      model: r.model,
+      memory_files: r.memoryFiles,
+      mcp_tools: r.mcpTools?.map((t) => ({
+        name: t.name,
+        server_name: t.serverName,
+        tokens: t.tokens,
+        is_loaded: t.isLoaded,
+      })),
+      system_tools: r.systemTools,
+      deferred_builtin_tools: r.deferredBuiltinTools?.map((t) => ({
+        name: t.name,
+        tokens: t.tokens,
+        is_loaded: t.isLoaded,
+      })),
+      system_prompt_sections: r.systemPromptSections,
+    };
+    session.latestContextUsage = breakdown;
+    emit(session, { type: "context_usage", data: breakdown });
+  } catch {
+    // Control request can fail mid-shutdown or on transport hiccups;
+    // not worth surfacing — UI keeps the previous breakdown.
+  }
 }
 
 const TITLE_MAX = 80;
@@ -429,9 +511,12 @@ async function driveSession(session: ChatSession): Promise<void> {
       }
 
       // The SDK signals end-of-turn with a `result` message. Move back
-      // to "idle" so the UI knows it can prompt for another turn.
+      // to "idle" so the UI knows it can prompt for another turn, and
+      // pull a fresh authoritative context-usage breakdown via the
+      // control channel (fire-and-forget — UI gets it via SSE).
       if (msg.type === "result") {
         setStatus(session, "idle");
+        void refreshContextUsage(session);
       } else if (
         (msg.type === "assistant" || msg.type === "stream_event") &&
         (session.status === "starting" || session.status === "idle")

@@ -50,6 +50,10 @@ export interface SessionSummary {
   // context-window % indicator. input_tokens already accounts for the
   // running history the SDK ships each turn.
   usage?: SessionUsage;
+  // Authoritative context-window breakdown from the SDK control
+  // channel (Query.getContextUsage). Refreshed at end of each turn.
+  // When present, the UI prefers this over deriving from `usage`.
+  context_usage?: ContextUsageBreakdown;
   // Top-level Task subagents the model has spawned in this session.
   // Server derives from history so the sidebar can show a tree without
   // each client re-walking transcripts. Empty/omitted when none yet.
@@ -88,6 +92,43 @@ export interface SessionUsage {
   output_tokens: number;
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
+}
+
+// ContextUsageBreakdown mirrors the SDK control-protocol response for
+// `get_context_usage` (Query.getContextUsage()). It's the same data
+// the CLI's `/context` slash command renders, so surfacing it 1:1 in
+// the web orchestrator avoids the per-turn `usage` math entirely and
+// guarantees the meter agrees with the CLI.
+export interface ContextUsageCategory {
+  name: string;
+  tokens: number;
+  color: string;
+  is_deferred?: boolean;
+}
+
+export interface ContextUsageBreakdown {
+  categories: ContextUsageCategory[];
+  total_tokens: number;
+  max_tokens: number;
+  percentage: number;
+  model: string;
+  // Optional detail blocks. Not every category is broken out (the CLI
+  // shows them in expandable sections); we forward what's there for
+  // future expansion / debugging without forcing the UI to render all.
+  memory_files?: { path: string; type: string; tokens: number }[];
+  mcp_tools?: {
+    name: string;
+    server_name: string;
+    tokens: number;
+    is_loaded?: boolean;
+  }[];
+  system_tools?: { name: string; tokens: number }[];
+  deferred_builtin_tools?: {
+    name: string;
+    tokens: number;
+    is_loaded: boolean;
+  }[];
+  system_prompt_sections?: { name: string; tokens: number }[];
 }
 
 export interface PermissionRequest {
@@ -144,6 +185,7 @@ export type ChatEvent =
   | { type: "plan_submitted"; data: PlanRecord }
   | { type: "plan_approved"; data: PlanRecord }
   | { type: "plan_failed"; data: PlanRecord }
+  | { type: "context_usage"; data: ContextUsageBreakdown }
   | { type: "error"; data: { message: string } }
   | { type: "closed"; data: Record<string, never> };
 

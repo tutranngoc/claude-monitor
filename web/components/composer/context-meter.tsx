@@ -6,23 +6,44 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import type { SessionUsage } from "@/lib/chat-types";
+import type {
+  ContextUsageBreakdown,
+  SessionUsage,
+} from "@/lib/chat-types";
 import { cn } from "@/lib/utils";
 
 interface Props {
+  // Authoritative breakdown from the SDK control channel
+  // (Query.getContextUsage). When present, this drives the meter and
+  // popover directly — same data Claude CLI's /context shows.
+  breakdown?: ContextUsageBreakdown | null;
+  // Per-API-call usage snapshot. Used as a fallback before the first
+  // turn completes (server can't fetch a breakdown until then).
   usage?: SessionUsage;
+  // Model context window size, used only for the fallback path.
   contextWindow: number;
 }
 
 // ContextMeter renders a small ring + percentage. Clicking opens a
-// popover with a per-category breakdown (cached prefix, cache write,
-// new input, last output, auto-compact buffer, free) so the user can
-// see exactly what's filling the window.
-export function ContextMeter({ usage, contextWindow }: Props) {
+// popover with a per-category breakdown. When the SDK control channel
+// has reported a real breakdown, we render that 1:1 (same as the CLI's
+// /context). Otherwise we fall back to the cache_read / cache_create /
+// input / output split we can compute from `usage`.
+export function ContextMeter({ breakdown, usage, contextWindow }: Props) {
   const [open, setOpen] = useState(false);
-  const used = totalContextTokens(usage);
-  const pct = contextWindow > 0 ? Math.min(100, (used / contextWindow) * 100) : 0;
-  const display = used === 0 ? "0%" : pct >= 1 ? `${Math.round(pct)}%` : "<1%";
+  // Prefer the SDK breakdown's percentage/total. They already account
+  // for the autocompact buffer the way the CLI does, and they use the
+  // model's authoritative max_tokens (1M vs 200K) rather than a static
+  // table.
+  const pct = breakdown
+    ? Math.min(100, breakdown.percentage)
+    : (() => {
+        const used = totalContextTokens(usage);
+        return contextWindow > 0
+          ? Math.min(100, (used / contextWindow) * 100)
+          : 0;
+      })();
+  const display = pct === 0 ? "0%" : pct >= 1 ? `${Math.round(pct)}%` : "<1%";
   const r = 7;
   const c = 2 * Math.PI * r;
   const offset = c - (pct / 100) * c;
@@ -75,10 +96,144 @@ export function ContextMeter({ usage, contextWindow }: Props) {
         <span>{display}</span>
       </PopoverTrigger>
       <PopoverContent align="end" sideOffset={6} className="w-80 p-3">
-        <ContextBreakdown usage={usage} contextWindow={contextWindow} />
+        {breakdown ? (
+          <SdkBreakdown breakdown={breakdown} />
+        ) : (
+          <ContextBreakdown usage={usage} contextWindow={contextWindow} />
+        )}
       </PopoverContent>
     </Popover>
   );
+}
+
+// SdkBreakdown renders the SDK control-channel breakdown directly.
+// Each category arrives with a name + token count + color (Ink color
+// names like "cyan", "green"). We map those to Tailwind utility
+// classes so the dots and stacked bar agree with the CLI palette.
+function SdkBreakdown({ breakdown }: { breakdown: ContextUsageBreakdown }) {
+  const free = Math.max(0, breakdown.max_tokens - breakdown.total_tokens);
+  const pctOf = (n: number) =>
+    breakdown.max_tokens > 0 ? (n / breakdown.max_tokens) * 100 : 0;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">Context window</h3>
+        <span className="text-[11px] text-muted-foreground tabular-nums">
+          {fmt(breakdown.total_tokens)} / {fmt(breakdown.max_tokens)}
+        </span>
+      </div>
+
+      <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
+        {breakdown.categories.map((c) => {
+          const w = pctOf(c.tokens);
+          if (w <= 0) return null;
+          return (
+            <span
+              key={c.name}
+              title={`${c.name}: ${fmt(c.tokens)}`}
+              className={cn("h-full", inkColorToBar(c.color))}
+              style={{ width: `${w}%` }}
+            />
+          );
+        })}
+      </div>
+
+      <ul className="space-y-1.5 text-[12px]">
+        {breakdown.categories.map((c) => (
+          <li key={c.name} className="flex items-baseline gap-2">
+            <span
+              className={cn(
+                "mt-1 inline-block size-2 shrink-0 rounded-sm",
+                inkColorToDot(c.color),
+              )}
+              aria-hidden
+            />
+            <span className="min-w-0 flex-1 truncate">
+              {c.name}
+              {c.is_deferred && (
+                <span className="ml-1 text-muted-foreground">(deferred)</span>
+              )}
+            </span>
+            <span className="tabular-nums text-muted-foreground">
+              {fmt(c.tokens)}
+            </span>
+            <span className="w-10 text-right tabular-nums text-muted-foreground">
+              {pctLabel(pctOf(c.tokens))}
+            </span>
+          </li>
+        ))}
+        <li className="flex items-baseline gap-2 border-t border-border pt-1.5">
+          <span
+            className="mt-1 inline-block size-2 shrink-0 rounded-sm border border-dashed border-muted-foreground/40"
+            aria-hidden
+          />
+          <span className="min-w-0 flex-1 truncate font-medium">Free</span>
+          <span className="tabular-nums">{fmt(free)}</span>
+          <span className="w-10 text-right tabular-nums">
+            {pctLabel(pctOf(free))}
+          </span>
+        </li>
+      </ul>
+
+      <p className="text-[11px] text-muted-foreground">
+        Model: <span className="font-mono">{breakdown.model}</span>
+      </p>
+    </div>
+  );
+}
+
+// Ink color names → Tailwind. The SDK ships terminal palette keys
+// ("cyan", "green", "yellow", "magenta", "blue", "red", "gray",
+// "white"); /context uses these to colorize each row in the CLI. We
+// map to roughly comparable Tailwind shades so the web UI mirrors the
+// terminal at a glance. Unknown colors fall back to muted.
+function inkColorToBar(color: string): string {
+  switch (color.toLowerCase()) {
+    case "cyan":
+      return "bg-cyan-500/70";
+    case "green":
+      return "bg-emerald-500/70";
+    case "yellow":
+      return "bg-amber-500/70";
+    case "magenta":
+    case "pink":
+      return "bg-pink-500/70";
+    case "blue":
+      return "bg-sky-500/70";
+    case "red":
+      return "bg-destructive/70";
+    case "gray":
+    case "grey":
+    case "white":
+      return "bg-muted-foreground/40";
+    default:
+      return "bg-violet-500/70";
+  }
+}
+
+function inkColorToDot(color: string): string {
+  switch (color.toLowerCase()) {
+    case "cyan":
+      return "bg-cyan-500";
+    case "green":
+      return "bg-emerald-500";
+    case "yellow":
+      return "bg-amber-500";
+    case "magenta":
+    case "pink":
+      return "bg-pink-500";
+    case "blue":
+      return "bg-sky-500";
+    case "red":
+      return "bg-destructive";
+    case "gray":
+    case "grey":
+    case "white":
+      return "bg-muted-foreground/60";
+    default:
+      return "bg-violet-500";
+  }
 }
 
 interface CategoryBar {

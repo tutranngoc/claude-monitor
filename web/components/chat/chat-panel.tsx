@@ -353,6 +353,7 @@ export function ChatPanel({ session }: Props) {
               onSubmit={onSubmit}
               disabled={closed}
               usage={liveUsage}
+              contextUsage={chat.contextUsage ?? session.context_usage ?? null}
               commands={CHAT_COMMANDS}
               placeholder={
                 closed
