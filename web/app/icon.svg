@@ -1,0 +1,31 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <path
+    d="M 56 80 L 25 80 Q 18 80 18 73 L 18 25 Q 18 18 25 18 L 75 18 Q 82 18 82 25 L 82 50"
+    stroke="#1F2937"
+    stroke-width="6"
+    stroke-linecap="round"
+    fill="none"
+  />
+  <circle cx="71" cy="60" r="5" stroke="#1F2937" stroke-width="5" fill="none" />
+  <path
+    d="M 60 80 C 60 68, 82 68, 82 80"
+    stroke="#1F2937"
+    stroke-width="5"
+    stroke-linecap="round"
+    fill="none"
+  />
+  <g stroke="#E97451" stroke-width="3.5" stroke-linecap="round" transform="translate(40 42)">
+    <line x1="2" y1="0" x2="13" y2="0" />
+    <line x1="1.732" y1="1" x2="11.258" y2="6.5" />
+    <line x1="1" y1="1.732" x2="6.5" y2="11.258" />
+    <line x1="0" y1="2" x2="0" y2="13" />
+    <line x1="-1" y1="1.732" x2="-6.5" y2="11.258" />
+    <line x1="-1.732" y1="1" x2="-11.258" y2="6.5" />
+    <line x1="-2" y1="0" x2="-13" y2="0" />
+    <line x1="-1.732" y1="-1" x2="-11.258" y2="-6.5" />
+    <line x1="-1" y1="-1.732" x2="-6.5" y2="-11.258" />
+    <line x1="0" y1="-2" x2="0" y2="-13" />
+    <line x1="1" y1="-1.732" x2="6.5" y2="-11.258" />
+    <line x1="1.732" y1="-1" x2="11.258" y2="-6.5" />
+  </g>
+</svg>

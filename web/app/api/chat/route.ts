@@ -36,6 +36,8 @@ export async function POST(req: Request) {
       cwd: body.cwd?.trim() || DEFAULT_CWD,
       configDir: body.config_dir,
       accountName: body.account_name,
+      model: body.model,
+      effort: body.effort,
     });
     return NextResponse.json(summary, { status: 201 });
   } catch (err) {

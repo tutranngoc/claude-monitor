@@ -204,6 +204,12 @@ func (m model) helpBar(st styles) string {
 		st.key.Render("[?]") + " toggle help",
 		st.key.Render("[q]") + " quit",
 	}
+	// [o] only makes sense when the orchestrator URL is known.
+	if m.webURL != "" {
+		// Insert just before [q] so the most-quitted key stays last.
+		parts = append(parts[:len(parts)-1],
+			append([]string{st.key.Render("[o]") + " open web"}, parts[len(parts)-1])...)
+	}
 	// [u] is intentionally hidden when no update is advertised; surface
 	// it (prepended so it leads the row) only when update.Check
 	// returned a non-nil Info.

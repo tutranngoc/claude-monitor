@@ -1,0 +1,386 @@
+"use client";
+
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
+import { ArrowUp, Mic, Paperclip } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import type { Attachment, Effort, SessionUsage } from "@/lib/chat-types";
+import { modelById } from "@/lib/models";
+import {
+  matchSlashCommands,
+  type SlashCommand,
+} from "@/lib/slash-commands";
+import { fileToAttachment } from "./attachments";
+import { AttachmentChip } from "./attachment-chip";
+import { ContextMeter } from "./context-meter";
+import { FolderPicker } from "./folder-picker";
+import { ModelEffortPicker } from "./model-effort-picker";
+import { SlashCommandMenu } from "./slash-command-menu";
+
+export interface ComposerSubmit {
+  text: string;
+  attachments: Attachment[];
+}
+
+interface CommonProps {
+  effort: Effort;
+  onEffortChange: (e: Effort) => void;
+  model: string;
+  onModelChange: (id: string) => void;
+  onSubmit: (payload: ComposerSubmit) => Promise<void> | void;
+  busy?: boolean;
+  disabled?: boolean;
+  placeholder?: string;
+  helper?: string;
+  // Optional usage payload used to render the context meter.
+  usage?: SessionUsage;
+  // Slash-command registry. When provided, the composer pops an
+  // autocomplete menu while the user is typing a leading "/name". Command
+  // execution itself stays the parent's responsibility — the composer
+  // just hands the raw text back through onSubmit.
+  commands?: SlashCommand[];
+}
+
+interface HomeProps extends CommonProps {
+  mode: "home";
+  cwd: string;
+  onCwdChange: (p: string) => void;
+  recentCwds?: string[];
+}
+
+interface SessionProps extends CommonProps {
+  mode: "session";
+  cwd: string;
+}
+
+type Props = HomeProps | SessionProps;
+
+// Composer is the unified prompt box used on the home view (mode="home")
+// and inside an open session (mode="session"). The visual frame is
+// identical; only the top-row chips differ — home gets the folder + model
+// pickers (those choices freeze on session creation), session shows a
+// read-only label.
+//
+// Behavior change vs the old composer: per the user's request, Enter
+// inserts a newline and Shift+Enter (or the send button) submits.
+export function Composer(props: Props) {
+  const [text, setText] = useState("");
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const [menuIndex, setMenuIndex] = useState(0);
+  const [menuDismissed, setMenuDismissed] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Keep the textarea height in sync with content. Capping at ~12 rows
+  // matches Claude.ai's behavior — past that we scroll inside the field.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`;
+  }, [text]);
+
+  // Recompute the autocomplete list every render. matchSlashCommands
+  // returns [] when the menu shouldn't be visible (no leading slash, or
+  // the user typed past the name into argument territory). Esc dismissal
+  // is a separate flag so backspacing past the slash + retyping it
+  // re-opens the menu.
+  const menuMatches = useMemo<SlashCommand[]>(() => {
+    if (!props.commands || menuDismissed) return [];
+    return matchSlashCommands(text, props.commands);
+  }, [props.commands, text, menuDismissed]);
+  const menuOpen = menuMatches.length > 0;
+
+  // Reset highlight + dismissal whenever the visible list changes shape:
+  // out-of-range index becomes a no-op selection, and re-opening the menu
+  // should clear a stale dismiss.
+  useEffect(() => {
+    if (menuIndex >= menuMatches.length) setMenuIndex(0);
+  }, [menuMatches.length, menuIndex]);
+  useEffect(() => {
+    // Re-arming the dismissal once the user has cleared the slash entirely
+    // means typing "/" again opens a fresh menu.
+    if (!text.trimStart().startsWith("/")) setMenuDismissed(false);
+  }, [text]);
+
+  const canSend =
+    !props.busy &&
+    !props.disabled &&
+    (text.trim().length > 0 || attachments.length > 0);
+
+  // submitText accepts an optional override so the slash-menu can submit
+  // the canonical "/<name>" string for the highlighted command without
+  // first round-tripping through React state (which wouldn't be visible
+  // synchronously on the same keystroke).
+  const submitText = async (override?: string) => {
+    if (props.busy || props.disabled) return;
+    const textToSend = (override ?? text).trim();
+    if (textToSend.length === 0 && attachments.length === 0) return;
+    try {
+      await props.onSubmit({ text: textToSend, attachments });
+      setText("");
+      setAttachments([]);
+      setMenuDismissed(false);
+    } catch (e) {
+      setErrors((prev) =>
+        [e instanceof Error ? e.message : String(e), ...prev].slice(0, 3),
+      );
+    }
+  };
+
+  // pickCommand replaces the slash-prefix with the chosen command's
+  // canonical name. Used for Tab (complete) and click-when-args-needed —
+  // it does NOT submit. Enter on the menu submits via submitText instead,
+  // matching Claude CLI: highlighted item runs immediately on Enter.
+  const pickCommand = (cmd: SlashCommand) => {
+    const trailing = cmd.argHint ? " " : "";
+    const next = `/${cmd.name}${trailing}`;
+    setText(next);
+    setMenuDismissed(false);
+    // Defer the focus + caret move until after React applies the state —
+    // otherwise the cursor lands at position 0 because the textarea hasn't
+    // re-rendered with the new value yet.
+    queueMicrotask(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      const end = next.length;
+      ta.setSelectionRange(end, end);
+    });
+  };
+
+  // chooseFromMenu fires the highlighted command. For commands with args
+  // (argHint set) we just complete + leave the cursor for typing — sending
+  // them with no args would silently produce a usage message and surprise
+  // the user. For arg-less commands we submit immediately.
+  const chooseFromMenu = (cmd: SlashCommand) => {
+    if (cmd.argHint) {
+      pickCommand(cmd);
+      return;
+    }
+    void submitText(`/${cmd.name}`);
+  };
+
+  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (menuOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMenuIndex((i) => (i + 1) % menuMatches.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMenuIndex(
+          (i) => (i - 1 + menuMatches.length) % menuMatches.length,
+        );
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const choice = menuMatches[menuIndex];
+        if (choice) chooseFromMenu(choice);
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const choice = menuMatches[menuIndex];
+        if (choice) pickCommand(choice);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMenuDismissed(true);
+        return;
+      }
+    }
+    // Enter inserts newline (default browser behavior). Shift+Enter sends.
+    if (e.key === "Enter" && e.shiftKey) {
+      e.preventDefault();
+      void submitText();
+    }
+  };
+
+  const ingest = async (files: File[]) => {
+    const next: Attachment[] = [];
+    const failures: string[] = [];
+    for (const f of files) {
+      const r = await fileToAttachment(f);
+      if (r.ok) next.push(r.attachment);
+      else failures.push(`${r.filename}: ${r.reason}`);
+    }
+    if (next.length) setAttachments((prev) => [...prev, ...next]);
+    if (failures.length) setErrors((prev) => [...failures, ...prev].slice(0, 3));
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData.files);
+    if (items.length === 0) return;
+    e.preventDefault();
+    void ingest(items);
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    const items = Array.from(e.dataTransfer.files);
+    if (items.length) void ingest(items);
+  };
+
+  const model = modelById(props.model);
+  const contextWindow = model?.contextWindow ?? 200_000;
+
+  return (
+    <div
+      className={cn(
+        "relative rounded-2xl border bg-card shadow-sm transition-colors",
+        dragOver && "border-primary bg-primary/[0.04]",
+      )}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          setDragOver(true);
+        }
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={onDrop}
+    >
+      {menuOpen && (
+        <SlashCommandMenu
+          commands={menuMatches}
+          selectedIndex={menuIndex}
+          onHover={setMenuIndex}
+          onSelect={chooseFromMenu}
+        />
+      )}
+      {/* Top chip row — folder + (model when home) */}
+      <div className="flex flex-wrap items-center gap-1.5 px-2 pt-2">
+        {props.mode === "home" ? (
+          <>
+            <FolderPicker
+              value={props.cwd}
+              onChange={props.onCwdChange}
+              recents={props.recentCwds}
+            />
+          </>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
+            {shorten(props.cwd)}
+          </span>
+        )}
+      </div>
+
+      {/* Attachment chip strip */}
+      {attachments.length > 0 && (
+        <div className="flex flex-wrap gap-2 px-2 pt-2">
+          {attachments.map((a, i) => (
+            <AttachmentChip
+              key={`${a.type}-${i}-${"filename" in a ? a.filename : ""}`}
+              attachment={a}
+              onRemove={() =>
+                setAttachments((prev) => prev.filter((_, idx) => idx !== i))
+              }
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Textarea */}
+      <textarea
+        ref={taRef}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={onKeyDown}
+        onPaste={onPaste}
+        placeholder={props.placeholder ?? "Describe a task or ask a question"}
+        rows={2}
+        disabled={props.disabled}
+        className="block w-full resize-none border-0 bg-transparent px-3 py-2.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-60"
+      />
+
+      {/* Bottom toolbar */}
+      <div className="flex items-center gap-1.5 border-t px-2 py-1.5">
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          aria-label="Attach files"
+          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <Paperclip className="size-4" />
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          accept="image/*,text/*,.md,.json,.yaml,.yml,.toml,.ts,.tsx,.js,.jsx,.go,.py,.rs,.rb,.php,.java,.cs,.swift,.kt,.html,.css,.scss,.sql,.graphql,.xml,.csv,.tsv,.proto,.sh,.bash,.lua,.scala,.c,.h,.cpp,.hpp"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            if (files.length) void ingest(files);
+            e.currentTarget.value = "";
+          }}
+        />
+        <button
+          type="button"
+          aria-label="Voice input (coming soon)"
+          disabled
+          className="flex size-7 items-center justify-center rounded-md text-muted-foreground/50"
+        >
+          <Mic className="size-4" />
+        </button>
+
+        <div className="flex-1" />
+
+        <ContextMeter usage={props.usage} contextWindow={contextWindow} />
+        <ModelEffortPicker
+          modelId={props.model}
+          effort={props.effort}
+          onModelChange={props.onModelChange}
+          onEffortChange={props.onEffortChange}
+        />
+
+        <Button
+          size="icon-sm"
+          onClick={() => void submitText()}
+          disabled={!canSend}
+          aria-label="Send (Shift+Enter)"
+          className="ml-1 rounded-full"
+        >
+          <ArrowUp className="size-4" />
+        </Button>
+      </div>
+
+      {(props.helper || errors.length > 0) && (
+        <div className="space-y-0.5 px-3 pb-2 text-[11px]">
+          {props.helper && (
+            <div className="text-muted-foreground">{props.helper}</div>
+          )}
+          {errors.map((e, i) => (
+            <div key={i} className="text-destructive">
+              {e}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function shorten(p: string): string {
+  if (!p) return "";
+  const m = /^\/Users\/[^/]+/.exec(p);
+  const compact = m ? "~" + p.slice(m[0].length) : p;
+  if (compact.length <= 40) return compact;
+  const parts = compact.split("/").filter(Boolean);
+  if (parts.length <= 2) return compact;
+  return ".../" + parts.slice(-2).join("/");
+}

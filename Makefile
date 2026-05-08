@@ -2,6 +2,7 @@ BINARY      := claude-monitor
 PKG         := ./cmd/claude-monitor
 ALL_PKGS    := ./...
 BIN_DIR     := bin
+WEB_DIR     := web
 INSTALL_DIR ?= $(HOME)/bin
 
 GOOS   ?= $(shell go env GOOS)
@@ -16,37 +17,38 @@ ifeq ($(GOOS),darwin)
 LDFLAGS += -linkmode=external
 endif
 
-.PHONY: all build run once install clean fmt vet tidy release help
+.PHONY: all build build-go build-web run once install clean fmt vet tidy release help
 
 all: build
 
-## build: compile binary into ./bin/
-build:
+## build: compile Go binary AND build the Next.js web orchestrator
+build: build-go build-web
+
+## build-go: compile the Go binary into ./bin/
+build-go:
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/$(BINARY) $(PKG)
 	@if [ "$(GOOS)" = "darwin" ]; then codesign -f -s - $(BIN_DIR)/$(BINARY) >/dev/null; fi
 	@echo "built $(BIN_DIR)/$(BINARY) ($(GOOS)/$(GOARCH), $(VERSION))"
 
-## run: build and start the TUI
+## build-web: install web deps + run `next build` so claude-monitor can spawn it
+build-web:
+	@command -v pnpm >/dev/null 2>&1 || { echo "pnpm not found; install with: npm i -g pnpm"; exit 1; }
+	@cd $(WEB_DIR) && pnpm install --frozen-lockfile
+	@cd $(WEB_DIR) && pnpm exec next build
+	@echo "built $(WEB_DIR)/.next"
+
+## run: build everything and start claude-monitor (daemon + web)
 run: build
 	$(BIN_DIR)/$(BINARY)
 
-## install: copy binary to $(INSTALL_DIR) (default: ~/bin)
+## install: copy binary AND web build to $(INSTALL_DIR) (default: ~/bin)
 install: build
 	@mkdir -p $(INSTALL_DIR)
 	install -m 0755 $(BIN_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
 	@echo "installed to $(INSTALL_DIR)/$(BINARY)"
-
-## release: cross-compile darwin+linux, amd64+arm64 into ./bin/
-release:
-	@mkdir -p $(BIN_DIR)
-	@for os in darwin linux; do \
-		for arch in amd64 arm64; do \
-			out=$(BIN_DIR)/$(BINARY)-$$os-$$arch; \
-			echo "building $$out"; \
-			GOOS=$$os GOARCH=$$arch go build -ldflags '$(LDFLAGS)' -o $$out $(PKG) || exit 1; \
-		done; \
-	done
+	@echo "note: web build stays at $(CURDIR)/$(WEB_DIR); claude-monitor finds it via the binary's location."
+	@echo "      to relocate, set CLAUDE_MONITOR_WEB_DIR or run from a layout where the binary's parent has a web/ sibling."
 
 ## fmt: gofmt all sources
 fmt:
@@ -60,9 +62,20 @@ vet:
 tidy:
 	go mod tidy
 
-## clean: remove build artifacts
+## clean: remove Go build artifacts (web build kept — `cd web && pnpm clean` for that)
 clean:
 	rm -rf $(BIN_DIR) $(BINARY)
+
+## release: cross-compile darwin+linux, amd64+arm64 into ./bin/
+release:
+	@mkdir -p $(BIN_DIR)
+	@for os in darwin linux; do \
+		for arch in amd64 arm64; do \
+			out=$(BIN_DIR)/$(BINARY)-$$os-$$arch; \
+			echo "building $$out"; \
+			GOOS=$$os GOARCH=$$arch go build -ldflags '$(LDFLAGS)' -o $$out $(PKG) || exit 1; \
+		done; \
+	done
 
 ## help: list targets
 help:

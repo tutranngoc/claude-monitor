@@ -118,6 +118,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/swap-to", s.handleSwapTo)
+	mux.HandleFunc("POST /api/account/login", s.handleAccountLogin)
+	mux.HandleFunc("POST /api/account/add", s.handleAccountAdd)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
 	mux.HandleFunc("OPTIONS /api/{rest...}", s.handleCORSPreflight)

@@ -90,6 +90,39 @@ export async function swapTo(
   return jsonOrThrow(res);
 }
 
+// reloginAccount asks the daemon to spawn Terminal.app running
+// `claude auth login` for an existing account. The browser doesn't
+// see the OAuth flow itself — the user completes it in the terminal
+// and the next ticker refresh picks up the new credentials.
+export async function reloginAccount(
+  ident: string,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; config_dir: string }> {
+  const res = await fetch(`${DAEMON_URL}/api/account/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ident }),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
+// addAccount provisions ~/.claude-<name> on the daemon side and
+// kicks off the same terminal-based login flow. `email` is optional
+// and forwarded as `--email` so the OAuth browser pre-fills.
+export async function addAccount(
+  payload: { name: string; email?: string },
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; config_dir: string; name: string }> {
+  const res = await fetch(`${DAEMON_URL}/api/account/add`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
 // WorktreePhase + WorktreeResult mirror the Go shapes in
 // internal/server/worktrees.go. The daemon expects branch names per
 // phase; web picks the convention (currently `wo/<plan-short>/<slug>`).

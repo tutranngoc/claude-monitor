@@ -3,9 +3,12 @@
 import { useEffect, useReducer, useRef } from "react";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type {
+  AskUserQuestionAnswers,
+  AskUserQuestionRequest,
   PermissionDecision,
   PermissionRequest,
   SessionStatus,
+  StreamingBlock,
 } from "@/lib/chat-types";
 import type { PlanRecord } from "@/lib/plan-types";
 
@@ -15,9 +18,14 @@ interface State {
   history: SDKMessage[];
   status: SessionStatus;
   pendingPermission: PermissionRequest | null;
+  pendingQuestion: AskUserQuestionRequest | null;
   latestPlan: PlanRecord | null;
   errors: string[];
   connection: ConnectionState;
+  // Per-block streaming state for the in-flight assistant turn. Cleared
+  // when the full `assistant` SDKMessage arrives (history takes over) or
+  // a fresh turn begins. Indexed by Anthropic's content_block_index.
+  streamingBlocks: StreamingBlock[];
 }
 
 type Action =
@@ -25,22 +33,154 @@ type Action =
   | { kind: "status"; status: SessionStatus }
   | { kind: "permission_request"; req: PermissionRequest }
   | { kind: "permission_resolved" }
+  | { kind: "ask_user_question"; req: AskUserQuestionRequest }
+  | { kind: "ask_user_question_resolved" }
   | { kind: "plan"; plan: PlanRecord }
   | { kind: "chat_error"; message: string }
   | { kind: "connection"; state: ConnectionState };
 
 const ERROR_CAP = 10;
 
+// Anthropic streaming-event envelope as forwarded by the SDK's
+// SDKPartialAssistantMessage. Only the fields we actually read are typed;
+// the SDK validates the rest upstream.
+interface StreamEnvelope {
+  event?: {
+    type: string;
+    index?: number;
+    content_block?: {
+      type: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+    };
+    delta?: {
+      type: string;
+      text?: string;
+      thinking?: string;
+      partial_json?: string;
+    };
+  };
+}
+
+function setBlock(
+  blocks: StreamingBlock[],
+  index: number,
+  block: StreamingBlock,
+): StreamingBlock[] {
+  const out = blocks.slice();
+  out[index] = block;
+  return out;
+}
+
+function patchBlock(
+  blocks: StreamingBlock[],
+  index: number,
+  patch: Partial<StreamingBlock>,
+): StreamingBlock[] {
+  const existing = blocks[index];
+  if (!existing) return blocks;
+  return setBlock(blocks, index, { ...existing, ...patch } as StreamingBlock);
+}
+
+function reduceStreamEvent(state: State, msg: SDKMessage): State {
+  const ev = (msg as unknown as StreamEnvelope).event;
+  if (!ev) return state;
+  // message_start opens a fresh turn — drop any leftover preview blocks.
+  if (ev.type === "message_start") {
+    return { ...state, streamingBlocks: [] };
+  }
+  if (ev.type === "content_block_start" && typeof ev.index === "number" && ev.content_block) {
+    const cb = ev.content_block;
+    const i = ev.index;
+    if (cb.type === "text") {
+      return { ...state, streamingBlocks: setBlock(state.streamingBlocks, i, { type: "text", text: "" }) };
+    }
+    if (cb.type === "thinking") {
+      return {
+        ...state,
+        streamingBlocks: setBlock(state.streamingBlocks, i, { type: "thinking", thinking: "" }),
+      };
+    }
+    if (cb.type === "tool_use") {
+      return {
+        ...state,
+        streamingBlocks: setBlock(state.streamingBlocks, i, {
+          type: "tool_use",
+          id: cb.id ?? "",
+          name: cb.name ?? "",
+          partial_json: "",
+        }),
+      };
+    }
+    return state;
+  }
+  if (ev.type === "content_block_delta" && typeof ev.index === "number" && ev.delta) {
+    const i = ev.index;
+    const d = ev.delta;
+    const existing = state.streamingBlocks[i];
+    if (!existing) return state;
+    if (d.type === "text_delta" && existing.type === "text") {
+      const chunk = d.text ?? "";
+      if (!chunk) return state;
+      return {
+        ...state,
+        streamingBlocks: patchBlock(state.streamingBlocks, i, { text: existing.text + chunk }),
+      };
+    }
+    if (d.type === "thinking_delta" && existing.type === "thinking") {
+      const chunk = d.thinking ?? "";
+      if (!chunk) return state;
+      return {
+        ...state,
+        streamingBlocks: patchBlock(state.streamingBlocks, i, {
+          thinking: existing.thinking + chunk,
+        }),
+      };
+    }
+    if (d.type === "input_json_delta" && existing.type === "tool_use") {
+      const chunk = d.partial_json ?? "";
+      if (!chunk) return state;
+      return {
+        ...state,
+        streamingBlocks: patchBlock(state.streamingBlocks, i, {
+          partial_json: existing.partial_json + chunk,
+        }),
+      };
+    }
+    return state;
+  }
+  return state;
+}
+
 function reducer(state: State, action: Action): State {
   switch (action.kind) {
-    case "message":
+    case "message": {
+      // stream_event: token deltas. Update per-block streaming state, leave history.
+      if (action.msg.type === "stream_event") {
+        return reduceStreamEvent(state, action.msg);
+      }
+      // Full assistant reply arrived — drop streaming preview so the real
+      // bubble (rendered from history) takes over without overlap.
+      if (action.msg.type === "assistant") {
+        return {
+          ...state,
+          history: [...state.history, action.msg],
+          streamingBlocks: [],
+        };
+      }
       return { ...state, history: [...state.history, action.msg] };
+    }
     case "status":
       return { ...state, status: action.status };
     case "permission_request":
       return { ...state, pendingPermission: action.req };
     case "permission_resolved":
       return { ...state, pendingPermission: null };
+    case "ask_user_question":
+      return { ...state, pendingQuestion: action.req };
+    case "ask_user_question_resolved":
+      return { ...state, pendingQuestion: null };
     case "plan":
       return { ...state, latestPlan: action.plan };
     case "chat_error":
@@ -54,14 +194,18 @@ const initial: State = {
   history: [],
   status: "starting",
   pendingPermission: null,
+  pendingQuestion: null,
   latestPlan: null,
   errors: [],
   connection: "connecting",
+  streamingBlocks: [],
 };
 
 export interface UseChatSession extends State {
   send: (text: string) => Promise<void>;
   decide: (decision: PermissionDecision) => Promise<void>;
+  answer: (answers: AskUserQuestionAnswers) => Promise<void>;
+  cancelQuestion: (message?: string) => Promise<void>;
   approvePlan: (planId: string) => Promise<void>;
   stop: () => Promise<void>;
 }
@@ -94,6 +238,13 @@ export function useChatSession(sessionId: string): UseChatSession {
     });
     es.addEventListener("permission_resolved", () => {
       dispatch({ kind: "permission_resolved" });
+    });
+    es.addEventListener("ask_user_question", (e) => {
+      const req = JSON.parse((e as MessageEvent).data) as AskUserQuestionRequest;
+      dispatch({ kind: "ask_user_question", req });
+    });
+    es.addEventListener("ask_user_question_resolved", () => {
+      dispatch({ kind: "ask_user_question_resolved" });
     });
     const onPlan = (e: Event) => {
       const plan = JSON.parse((e as MessageEvent).data) as PlanRecord;
@@ -154,6 +305,38 @@ export function useChatSession(sessionId: string): UseChatSession {
     }
   };
 
+  const answer = async (answers: AskUserQuestionAnswers) => {
+    const req = state.pendingQuestion;
+    if (!req) return;
+    const res = await fetch(`/api/chat/${sessionId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: req.id, answers }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `answer failed: ${body}` });
+    }
+  };
+
+  const cancelQuestion = async (message?: string) => {
+    const req = state.pendingQuestion;
+    if (!req) return;
+    const res = await fetch(`/api/chat/${sessionId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request_id: req.id,
+        cancel: true,
+        message: message ?? "",
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `cancel failed: ${body}` });
+    }
+  };
+
   const approvePlan = async (planId: string) => {
     const res = await fetch(`/api/chat/${sessionId}/plan/approve`, {
       method: "POST",
@@ -170,5 +353,5 @@ export function useChatSession(sessionId: string): UseChatSession {
     await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
   };
 
-  return { ...state, send, decide, approvePlan, stop };
+  return { ...state, send, decide, answer, cancelQuestion, approvePlan, stop };
 }

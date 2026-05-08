@@ -22,6 +22,10 @@ type model struct {
 	cfg     config.Config
 	root    string
 	version string
+	// webURL is the orchestrator URL the [o] hotkey opens in the user's
+	// browser. Empty means no spawn was hinted (legacy --tui standalone)
+	// — the hotkey shows a flash instead of trying to open nothing.
+	webURL string
 
 	rows        []account.Row
 	activeDir   string
@@ -122,13 +126,14 @@ const (
 	pickerRelogin
 )
 
-func initialModel(root string, cfg config.Config, version string) model {
+func initialModel(root string, cfg config.Config, version, webURL string) model {
 	// Start at inflight=1, refreshing=true so the first frame already
 	// shows "loading…" while Init's refreshCmd runs.
 	return model{
 		root:       root,
 		cfg:        cfg,
 		version:    version,
+		webURL:     webURL,
 		showHelp:   true,
 		inflight:   1,
 		refreshing: true,
@@ -154,8 +159,8 @@ func (m model) Init() tea.Cmd {
 // passed by value because the TUI owns its own copy after launch
 // (toggles persist via config.Save without touching the caller's
 // instance).
-func Run(root string, cfg config.Config, version string) (restart bool, err error) {
-	p := tea.NewProgram(initialModel(root, cfg, version), tea.WithAltScreen())
+func Run(root string, cfg config.Config, version, webURL string) (restart bool, err error) {
+	p := tea.NewProgram(initialModel(root, cfg, version, webURL), tea.WithAltScreen())
 	final, err := p.Run()
 	if err != nil {
 		return false, err

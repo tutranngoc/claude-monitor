@@ -8,8 +8,9 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-mono: var(--font-mono);
   --font-heading: var(--font-sans);
+  --font-display: var(--font-display);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -128,3 +129,56 @@
     @apply font-sans;
   }
 }
+
+/* Prose styles for assistant chat messages. Tight spacing, no horizontal
+   margins (the bubble already pads), and code blocks get full-bleed look. */
+.prose-chat {
+  @apply text-[0.95rem] leading-relaxed;
+}
+.prose-chat > * + * {
+  @apply mt-2;
+}
+.prose-chat h1,
+.prose-chat h2,
+.prose-chat h3,
+.prose-chat h4 {
+  @apply mt-4 font-semibold;
+}
+.prose-chat h1 {
+  @apply text-xl;
+}
+.prose-chat h2 {
+  @apply text-lg;
+}
+.prose-chat h3 {
+  @apply text-base;
+}
+.prose-chat h4 {
+  @apply text-sm uppercase tracking-wide text-muted-foreground;
+}
+.prose-chat p {
+  @apply whitespace-pre-wrap;
+}
+.prose-chat ul {
+  @apply list-disc pl-6;
+}
+.prose-chat ol {
+  @apply list-decimal pl-6;
+}
+.prose-chat li + li {
+  @apply mt-1;
+}
+.prose-chat blockquote {
+  @apply border-l-2 border-muted-foreground/30 pl-3 italic text-muted-foreground;
+}
+.prose-chat hr {
+  @apply my-4 border-border;
+}
+.prose-chat strong {
+  @apply font-semibold;
+}
+.prose-chat em {
+  @apply italic;
+}
+/* highlight.js theme is loaded inside the component import; we just keep
+   the pre/code base unchanged so token colors win against any reset. */

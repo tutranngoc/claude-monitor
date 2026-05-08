@@ -43,6 +43,9 @@ export async function GET(req: Request, { params }: Ctx) {
       if (snap.pending_permission) {
         writeEvent({ type: "permission_request", data: snap.pending_permission });
       }
+      if (snap.pending_question) {
+        writeEvent({ type: "ask_user_question", data: snap.pending_question });
+      }
       if (snap.latest_plan) {
         // Replay as the matching event type so the client reducer ends up
         // in the right state (submitted vs approved vs failed) without
