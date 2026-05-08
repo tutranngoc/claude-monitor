@@ -136,9 +136,28 @@ func autoDiscoverPaths() ([]string, error) {
 			// Skip files like .claude.json / .claude.json.backup.
 			continue
 		}
+		// Skip our own state directory. ~/.claude-monitor holds this
+		// app's persisted sessions (under sessions/), settings, and
+		// other internal state — not a Claude account config dir. It
+		// otherwise sneaks in because (a) the name starts with
+		// ".claude" and (b) the sessions/ subdir trips
+		// looksLikeClaudeDir's marker check, leaving a phantom
+		// "claude-monitor" row in the Accounts modal.
+		if isOwnStateDir(name) {
+			continue
+		}
 		out = append(out, filepath.Join(home, name))
 	}
 	return out, nil
+}
+
+// isOwnStateDir reports whether `name` (a basename under $HOME) is a
+// directory this app uses for its own state and must therefore not
+// surface as a Claude account. Currently just `.claude-monitor`, but
+// kept as a function so future siblings (e.g. `.claude-monitor-cache`)
+// can be added in one place.
+func isOwnStateDir(name string) bool {
+	return name == ".claude-monitor" || strings.HasPrefix(name, ".claude-monitor-")
 }
 
 // nameFor derives the display name for an account from its path.

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -231,6 +232,50 @@ func TestResolveDirsAutoDiscover(t *testing.T) {
 		names[i] = a.Name
 	}
 	want := []string{"claude", "claude-gem"}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("auto-discovered names = %v, want %v", names, want)
+	}
+}
+
+// TestResolveDirsSkipsOwnStateDir guards against a regression where
+// ~/.claude-monitor (where this app stores its own persisted sessions
+// under sessions/) gets picked up as a Claude account: its name starts
+// with ".claude" *and* the sessions/ subdir satisfies
+// looksLikeClaudeDir's marker check, so without an explicit skip it
+// shows up as a phantom "claude-monitor" row in the Accounts modal.
+func TestResolveDirsSkipsOwnStateDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	// Real account.
+	if err := os.MkdirAll(filepath.Join(tmp, ".claude", "projects"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Our own state dir — has sessions/ so it WOULD pass
+	// looksLikeClaudeDir if we didn't filter it out.
+	if err := os.MkdirAll(filepath.Join(tmp, ".claude-monitor", "sessions"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Hypothetical sibling state dir.
+	if err := os.MkdirAll(filepath.Join(tmp, ".claude-monitor-cache", "sessions"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	got, err := ResolveDirs("")
+	if err != nil {
+		t.Fatalf("ResolveDirs: %v", err)
+	}
+	names := make([]string, len(got))
+	for i, a := range got {
+		names[i] = a.Name
+	}
+	for _, n := range names {
+		if n == "claude-monitor" || strings.HasPrefix(n, "claude-monitor-") {
+			t.Errorf("auto-discover surfaced own state dir %q in %v", n, names)
+		}
+	}
+	want := []string{"claude"}
 	sort.Strings(names)
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("auto-discovered names = %v, want %v", names, want)
