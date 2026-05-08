@@ -19,6 +19,7 @@ import type {
   AskUserQuestionAnswers,
   AskUserQuestionRequest,
   Effort,
+  PermissionMode,
   SessionSummary,
   SessionUsage,
   StreamingBlock,
@@ -31,6 +32,8 @@ import {
   type ParsedCommand,
 } from "@/lib/slash-commands";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
+import { ThinkingIndicator } from "./thinking-indicator";
+import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
 import { AskQuestionCard } from "./ask-question-card";
@@ -56,7 +59,8 @@ type ChatItem =
   | { kind: "plan"; plan: PlanRecord }
   | { kind: "ask_question"; request: AskUserQuestionRequest }
   | { kind: "error"; message: string; index: number }
-  | { kind: "command_output"; output: CommandOutput; id: string };
+  | { kind: "command_output"; output: CommandOutput; id: string }
+  | { kind: "thinking" };
 
 interface CommandLog {
   id: string;
@@ -74,6 +78,12 @@ export function ChatPanel({ session }: Props) {
   const router = useRouter();
   const [effort, setEffort] = useState<Effort>(session.effort ?? DEFAULT_EFFORT);
   const [model, setModel] = useState<string>(session.model ?? "");
+  // permission_mode is one of the only session knobs whose default
+  // hasn't always existed on disk — coerce to "default" when the
+  // server returned a session without it.
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(
+    (session.permission_mode as PermissionMode | undefined) ?? "default",
+  );
   const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
 
@@ -102,10 +112,15 @@ export function ChatPanel({ session }: Props) {
   // first so the picker chip reflects the choice immediately; if the
   // server rejects (e.g. session already closed), we revert and surface
   // the error in the chat panel's error list.
-  const patchOptions = async (patch: { model?: string; effort?: Effort }) => {
-    const prev = { model, effort };
+  const patchOptions = async (patch: {
+    model?: string;
+    effort?: Effort;
+    permission_mode?: PermissionMode;
+  }) => {
+    const prev = { model, effort, permissionMode };
     if (patch.model) setModel(patch.model);
     if (patch.effort) setEffort(patch.effort);
+    if (patch.permission_mode) setPermissionMode(patch.permission_mode);
     try {
       const res = await fetch(`/api/chat/${session.id}`, {
         method: "PATCH",
@@ -116,6 +131,7 @@ export function ChatPanel({ session }: Props) {
     } catch {
       setModel(prev.model);
       setEffort(prev.effort);
+      setPermissionMode(prev.permissionMode);
     }
   };
 
@@ -177,6 +193,16 @@ export function ChatPanel({ session }: Props) {
     flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
     if (chat.streamingBlocks.length > 0) {
       out.push({ kind: "streaming", blocks: chat.streamingBlocks });
+    } else if (
+      chat.status === "thinking" &&
+      !chat.pendingPermission &&
+      !chat.pendingQuestion
+    ) {
+      // Server-side turn is in flight but no deltas have arrived
+      // yet (or extended thinking suppressed them). Show a thinking
+      // chip so the UI does not feel frozen during the multi-second
+      // wait before the first token streams in.
+      out.push({ kind: "thinking" });
     }
     if (chat.pendingQuestion) {
       out.push({ kind: "ask_question", request: chat.pendingQuestion });
@@ -194,9 +220,19 @@ export function ChatPanel({ session }: Props) {
     chat.pendingQuestion,
     chat.latestPlan,
     chat.errors,
+    chat.status,
+    chat.pendingPermission,
     commandLog,
     subagentDerivation,
   ]);
+
+  // Derive the visible queue from history. Anything user-typed after
+  // the latest `result` is unprocessed; the oldest is in flight (or
+  // about to be) and the rest are strictly waiting.
+  const queuedMessages = computeQueuedMessages(
+    chat.history,
+    chat.status === "thinking",
+  );
 
   const closed = chat.status === "closed" || chat.status === "errored";
 
@@ -225,6 +261,9 @@ export function ChatPanel({ session }: Props) {
       body: JSON.stringify({
         text: parsed?.raw ?? text,
         attachments,
+        // Generate per-submit so server can dedupe accidental repeats
+        // (double-Enter, browser auto-retry on a network blip).
+        client_request_id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
       }),
     });
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -298,7 +337,10 @@ export function ChatPanel({ session }: Props) {
         </div>
 
         <footer className="px-4 py-3">
-          <div className="mx-auto max-w-3xl">
+          <div className="mx-auto max-w-3xl space-y-2">
+            {queuedMessages.length > 0 && (
+              <QueueIndicator queued={queuedMessages} />
+            )}
             <Composer
               mode="session"
               cwd={session.cwd}
@@ -306,6 +348,8 @@ export function ChatPanel({ session }: Props) {
               onModelChange={(id) => void patchOptions({ model: id })}
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
+              permMode={permissionMode}
+              onPermModeChange={(m) => void patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
               disabled={closed}
               usage={liveUsage}
@@ -364,6 +408,7 @@ function ItemRow({
         {item.kind === "command_output" && (
           <CommandOutputBubble output={item.output} />
         )}
+        {item.kind === "thinking" && <ThinkingIndicator />}
       </div>
     </div>
   );
@@ -388,6 +433,8 @@ function itemKey(_: number, item: ChatItem): string {
       return `err:${item.index}`;
     case "command_output":
       return `cmd:${item.id}`;
+    case "thinking":
+      return "thinking";
   }
 }
 

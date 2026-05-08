@@ -38,6 +38,7 @@ export async function POST(req: Request) {
       accountName: body.account_name,
       model: body.model,
       effort: body.effort,
+      permissionMode: body.permission_mode,
     });
     return NextResponse.json(summary, { status: 201 });
   } catch (err) {

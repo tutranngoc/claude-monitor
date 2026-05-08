@@ -2,62 +2,26 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, MessageSquare } from "lucide-react";
+import { useMemo, useState, useTransition } from "react";
+import {
+  ChevronDown,
+  Loader2,
+  MessageSquare,
+  ShieldAlert,
+  Square,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSessions, stopSessionRemote } from "@/lib/sessions-context";
 import type { SessionSummary, SubagentSummary } from "@/lib/chat-types";
 
-// Sidebar's session list. Refetches when the route changes so a freshly
-// created chat appears the moment we navigate into it. Also listens
-// for `cm:session-subagents` window events fired by useChatSession so
-// the subagent tree stays live as the active chat dispatches subagents.
+// SessionsList consumes the shared SessionsProvider so the sidebar
+// renders rows from one /api/chat poll instead of opening many. The
+// running state is folded into each row directly (no separate "Running"
+// panel) since a run always belongs to exactly one session.
 export function SessionsList() {
+  const { sessions, refresh } = useSessions();
   const pathname = usePathname();
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  // Coalesce rapid-fire fetches — every assistant turn during a
-  // subagent's run flips the fingerprint, but the sidebar only needs
-  // one refresh per ~250ms to feel live.
-  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const refetch = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const res = await fetch("/api/chat", { signal });
-      if (!res.ok) return;
-      const data = (await res.json()) as { sessions: SessionSummary[] };
-      setSessions(data.sessions);
-    } catch {
-      // Aborted or transient — let the next refresh recover.
-    }
-  }, []);
-
-  useEffect(() => {
-    const ctrl = new AbortController();
-    let cancelled = false;
-    void (async () => {
-      await refetch(ctrl.signal);
-      if (!cancelled) setLoaded(true);
-    })();
-    return () => {
-      cancelled = true;
-      ctrl.abort();
-    };
-  }, [pathname, refetch]);
-
-  useEffect(() => {
-    const onUpdate = () => {
-      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
-      refreshTimerRef.current = setTimeout(() => {
-        refreshTimerRef.current = null;
-        void refetch();
-      }, 250);
-    };
-    window.addEventListener("cm:session-subagents", onUpdate);
-    return () => {
-      window.removeEventListener("cm:session-subagents", onUpdate);
-      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
-    };
-  }, [refetch]);
+  const { loaded } = useSessions();
 
   // Pull the active session id out of /chat/[id]. Avoids carrying the
   // pathname through every row.
@@ -83,7 +47,11 @@ export function SessionsList() {
     <ul className="space-y-0.5 px-1">
       {sessions.map((s) => (
         <li key={s.id}>
-          <SessionRow session={s} active={s.id === activeId} />
+          <SessionRow
+            session={s}
+            active={s.id === activeId}
+            onAfterStop={refresh}
+          />
         </li>
       ))}
     </ul>
@@ -93,24 +61,49 @@ export function SessionsList() {
 function SessionRow({
   session,
   active,
+  onAfterStop,
 }: {
   session: SessionSummary;
   active: boolean;
+  onAfterStop: () => void;
 }) {
   const title = session.title ?? "New chat";
   const subtitle = subtitleFor(session);
-  const subagents = session.subagents ?? [];
-  // Collapse subagent tree by default — most rows have at most a few
-  // subagents and clutter compounds across many sessions. Active row
-  // starts expanded so the user landing in /chat/[id] sees the tree
-  // they presumably came to dig into.
+  // Only surface subagents that are still working: once a Task completes,
+  // the user doesn't need it cluttering the sidebar tree. Filter inside
+  // useMemo so a fresh `[]` literal in `session.subagents` doesn't bust
+  // the dependency array on every render.
+  const activeSubagents = useMemo(
+    () => (session.subagents ?? []).filter((s) => s.status === "active"),
+    [session.subagents],
+  );
+  // Collapse subagent tree by default. Active row starts expanded so
+  // the user landing in /chat/[id] sees the tree they came to dig into.
   const [open, setOpen] = useState(active);
+  const [stopping, startStop] = useTransition();
+
+  const running =
+    session.status === "thinking" || session.status === "awaiting_permission";
+  const awaiting = session.status === "awaiting_permission";
+
+  const onStop = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    startStop(async () => {
+      await stopSessionRemote(session.id);
+      onAfterStop();
+    });
+  };
 
   return (
     <div className="group/row">
       <div
         className={cn(
           "relative flex items-start rounded-md transition-colors",
+          // Running rows get a soft amber wash so the eye spots them
+          // even when scanning a long list. Active row keeps its own
+          // accent so the user doesn't lose track of where they are.
+          running && !active && "bg-amber-500/[0.07]",
           active
             ? "bg-sidebar-accent text-sidebar-accent-foreground"
             : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
@@ -120,28 +113,88 @@ function SessionRow({
           href={`/chat/${session.id}`}
           className="flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-sm"
         >
-          <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
+          {running ? (
+            // Spinner / shield for in-flight sessions. Replaces the
+            // generic MessageSquare icon so a quick glance tells you
+            // which rows are doing work right now.
+            awaiting ? (
+              <ShieldAlert
+                className="mt-0.5 size-3.5 shrink-0 text-blue-500"
+                aria-hidden
+              />
+            ) : (
+              <Loader2
+                className="mt-0.5 size-3.5 shrink-0 animate-spin text-amber-500"
+                aria-hidden
+              />
+            )
+          ) : (
+            <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
+          )}
           <div className="min-w-0 flex-1 leading-tight">
             <div className="truncate">{title}</div>
             <div className="truncate text-[11px] text-muted-foreground">
-              {subtitle}
+              {running ? (
+                <>
+                  <span
+                    className={cn(
+                      "font-medium",
+                      awaiting
+                        ? "text-blue-600 dark:text-blue-400"
+                        : "text-amber-600 dark:text-amber-400",
+                    )}
+                  >
+                    {awaiting ? "Awaiting permission" : "Working…"}
+                  </span>
+                  {" · "}
+                  <span>{subtitle}</span>
+                </>
+              ) : (
+                subtitle
+              )}
             </div>
           </div>
-          <StatusDot status={session.status} />
+          {/* Status dot still rides along when the session is NOT
+              running (errored / closed / idle) — small enough not to
+              compete with the spinner. */}
+          {!running && <StatusDot status={session.status} />}
         </Link>
-        {subagents.length > 0 && (
+
+        {/* Stop button: visible on hover for running rows. Click stops
+            the session via DELETE. We render it as a real <button>
+            (not nested inside the Link) so its click handler runs
+            without first navigating into the chat. */}
+        {running && (
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={stopping}
+            aria-label={`Stop ${title}`}
+            title="Stop session"
+            className={cn(
+              "mt-1 mr-1 flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-all",
+              "opacity-0 group-hover/row:opacity-100",
+              "hover:bg-destructive/15 hover:text-destructive",
+              "disabled:opacity-40",
+            )}
+          >
+            <Square className="size-3" aria-hidden />
+          </button>
+        )}
+
+        {activeSubagents.length > 0 && (
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
             aria-label={
               open
-                ? `Hide ${subagents.length} subagents`
-                : `Show ${subagents.length} subagents`
+                ? `Hide ${activeSubagents.length} running subagents`
+                : `Show ${activeSubagents.length} running subagents`
             }
             className="flex shrink-0 items-center gap-1 px-1.5 py-1.5 text-[11px] font-mono text-muted-foreground transition-colors hover:text-foreground"
           >
-            <span>{subagents.length}</span>
+            <span>{activeSubagents.length}</span>
             <ChevronDown
               className={cn(
                 "size-3 transition-transform",
@@ -153,9 +206,9 @@ function SessionRow({
         )}
       </div>
 
-      {subagents.length > 0 && open && (
+      {activeSubagents.length > 0 && open && (
         <ul className="mt-0.5 ml-4 space-y-0.5 border-l border-border/60 pl-2">
-          {subagents.map((sub) => (
+          {activeSubagents.map((sub) => (
             <li key={sub.task_id}>
               <SubagentRow sessionId={session.id} subagent={sub} />
             </li>
@@ -217,21 +270,19 @@ function subtitleFor(s: SessionSummary): string {
   return when;
 }
 
+// StatusDot is only used for the *non-running* states (errored / closed
+// / idle) since running sessions get a more prominent spinner inline.
 function StatusDot({ status }: { status: SessionSummary["status"] }) {
-  const color =
+  const base =
     status === "errored"
       ? "bg-destructive"
-      : status === "thinking"
-        ? "bg-amber-500"
-        : status === "awaiting_permission"
-          ? "bg-blue-500"
-          : status === "closed"
-            ? "bg-muted-foreground/40"
-            : "bg-emerald-500";
+      : status === "closed"
+        ? "bg-muted-foreground/40"
+        : "bg-emerald-500";
   return (
     <span
       title={status.replace("_", " ")}
-      className={cn("mt-2 mr-2 inline-block size-1.5 shrink-0 rounded-full", color)}
+      className={cn("mt-2 mr-2 inline-block size-1.5 shrink-0 rounded-full", base)}
     />
   );
 }

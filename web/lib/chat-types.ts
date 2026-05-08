@@ -9,6 +9,17 @@ import type { PlanRecord } from "./plan-types";
 // SDK runtime) can use the same union.
 export type Effort = EffortLevel;
 
+// PermissionMode mirrors the SDK PermissionMode union but is duplicated
+// here so client modules (which can only import types from the SDK)
+// have a runtime-safe value. Keep in sync with the SDK upstream.
+export type PermissionMode =
+  | "default"
+  | "plan"
+  | "acceptEdits"
+  | "bypassPermissions"
+  | "dontAsk"
+  | "auto";
+
 export type SessionStatus =
   | "starting"
   | "idle"
@@ -32,6 +43,9 @@ export interface SessionSummary {
   // Selected at session creation; UI surfaces them in the composer.
   model?: string;
   effort?: Effort;
+  // Active permission mode. Drives auto-allow behavior server-side
+  // and the mode chip in the composer toolbar client-side.
+  permission_mode?: PermissionMode;
   // Most recent token usage from a `result` SDK message. Drives the
   // context-window % indicator. input_tokens already accounts for the
   // running history the SDK ships each turn.
@@ -154,6 +168,9 @@ export interface CreateSessionRequest {
   account_name?: string;
   model?: string;
   effort?: Effort;
+  // Active permission mode. Drives auto-allow behavior server-side
+  // and the mode chip in the composer toolbar client-side.
+  permission_mode?: PermissionMode;
 }
 
 // Inline image attachment for the input route. Source is a data URL the
@@ -179,6 +196,10 @@ export type Attachment = AttachmentImage | AttachmentText;
 export interface SendInputRequest {
   text: string;
   attachments?: Attachment[];
+  // Optional client-generated id used to dedupe accidental double-
+  // submits (smashing Enter, browser auto-retry on network blip).
+  // Server tracks recent ids in a short TTL cache and drops repeats.
+  client_request_id?: string;
 }
 
 // StreamingBlock mirrors a single Anthropic content block while it's still

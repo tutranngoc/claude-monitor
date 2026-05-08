@@ -11,7 +11,7 @@ import {
   HOME_COMMANDS,
   parseSlashCommand,
 } from "@/lib/slash-commands";
-import type { Effort, SessionSummary } from "@/lib/chat-types";
+import type { Effort, PermissionMode, SessionSummary } from "@/lib/chat-types";
 
 // HomeView is the empty-state landing of the workspace: a serif hero +
 // the composer. Submitting creates a session against the active account
@@ -25,6 +25,7 @@ export function HomeView() {
   const [cwd, setCwd] = useState<string>("");
   const [model, setModel] = useState<string>(DEFAULT_MODEL_ID);
   const [effort, setEffort] = useState<Effort>(DEFAULT_EFFORT);
+  const [mode, setMode] = useState<PermissionMode>("default");
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
 
@@ -87,6 +88,7 @@ export function HomeView() {
           cwd: cwd || undefined,
           model,
           effort,
+          permission_mode: mode,
         }),
       });
       if (!res.ok) {
@@ -98,7 +100,12 @@ export function HomeView() {
       const sendRes = await fetch(`/api/chat/${summary.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, attachments }),
+        body: JSON.stringify({
+          text,
+          attachments,
+          client_request_id:
+            globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+        }),
       });
       if (!sendRes.ok) {
         throw new Error(`send: ${sendRes.status}: ${await sendRes.text()}`);
@@ -138,6 +145,8 @@ export function HomeView() {
           onModelChange={setModel}
           effort={effort}
           onEffortChange={setEffort}
+          permMode={mode}
+          onPermModeChange={setMode}
           onSubmit={onSubmit}
           busy={busy}
           disabled={!active}

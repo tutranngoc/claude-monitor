@@ -4,7 +4,7 @@ import {
   stopSession,
   updateSessionOptions,
 } from "@/lib/server/sessions";
-import type { Effort } from "@/lib/chat-types";
+import type { Effort, PermissionMode } from "@/lib/chat-types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,19 +25,24 @@ export async function GET(_req: Request, { params }: Ctx) {
 interface PatchBody {
   model?: string;
   effort?: Effort;
+  permission_mode?: PermissionMode;
 }
 
 export async function PATCH(req: Request, { params }: Ctx) {
   const { id } = await params;
   const body = (await req.json().catch(() => ({}))) as PatchBody;
-  if (!body.model && !body.effort) {
+  if (!body.model && !body.effort && !body.permission_mode) {
     return NextResponse.json(
-      { error: "model or effort required" },
+      { error: "model, effort, or permission_mode required" },
       { status: 400 },
     );
   }
   try {
-    const summary = await updateSessionOptions(id, body);
+    const summary = await updateSessionOptions(id, {
+      model: body.model,
+      effort: body.effort,
+      permissionMode: body.permission_mode,
+    });
     return NextResponse.json(summary);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -29,10 +29,10 @@ export function Markdown({ source }: Props) {
   );
 }
 
-// Pulled out so the components object isn't reallocated on every render.
+// Pulled out so the components object is not reallocated on every render.
 const components: Components = {
   pre({ node, children }) {
-    // react-markdown renders fenced code as <pre><code class="language-x">…</code></pre>.
+    // react-markdown renders fenced code as <pre><code class="language-x">...</code></pre>.
     // We dig into the AST to read the language class + the raw source text,
     // then replace the whole pre with either CodeBlock or MermaidBlock.
     const codeNode = node?.children?.[0];
@@ -64,10 +64,10 @@ const components: Components = {
   code({ className, children, ...props }) {
     // react-markdown calls this for both inline `code` and the inner
     // <code> of a fenced ```block```. After rehype-highlight runs on the
-    // fenced one, className becomes "hljs language-x" — earlier we only
+    // fenced one, className becomes "hljs language-x" - earlier we only
     // checked for `language-` prefix, missed the rehype-prefixed string,
     // and applied inline `bg-muted` to the <code>. Since <code> is inline,
-    // its background paints under each text run separately — that's why
+    // its background paints under each text run separately - that's why
     // multi-line code blocks rendered with a light strip per line.
     //
     // Inline code never has a className from react-markdown, so the
@@ -88,22 +88,35 @@ const components: Components = {
       </code>
     );
   },
+  // Tables: the heavy styling lives in globals.css under `.prose-chat
+  // table` so the rules can use CSS variables for theme-aware colors.
+  // Here we only wire the wrapper (overflow + border + rounded corners
+  // for narrow viewports) and pass children through to a real
+  // <table>/<thead>/<tbody>/<tr>/<th>/<td> tree. Returning a wrapping div
+  // also keeps wide tables from blowing the bubble out horizontally.
   table({ children }) {
     return (
-      <div className="my-3 overflow-x-auto rounded-md border">
-        <table className="w-full text-sm">{children}</table>
+      <div className="my-3 overflow-x-auto rounded-lg border bg-card shadow-sm">
+        <table className="w-full">{children}</table>
       </div>
     );
   },
-  th({ children }) {
-    return (
-      <th className="border-b bg-muted/50 px-3 py-1.5 text-left font-medium">
-        {children}
-      </th>
-    );
+  thead({ children }) {
+    return <thead>{children}</thead>;
   },
-  td({ children }) {
-    return <td className="border-t px-3 py-1.5 align-top">{children}</td>;
+  tbody({ children }) {
+    return <tbody>{children}</tbody>;
+  },
+  tr({ children }) {
+    return <tr>{children}</tr>;
+  },
+  th({ children, style }) {
+    // GFM emits text-align via inline `style` for `:---:` etc. We forward
+    // it so column alignment hints from the source render correctly.
+    return <th style={style}>{children}</th>;
+  },
+  td({ children, style }) {
+    return <td style={style}>{children}</td>;
   },
   a({ children, href }) {
     return (

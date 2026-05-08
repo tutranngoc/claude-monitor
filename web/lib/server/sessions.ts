@@ -13,6 +13,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue } from "./async-queue";
+import { findClaudeBinary } from "./claude-binary";
 import {
   createPlanMcpServer,
   PLAN_MCP_SERVER_NAME,
@@ -25,6 +26,7 @@ import type {
   Attachment,
   ChatEvent,
   PermissionDecision,
+  PermissionMode,
   PermissionRequest,
   SessionSnapshot,
   SessionStatus,
@@ -55,6 +57,7 @@ interface ChatSession {
   createdAt: Date;
   model?: string;
   effort?: EffortLevel;
+  permissionMode: PermissionMode;
 
   inputQueue: AsyncQueue<SDKUserMessage>;
   query: Query;
@@ -64,6 +67,10 @@ interface ChatSession {
   pendingQuestion?: PendingQuestion;
   emitter: EventEmitter;
   abortController: AbortController;
+  // Cache of (clientRequestId -> expiresAt) used to drop duplicate
+  // input POSTs from a flaky network or a double-pressed Enter. We
+  // store on the session itself so dedupe is scoped per chat.
+  recentRequestIds: Map<string, number>;
   // Latest plan submitted via the submit_plan MCP tool. Only the most
   // recent submission is shown in the panel; older ones remain on disk
   // under ~/.claude/projects/<encoded-cwd>/plans/.
@@ -115,6 +122,7 @@ function summarize(session: ChatSession): SessionSummary {
     title: firstUserText(session.history),
     model: session.model,
     effort: session.effort,
+    permission_mode: session.permissionMode,
     usage: session.latestUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
   };
@@ -209,6 +217,7 @@ export function createSession(opts: {
   accountName?: string;
   model?: string;
   effort?: EffortLevel;
+  permissionMode?: PermissionMode;
 }): SessionSummary {
   const id = randomUUID();
   const inputQueue = new AsyncQueue<SDKUserMessage>();
@@ -229,9 +238,11 @@ export function createSession(opts: {
     createdAt: new Date(),
     model: opts.model,
     effort: opts.effort,
+    permissionMode: opts.permissionMode ?? "default",
     inputQueue,
     history: [],
     status: "starting",
+    recentRequestIds: new Map(),
     emitter,
     abortController,
     query: undefined as unknown as Query, // assigned below
@@ -338,12 +349,27 @@ export function createSession(opts: {
     },
   });
 
+  // SDK locates a native binary via optional deps; if those got
+  // skipped during install we end up throwing "Native CLI binary
+  // for darwin-arm64 not found" at first iteration. findClaudeBinary
+  // returns the path of whatever `claude` is on PATH (or null if
+  // there really is none, in which case the SDK's own error wins).
+  const claudeBin = findClaudeBinary();
+
   session.query = query({
     prompt: inputQueue,
     options: {
       cwd: opts.cwd,
       env: { ...process.env, CLAUDE_CONFIG_DIR: opts.configDir },
-      permissionMode: "default",
+      ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
+      permissionMode: session.permissionMode,
+      // bypassPermissions ("Auto / Yolo" in the UI) requires the
+      // session to be launched with this opt-in. Without it the SDK
+      // refuses both the initial config and any later
+      // setPermissionMode("bypassPermissions") call. We're a desktop
+      // app for trusted local repos — match the CLI's
+      // `--allow-dangerously-skip-permissions` flag.
+      allowDangerouslySkipPermissions: true,
       canUseTool,
       mcpServers: { [PLAN_MCP_SERVER_NAME]: planMcp },
       abortController,
@@ -391,11 +417,15 @@ async function driveSession(session: ChatSession): Promise<void> {
         }
         setStatus(session, "idle");
       } else if (
-        session.status === "starting" ||
-        session.status === "idle"
+        (msg.type === "assistant" || msg.type === "stream_event") &&
+        (session.status === "starting" || session.status === "idle")
       ) {
-        // First non-result message after a quiet period — Claude is
-        // working again.
+        // Real model output is starting — Claude is working. Earlier
+        // we flipped on *any* non-result message, but the SDK also
+        // ships `system` control messages for things like
+        // setPermissionMode acknowledgements; flipping on those left
+        // the session stuck on "thinking" after a mode change with
+        // no actual turn in flight.
         setStatus(session, "thinking");
       }
     }
@@ -452,15 +482,37 @@ export function emitPlanEvent(
   emit(s, { type, data: plan });
 }
 
+const REQUEST_DEDUPE_TTL_MS = 30_000;
+
+// Drop any cached id older than the TTL. Cheap to call before each
+// dedupe lookup; the map stays bounded because expirations sweep here.
+function pruneRecentIds(s: ChatSession, now: number): void {
+  for (const [id, exp] of s.recentRequestIds) {
+    if (exp <= now) s.recentRequestIds.delete(id);
+  }
+}
+
 export function sendMessage(
   sessionId: string,
   text: string,
   attachments?: Attachment[],
-): void {
+  clientRequestId?: string,
+): { sent: boolean; deduped: boolean } {
   const s = sessions.get(sessionId);
   if (!s) throw new Error("session not found");
   if (s.status === "closed" || s.status === "errored") {
     throw new Error(`session is ${s.status}`);
+  }
+  if (clientRequestId) {
+    const now = Date.now();
+    pruneRecentIds(s, now);
+    if (s.recentRequestIds.has(clientRequestId)) {
+      // Same id within the TTL — silently treat as a no-op so the
+      // duplicate response still resolves 200 on the client without
+      // pushing a duplicate user message into history.
+      return { sent: false, deduped: true };
+    }
+    s.recentRequestIds.set(clientRequestId, now + REQUEST_DEDUPE_TTL_MS);
   }
   // The SDK consumes user messages from the input queue but does NOT
   // echo them back through the Query iterator (verified empirically),
@@ -480,6 +532,7 @@ export function sendMessage(
   s.history.push(msg);
   emit(s, { type: "message", data: msg });
   setStatus(s, "thinking");
+  return { sent: true, deduped: false };
 }
 
 export function resolvePermission(
@@ -547,7 +600,7 @@ export function cancelAskUserQuestion(
 // fine). Errors propagate so the route handler can surface them.
 export async function updateSessionOptions(
   sessionId: string,
-  opts: { model?: string; effort?: EffortLevel },
+  opts: { model?: string; effort?: EffortLevel; permissionMode?: PermissionMode },
 ): Promise<SessionSummary> {
   const s = sessions.get(sessionId);
   if (!s) throw new Error("session not found");
@@ -561,6 +614,13 @@ export async function updateSessionOptions(
   if (opts.effort && opts.effort !== s.effort) {
     await s.query.applyFlagSettings({ effort: opts.effort });
     s.effort = opts.effort;
+  }
+  if (opts.permissionMode && opts.permissionMode !== s.permissionMode) {
+    // setPermissionMode applies immediately to the next tool call.
+    // Plan/acceptEdits change canUseTool decision flow; bypassPermissions
+    // turns canUseTool off entirely on the SDK side.
+    await s.query.setPermissionMode(opts.permissionMode);
+    s.permissionMode = opts.permissionMode;
   }
   return summarize(s);
 }

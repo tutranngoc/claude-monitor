@@ -2,8 +2,9 @@ import type { Metadata } from "next";
 import { Inter, JetBrains_Mono, Instrument_Serif } from "next/font/google";
 import "./globals.css";
 import { WorkspaceShell } from "@/components/workspace-shell";
+import { ThemeProvider, THEME_INIT_SCRIPT } from "@/lib/theme-context";
 
-// Font choices — Inter is closest to Söhne (what Claude.ai uses) without
+// Font choices: Inter is closest to Söhne (what Claude.ai uses) without
 // licensing; Instrument Serif gives the home hero an editorial flourish;
 // JetBrains Mono replaces Geist Mono so Vietnamese diacritics inside code
 // blocks render in the same monospace face as the rest of the snippet
@@ -30,6 +31,9 @@ export const metadata: Metadata = {
   description: "Web orchestrator for claude-monitor accounts",
 };
 
+// suppressHydrationWarning on <html> is intentional: the inline init
+// script flips the .dark class before React hydrates, which would
+// otherwise mismatch the server-rendered (always-light) markup.
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -38,10 +42,20 @@ export default function RootLayout({
   return (
     <html
       lang="en"
+      suppressHydrationWarning
       className={`${inter.variable} ${instrumentSerif.variable} ${jetBrainsMono.variable} h-full antialiased`}
     >
+      <head>
+        {/* Painted before React hydrates so the page never flashes the
+            wrong palette on dark-mode users. See lib/theme-context.tsx. */}
+        <script
+          dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
+        />
+      </head>
       <body className="h-full overflow-hidden">
-        <WorkspaceShell>{children}</WorkspaceShell>
+        <ThemeProvider>
+          <WorkspaceShell>{children}</WorkspaceShell>
+        </ThemeProvider>
       </body>
     </html>
   );

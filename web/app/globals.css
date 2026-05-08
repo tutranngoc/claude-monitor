@@ -182,3 +182,72 @@
 }
 /* highlight.js theme is loaded inside the component import; we just keep
    the pre/code base unchanged so token colors win against any reset. */
+/* Thinking-indicator dot animation. Three dots offset their delays to
+   chase one another across the row; the keyframe pulses opacity + scale
+   so the row looks alive without bouncing the surrounding layout. */
+@keyframes cm-thinking-pulse {
+  0%, 80%, 100% {
+    opacity: 0.3;
+    transform: scale(0.85);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Markdown table polish. Default react-markdown tables render flush
+   against the bubble edge; this gives them rounded corners, a subtle
+   header band, zebra striping, and proper padding so they actually look
+   like tables instead of un-styled grid output. Dark mode inherits via
+   the CSS variables in :root / .dark above. */
+.prose-chat table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.prose-chat thead tr {
+  background: color-mix(in oklab, var(--muted) 70%, transparent);
+}
+.prose-chat th,
+.prose-chat td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+.prose-chat th {
+  font-weight: 600;
+  color: var(--foreground);
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.prose-chat tbody tr:nth-child(odd) {
+  background: color-mix(in oklab, var(--muted) 28%, transparent);
+}
+.prose-chat tbody tr:hover {
+  background: color-mix(in oklab, var(--accent) 55%, transparent);
+}
+.prose-chat tbody tr:last-child td {
+  border-bottom: 0;
+}
+.prose-chat th:first-child,
+.prose-chat td:first-child {
+  padding-left: 1rem;
+}
+.prose-chat th:last-child,
+.prose-chat td:last-child {
+  padding-right: 1rem;
+}
+/* Inline code inside a cell keeps its monospace + tinted background but
+   loses the heavy outer border so it doesn't fight with the cell. */
+.prose-chat td code,
+.prose-chat th code {
+  background: color-mix(in oklab, var(--muted) 80%, transparent);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+}

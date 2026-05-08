@@ -9,7 +9,7 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { ArrowUp, Mic, Paperclip } from "lucide-react";
+import { ArrowUp, GitBranch, Mic, Paperclip } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Attachment, Effort, SessionUsage } from "@/lib/chat-types";
@@ -23,6 +23,8 @@ import { AttachmentChip } from "./attachment-chip";
 import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
+import { ModePicker, type PermissionMode } from "./mode-picker";
+import { useGitBranch } from "@/hooks/use-git-branch";
 import { SlashCommandMenu } from "./slash-command-menu";
 
 export interface ComposerSubmit {
@@ -47,6 +49,11 @@ interface CommonProps {
   // execution itself stays the parent's responsibility — the composer
   // just hands the raw text back through onSubmit.
   commands?: SlashCommand[];
+  // Permission mode + change handler. Optional so callers that don't
+  // wire it up just don't render the mode pill. Named permMode to
+  // avoid colliding with the home|session discriminator on Props.
+  permMode?: PermissionMode;
+  onPermModeChange?: (m: PermissionMode) => void;
 }
 
 interface HomeProps extends CommonProps {
@@ -80,6 +87,12 @@ export function Composer(props: Props) {
   const [menuDismissed, setMenuDismissed] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // Guard against concurrent submits: a slow onSubmit + a quick
+  // double-Enter could fire props.onSubmit twice for the same text
+  // before the textarea cleared. The ref short-circuits the second
+  // call without depending on React state, which wouldn't have
+  // updated yet on the same keystroke.
+  const submittingRef = useRef(false);
 
   // Keep the textarea height in sync with content. Capping at ~12 rows
   // matches Claude.ai's behavior — past that we scroll inside the field.
@@ -124,17 +137,29 @@ export function Composer(props: Props) {
   // synchronously on the same keystroke).
   const submitText = async (override?: string) => {
     if (props.busy || props.disabled) return;
+    if (submittingRef.current) return;
     const textToSend = (override ?? text).trim();
     if (textToSend.length === 0 && attachments.length === 0) return;
+    submittingRef.current = true;
+    // Capture-and-clear immediately so the textarea reflects "sent"
+    // even while the network call is still in flight. On error we
+    // restore the text so the user can retry.
+    const restoreText = text;
+    const restoreAtt = attachments;
+    setText("");
+    setAttachments([]);
+    setMenuDismissed(false);
     try {
-      await props.onSubmit({ text: textToSend, attachments });
-      setText("");
-      setAttachments([]);
-      setMenuDismissed(false);
+      await props.onSubmit({ text: textToSend, attachments: restoreAtt });
     } catch (e) {
+      // Restore so the user keeps their draft on failure.
+      setText(restoreText);
+      setAttachments(restoreAtt);
       setErrors((prev) =>
         [e instanceof Error ? e.message : String(e), ...prev].slice(0, 3),
       );
+    } finally {
+      submittingRef.current = false;
     }
   };
 
@@ -238,6 +263,7 @@ export function Composer(props: Props) {
 
   const model = modelById(props.model);
   const contextWindow = model?.contextWindow ?? 200_000;
+  const branchInfo = useGitBranch(props.cwd);
 
   return (
     <div
@@ -271,11 +297,15 @@ export function Composer(props: Props) {
               onChange={props.onCwdChange}
               recents={props.recentCwds}
             />
+            <BranchChip info={branchInfo} />
           </>
         ) : (
-          <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
-            {shorten(props.cwd)}
-          </span>
+          <>
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
+              {shorten(props.cwd)}
+            </span>
+            <BranchChip info={branchInfo} />
+          </>
         )}
       </div>
 
@@ -341,6 +371,9 @@ export function Composer(props: Props) {
         <div className="flex-1" />
 
         <ContextMeter usage={props.usage} contextWindow={contextWindow} />
+        {props.permMode && props.onPermModeChange && (
+          <ModePicker mode={props.permMode} onChange={props.onPermModeChange} />
+        )}
         <ModelEffortPicker
           modelId={props.model}
           effort={props.effort}
@@ -372,6 +405,29 @@ export function Composer(props: Props) {
         </div>
       )}
     </div>
+  );
+}
+
+// BranchChip renders next to the folder label so the user can tell at
+// a glance which branch their working folder is on. Hides itself when
+// the path isn't a git repo (BranchInfo carries branch=null), so
+// non-git folders don't get a sad "—" chip.
+function BranchChip({
+  info,
+}: {
+  info: ReturnType<typeof useGitBranch>;
+}) {
+  if (info.loading) return null;
+  if (!info.branch && !info.detached) return null;
+  const text = info.branch ?? `det@${info.detached}`;
+  return (
+    <span
+      title={info.branch ?? `Detached HEAD at ${info.detached}`}
+      className="inline-flex items-center gap-1 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground"
+    >
+      <GitBranch className="size-3 shrink-0 opacity-70" aria-hidden />
+      <span className="max-w-[160px] truncate">{text}</span>
+    </span>
   );
 }
 

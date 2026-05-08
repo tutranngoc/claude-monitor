@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { AlertCircle, Plus } from "lucide-react";
+import { useEffect, useState, useTransition } from "react";
+import { AlertCircle, Plus, RefreshCw, Timer } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import {
   addAccount,
@@ -43,6 +43,10 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
   const [action, setAction] = useState<ActionState>({ kind: "idle" });
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  // Tick every second so countdown labels ("resets in 1h 30m") stay live
+  // while the dialog is open. The daemon snapshot itself only refreshes
+  // every ~5s; this hook is what makes the seconds visibly tick down.
+  const now = useNowTick(open ? 1000 : null);
 
   const onSwap = (ident: string) => {
     setAction({ kind: "busy", ident, what: "swap" });
@@ -90,6 +94,7 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
             <ConnectionPill
               status={status}
               fetchedAt={snapshot?.fetched_at}
+              now={now}
             />
           </DialogDescription>
         </DialogHeader>
@@ -140,6 +145,7 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
                   account={a}
                   busy={busy}
                   busyKind={busy ? action.what : undefined}
+                  now={now}
                   onSwap={() => onSwap(a.name)}
                   onRelogin={() => onRelogin(a.name)}
                 />
@@ -180,12 +186,14 @@ function AccountCard({
   account,
   busy,
   busyKind,
+  now,
   onSwap,
   onRelogin,
 }: {
   account: AccountState;
   busy: boolean;
   busyKind?: "swap" | "relogin";
+  now: number;
   onSwap: () => void;
   onRelogin: () => void;
 }) {
@@ -243,8 +251,8 @@ function AccountCard({
         </div>
       )}
       <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-        <UtilBlock label="5h" w={account.five_hour} />
-        <UtilBlock label="weekly" w={account.weekly} />
+        <UtilBlock label="5h session" w={account.five_hour} now={now} />
+        <UtilBlock label="weekly" w={account.weekly} now={now} />
       </div>
     </div>
   );
@@ -326,7 +334,15 @@ function AddAccountForm({
   );
 }
 
-function UtilBlock({ label, w }: { label: string; w?: Window }) {
+function UtilBlock({
+  label,
+  w,
+  now,
+}: {
+  label: string;
+  w?: Window;
+  now: number;
+}) {
   if (!w) {
     return (
       <div className="space-y-1">
@@ -339,13 +355,26 @@ function UtilBlock({ label, w }: { label: string; w?: Window }) {
     );
   }
   const v = Math.round(w.utilization);
+  const reset = formatResetCountdown(w.resets_at, now);
   return (
     <div className="space-y-1">
-      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+      <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
         <span>{label}</span>
         <span className="tabular-nums">{v}%</span>
       </div>
       <Progress value={Math.min(v, 100)} className="h-1.5" />
+      {/* Reset hint sits right under the bar so the eye reads:
+          label · % → progress → "resets in 1h 30m". Title attr keeps the
+          full ISO timestamp accessible on hover for power users. */}
+      {reset && (
+        <div
+          className="flex items-center gap-1 text-[10px] text-muted-foreground/90"
+          title={w.resets_at ?? undefined}
+        >
+          <Timer className="size-3" aria-hidden />
+          <span className="tabular-nums">{reset}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -362,9 +391,11 @@ function ShortStatus({ a }: { a: AccountState }) {
 function ConnectionPill({
   status,
   fetchedAt,
+  now,
 }: {
   status: ConnectionStatus;
   fetchedAt?: string;
+  now: number;
 }) {
   const dot =
     status === "open"
@@ -372,16 +403,21 @@ function ConnectionPill({
       : status === "connecting"
         ? "bg-amber-500"
         : "bg-destructive";
+  const age = fetchedAt ? formatAge(fetchedAt, now) : null;
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+    <span className="inline-flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
       <span
         className={`inline-block size-1.5 rounded-full ${dot}`}
         aria-hidden
       />
       <span className="capitalize">{status}</span>
       {fetchedAt && (
-        <span className="tabular-nums">
-          · {new Date(fetchedAt).toLocaleTimeString()}
+        <span
+          className="inline-flex items-center gap-1 tabular-nums"
+          title={`Snapshot fetched at ${new Date(fetchedAt).toLocaleString()}`}
+        >
+          <RefreshCw className="size-3" aria-hidden />
+          <span>refreshed {age}</span>
         </span>
       )}
     </span>
@@ -390,4 +426,72 @@ function ConnectionPill({
 
 function pct(n: number): string {
   return `${Math.round(n)}%`;
+}
+
+// formatResetCountdown turns an OAuth-quota reset timestamp into a
+// human-readable countdown. Negative deltas (already passed) read as
+// "resets now" so the user sees that the daemon hasn't ticked yet —
+// distinct from the missing-data case (handled by the empty UtilBlock).
+function formatResetCountdown(
+  iso: string | null | undefined,
+  now: number,
+): string | null {
+  if (!iso) return null;
+  const target = new Date(iso).getTime();
+  if (Number.isNaN(target)) return null;
+  const ms = target - now;
+  if (ms <= 0) return "resets now";
+
+  const totalSec = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  const days = Math.floor(hours / 24);
+
+  // > 1 day: "resets in 2d 3h" — minutes drop because second-level
+  // updates aren't useful at this scale. < 1h: "resets in 4m 30s" so the
+  // user sees seconds count down on the most-imminent window.
+  if (days >= 1) {
+    return `resets in ${days}d ${hours % 24}h`;
+  }
+  if (hours >= 1) {
+    return `resets in ${hours}h ${minutes.toString().padStart(2, "0")}m`;
+  }
+  if (minutes >= 1) {
+    return `resets in ${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  }
+  return `resets in ${seconds}s`;
+}
+
+// formatAge renders how long ago the daemon snapshot arrived. Stays
+// terse so the connection pill doesn't grow past one line: "2s ago",
+// "5m ago", "1h ago".
+function formatAge(iso: string, now: number): string {
+  const ms = now - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ago`;
+}
+
+// useNowTick re-renders on a fixed interval so countdown displays show
+// live seconds. Pass null to pause the timer (we do this when the
+// dialog is closed so a hidden modal doesn't churn React work).
+function useNowTick(intervalMs: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (intervalMs == null) return;
+    // No initial setNow: the interval fires within intervalMs (1s in
+    // practice) and the staleness on first paint is sub-second, which
+    // is below any user-perceptible threshold for countdown labels.
+    // Avoiding the synchronous setNow keeps us clean of the
+    // set-state-in-effect lint.
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
 }

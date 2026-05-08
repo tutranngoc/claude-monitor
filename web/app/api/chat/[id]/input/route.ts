@@ -28,8 +28,15 @@ export async function POST(req: Request, { params }: Ctx) {
     );
   }
   try {
-    sendMessage(id, text, attachments);
-    return NextResponse.json({ ok: true });
+    const result = sendMessage(
+      id,
+      text,
+      attachments,
+      typeof body.client_request_id === "string"
+        ? body.client_request_id
+        : undefined,
+    );
+    return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : String(err) },
