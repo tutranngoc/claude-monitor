@@ -1,0 +1,1307 @@
+"use client";
+
+import { useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import { useChatSession } from "@/hooks/use-chat-session";
+import { useDaemonContext } from "@/lib/daemon-context";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Composer, type ComposerSubmit } from "@/components/composer/composer";
+import {
+  DEFAULT_EFFORT,
+  EFFORT_LABELS,
+  MODELS,
+  modelById,
+} from "@/lib/models";
+import type {
+  AskUserQuestionAnswers,
+  AskUserQuestionRequest,
+  Effort,
+  SessionSummary,
+  SessionUsage,
+  StreamingBlock,
+} from "@/lib/chat-types";
+import type { AccountState } from "@/lib/daemon";
+import type { PlanRecord } from "@/lib/plan-types";
+import {
+  CHAT_COMMANDS,
+  parseSlashCommand,
+  type ParsedCommand,
+} from "@/lib/slash-commands";
+import { MessageBubble, StreamingTurn } from "./message-bubble";
+import { PermissionDialog } from "./permission-dialog";
+import { PlanCard } from "./plan-card";
+import { AskQuestionCard } from "./ask-question-card";
+import { SubagentProvider } from "./subagent-context";
+import { shouldHideFromMainTimeline } from "@/lib/subagents";
+import {
+  CommandOutputBubble,
+  type CommandOutput,
+  type UsageBar,
+} from "./command-output-bubble";
+
+interface Props {
+  session: SessionSummary;
+}
+
+// One Virtuoso item — message history is interleaved with the streaming
+// preview, latest plan, and any error notices so they share the same
+// virtualized scroll viewport. Anything that needs to anchor at the
+// bottom is added as a trailing item.
+type ChatItem =
+  | { kind: "message"; msg: SDKMessage }
+  | { kind: "streaming"; blocks: StreamingBlock[] }
+  | { kind: "plan"; plan: PlanRecord }
+  | { kind: "ask_question"; request: AskUserQuestionRequest }
+  | { kind: "error"; message: string; index: number }
+  | { kind: "command_output"; output: CommandOutput; id: string };
+
+interface CommandLog {
+  id: string;
+  output: CommandOutput;
+  // Number of history entries when the command was run. Used to splice
+  // the output back into the right spot of the timeline if the user
+  // continues chatting afterwards — otherwise commands clump at the
+  // bottom and look temporally wrong.
+  insertAfter: number;
+}
+
+export function ChatPanel({ session }: Props) {
+  const chat = useChatSession(session.id);
+  const daemon = useDaemonContext();
+  const router = useRouter();
+  const [effort, setEffort] = useState<Effort>(session.effort ?? DEFAULT_EFFORT);
+  const [model, setModel] = useState<string>(session.model ?? "");
+  const [commandLog, setCommandLog] = useState<CommandLog[]>([]);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+
+  // Match the session to one of the daemon's known accounts so /usage,
+  // /account, /stats, /status can read live OAuth quota windows. Match by
+  // config_dir first (durable), name second (covers older sessions where
+  // config_dir might disagree with the snapshot's spelling).
+  const activeAccount = findAccount(
+    daemon.snapshot?.accounts,
+    session.config_dir,
+    session.account_name,
+  );
+
+  const appendOutput = (output: CommandOutput) => {
+    setCommandLog((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${prev.length}`,
+        output,
+        insertAfter: chat.history.length,
+      },
+    ]);
+  };
+
+  // PATCH the running session with new model/effort. Optimistic update
+  // first so the picker chip reflects the choice immediately; if the
+  // server rejects (e.g. session already closed), we revert and surface
+  // the error in the chat panel's error list.
+  const patchOptions = async (patch: { model?: string; effort?: Effort }) => {
+    const prev = { model, effort };
+    if (patch.model) setModel(patch.model);
+    if (patch.effort) setEffort(patch.effort);
+    try {
+      const res = await fetch(`/api/chat/${session.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    } catch {
+      setModel(prev.model);
+      setEffort(prev.effort);
+    }
+  };
+
+  // The SSR snapshot's `usage` is from session creation; once SSE starts
+  // streaming, it becomes stale. Recompute from the latest `result` SDK
+  // message in history so the context meter reflects live tokens. React
+  // Compiler memoizes this — manual useMemo conflicts with its analysis.
+  const liveUsage = latestUsage(chat.history) ?? session.usage;
+
+  // Subagent grouping derives from history. We pass it through context
+  // so MessageBubble can render Task tool_use blocks as SubagentCards;
+  // here we use it to filter the main timeline so child messages and
+  // top-level tool_result echoes don't double-render alongside the card.
+  const subagentDerivation = useMemo(
+    () => ({
+      byTaskId: chat.subagentsByTaskId,
+      childrenByTaskId: chat.subagentChildrenByTaskId,
+      resultTaskIds: chat.subagentResultTaskIds,
+      list: chat.subagents,
+    }),
+    [
+      chat.subagentsByTaskId,
+      chat.subagentChildrenByTaskId,
+      chat.subagentResultTaskIds,
+      chat.subagents,
+    ],
+  );
+
+  const items = useMemo<ChatItem[]>(() => {
+    const out: ChatItem[] = [];
+    const sortedCmds = [...commandLog].sort(
+      (a, b) => a.insertAfter - b.insertAfter,
+    );
+    let cmdIdx = 0;
+    const flushCmdsUpTo = (boundary: number) => {
+      while (
+        cmdIdx < sortedCmds.length &&
+        sortedCmds[cmdIdx].insertAfter <= boundary
+      ) {
+        out.push({
+          kind: "command_output",
+          output: sortedCmds[cmdIdx].output,
+          id: sortedCmds[cmdIdx].id,
+        });
+        cmdIdx++;
+      }
+    };
+    flushCmdsUpTo(0);
+    for (let i = 0; i < chat.history.length; i++) {
+      const msg = chat.history[i];
+      // Children of a Task subagent live inside that subagent's card,
+      // not in the top-level viewport. Same for the user message that
+      // ferries a Task's tool_result back to the dispatcher.
+      if (!shouldHideFromMainTimeline(msg, subagentDerivation)) {
+        out.push({ kind: "message", msg });
+      }
+      flushCmdsUpTo(i + 1);
+    }
+    flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
+    if (chat.streamingBlocks.length > 0) {
+      out.push({ kind: "streaming", blocks: chat.streamingBlocks });
+    }
+    if (chat.pendingQuestion) {
+      out.push({ kind: "ask_question", request: chat.pendingQuestion });
+    }
+    if (chat.latestPlan) {
+      out.push({ kind: "plan", plan: chat.latestPlan });
+    }
+    chat.errors.forEach((message, index) => {
+      out.push({ kind: "error", message, index });
+    });
+    return out;
+  }, [
+    chat.history,
+    chat.streamingBlocks,
+    chat.pendingQuestion,
+    chat.latestPlan,
+    chat.errors,
+    commandLog,
+    subagentDerivation,
+  ]);
+
+  const closed = chat.status === "closed" || chat.status === "errored";
+
+  const onSubmit = async ({ text, attachments }: ComposerSubmit) => {
+    const parsed = parseSlashCommand(text, CHAT_COMMANDS);
+    if (parsed && !parsed.command.passThrough) {
+      await runChatCommand(parsed, {
+        session,
+        chat,
+        model,
+        effort,
+        liveUsage,
+        account: activeAccount,
+        appendOutput,
+        patchOptions,
+        router,
+      });
+      return;
+    }
+    // Pass-through commands (and regular messages) hit the SDK as-is —
+    // Claude has its own slash-command awareness for things like /init,
+    // /review, /commit, etc.
+    const res = await fetch(`/api/chat/${session.id}/input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: parsed?.raw ?? text,
+        attachments,
+      }),
+    });
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  };
+
+  const cwdLabel = shortenCwd(session.cwd);
+
+  return (
+    <SubagentProvider
+      byTaskId={subagentDerivation.byTaskId}
+      childrenByTaskId={subagentDerivation.childrenByTaskId}
+      resultTaskIds={subagentDerivation.resultTaskIds}
+    >
+      <div className="relative flex h-full min-h-0 flex-col">
+        <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 px-4 py-2">
+          <div className="pointer-events-auto flex min-w-0 items-baseline gap-2 rounded-md bg-background/70 px-2 py-1 backdrop-blur-sm">
+            <span className="min-w-0 truncate text-sm font-medium">
+              {session.title ?? "New chat"}
+            </span>
+            <span
+              title={session.cwd}
+              className="hidden whitespace-nowrap font-mono text-[11px] text-muted-foreground sm:inline"
+            >
+              {cwdLabel}
+              {session.account_name && <> · {session.account_name}</>}
+            </span>
+            <StatusBadge status={chat.status} />
+          </div>
+          <div className="pointer-events-auto flex items-center gap-2">
+            {!closed && (
+              <Button variant="outline" size="sm" onClick={() => chat.stop()}>
+                Stop
+              </Button>
+            )}
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1">
+          {items.length === 0 && chat.status === "starting" ? (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              Starting Claude Code…
+            </div>
+          ) : (
+            <Virtuoso<ChatItem>
+              ref={virtuosoRef}
+              data={items}
+              // Slight default-item-height nudge keeps the virtualizer from
+              // over-budgeting offscreen rows for a typical short message.
+              defaultItemHeight={48}
+              increaseViewportBy={{ top: 200, bottom: 600 }}
+              followOutput={(atBottom) => (atBottom ? "smooth" : false)}
+              initialTopMostItemIndex={
+                items.length > 0 ? items.length - 1 : undefined
+              }
+              computeItemKey={itemKey}
+              // Top spacer matches the floating header's vertical footprint
+              // so the first message clears the absolute header on initial
+              // render. Header is pointer-events-none so scrolling works
+              // through it once content slides up.
+              components={{ Header: HeaderSpacer }}
+              itemContent={(_, item) => (
+                <ItemRow
+                  item={item}
+                  approvePlan={chat.approvePlan}
+                  answerQuestion={chat.answer}
+                  cancelQuestion={chat.cancelQuestion}
+                />
+              )}
+            />
+          )}
+        </div>
+
+        <footer className="px-4 py-3">
+          <div className="mx-auto max-w-3xl">
+            <Composer
+              mode="session"
+              cwd={session.cwd}
+              model={model}
+              onModelChange={(id) => void patchOptions({ model: id })}
+              effort={effort}
+              onEffortChange={(e) => void patchOptions({ effort: e })}
+              onSubmit={onSubmit}
+              disabled={closed}
+              usage={liveUsage}
+              commands={CHAT_COMMANDS}
+              placeholder={
+                closed
+                  ? "Session ended — start a new one"
+                  : "Describe a task or ask a question · type / for commands"
+              }
+            />
+          </div>
+        </footer>
+
+        <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
+      </div>
+    </SubagentProvider>
+  );
+}
+
+function HeaderSpacer() {
+  // Matches the floating header's height (py-2 + content + chip padding ≈ 44px).
+  return <div className="h-12" />;
+}
+
+function ItemRow({
+  item,
+  approvePlan,
+  answerQuestion,
+  cancelQuestion,
+}: {
+  item: ChatItem;
+  approvePlan: (planId: string) => Promise<void>;
+  answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
+  cancelQuestion: (message?: string) => Promise<void>;
+}) {
+  return (
+    <div className="px-4 py-1">
+      <div className="mx-auto max-w-3xl">
+        {item.kind === "message" && <MessageBubble msg={item.msg} />}
+        {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}
+        {item.kind === "plan" && (
+          <PlanCard plan={item.plan} onApprove={approvePlan} />
+        )}
+        {item.kind === "ask_question" && (
+          <AskQuestionCard
+            request={item.request}
+            onSubmit={answerQuestion}
+            onCancel={() => cancelQuestion()}
+          />
+        )}
+        {item.kind === "error" && (
+          <div className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {item.message}
+          </div>
+        )}
+        {item.kind === "command_output" && (
+          <CommandOutputBubble output={item.output} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function itemKey(_: number, item: ChatItem): string {
+  switch (item.kind) {
+    case "message":
+      // SDKMessages carry a uuid for assistant/user; system messages don't,
+      // so fall back to a positional key. We prefix to avoid collisions
+      // across kinds.
+      return `m:${"uuid" in item.msg && item.msg.uuid ? item.msg.uuid : "anon"}`;
+    case "streaming":
+      // Single sticky key — Virtuoso reuses the same DOM node as deltas
+      // arrive, avoiding a re-mount per chunk.
+      return "streaming";
+    case "plan":
+      return `plan:${item.plan.id}`;
+    case "ask_question":
+      return `ask:${item.request.id}`;
+    case "error":
+      return `err:${item.index}`;
+    case "command_output":
+      return `cmd:${item.id}`;
+  }
+}
+
+// shortenCwd replaces the user's home directory with ~ and squashes long
+// middles so the header stays single-line. The full path is exposed via
+// the title= attribute on hover.
+function shortenCwd(cwd: string): string {
+  const homed = cwd
+    .replace(/^\/Users\/[^/]+\//, "~/")
+    .replace(/^\/home\/[^/]+\//, "~/");
+  const segments = homed.split("/");
+  if (segments.length <= 4) return homed;
+  // ~/.../ <last two segments>
+  const head = segments[0] === "~" ? "~" : segments[0] || "/";
+  const tail = segments.slice(-2).join("/");
+  return `${head}/…/${tail}`;
+}
+
+function latestUsage(
+  history: ReturnType<typeof useChatSession>["history"],
+): SessionUsage | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.type !== "result") continue;
+    const u = (m as { usage?: Partial<SessionUsage> }).usage;
+    if (!u) continue;
+    return {
+      input_tokens: u.input_tokens ?? 0,
+      output_tokens: u.output_tokens ?? 0,
+      cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+    };
+  }
+  return undefined;
+}
+
+function StatusBadge({ status }: { status: SessionSummary["status"] }) {
+  const variant: React.ComponentProps<typeof Badge>["variant"] =
+    status === "errored"
+      ? "destructive"
+      : status === "closed"
+        ? "outline"
+        : status === "awaiting_permission"
+          ? "secondary"
+          : "default";
+  return <Badge variant={variant}>{status.replace("_", " ")}</Badge>;
+}
+
+// runChatCommand is the dispatcher for slash commands typed inside an
+// active session. Each branch composes a CommandOutput and may also
+// trigger side effects (PATCH the session, stop, navigate, clipboard).
+// Unknown command names never reach here — parseSlashCommand filters
+// against CHAT_COMMANDS, so the fall-through is "send as user message".
+type ChatHookValue = ReturnType<typeof useChatSession>;
+
+interface ChatCommandContext {
+  session: SessionSummary;
+  chat: ChatHookValue;
+  model: string;
+  effort: Effort;
+  // Latest per-turn usage — drives the context-window meter. May be
+  // undefined before any turn completes.
+  liveUsage?: SessionUsage;
+  // The session's account as seen by the daemon ticker. Undefined when
+  // the daemon hasn't snapshot'd yet, or when the session's config_dir
+  // doesn't match any known account.
+  account?: AccountState;
+  appendOutput: (output: CommandOutput) => void;
+  patchOptions: (patch: { model?: string; effort?: Effort }) => Promise<void>;
+  router: ReturnType<typeof useRouter>;
+}
+
+const ALL_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
+
+async function runChatCommand(
+  parsed: ParsedCommand,
+  ctx: ChatCommandContext,
+): Promise<void> {
+  switch (parsed.command.name) {
+    case "help": {
+      const body = CHAT_COMMANDS.filter((c) => !c.hidden)
+        .map((c) => {
+          const sig = `/${c.name}${c.argHint ? ` ${c.argHint}` : ""}`;
+          return `\`${sig}\` — ${c.description}`;
+        })
+        .join("\n\n");
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Slash commands",
+        body,
+      });
+      return;
+    }
+
+    case "clear": {
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            config_dir: ctx.session.config_dir,
+            account_name: ctx.session.account_name,
+            cwd: ctx.session.cwd,
+            model: ctx.model,
+            effort: ctx.effort,
+          }),
+        });
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        const summary = (await res.json()) as SessionSummary;
+        ctx.router.push(`/chat/${summary.id}`);
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to start a new chat: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "context": {
+      const m = modelById(ctx.model);
+      const window = m?.contextWindow ?? 200_000;
+      const u = ctx.liveUsage;
+      // Approximation: SDK doesn't break input down by source, so we
+      // bucket what we have. cache_read = the cached prefix (system
+      // prompt + tools + memory + earlier messages), input = current
+      // turn's user input, cache_creation = first-write cached chunks,
+      // output = previous turn's response. Free-space is the
+      // remainder; autocompact buffer is reserved at 5% of the model
+      // window — matches the CLI's default before user override.
+      const cacheRead = u?.cache_read_input_tokens ?? 0;
+      const cacheCreate = u?.cache_creation_input_tokens ?? 0;
+      const newInput = u?.input_tokens ?? 0;
+      const output = u?.output_tokens ?? 0;
+      const total = cacheRead + cacheCreate + newInput + output;
+      const autocompactBuffer = Math.round(window * 0.05);
+
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Context Usage",
+        context: {
+          modelLabel: m
+            ? `${m.label}${m.badge ? ` (${m.badge} context)` : ""}`
+            : ctx.model,
+          modelId: ctx.model,
+          totalTokens: total,
+          rawMaxTokens: window,
+          autocompactBufferTokens: autocompactBuffer,
+          // Order matters — this is the order cells get painted in the
+          // grid (left-to-right, top-to-bottom).
+          categories: [
+            {
+              name: "Cached prefix",
+              tokens: cacheRead,
+              color: "text-violet-500",
+            },
+            {
+              name: "Cache write",
+              tokens: cacheCreate,
+              color: "text-pink-500",
+            },
+            {
+              name: "Messages (this turn)",
+              tokens: newInput,
+              color: "text-emerald-500",
+            },
+            {
+              name: "Last assistant reply",
+              tokens: output,
+              color: "text-sky-500",
+            },
+          ],
+        },
+        body: u
+          ? undefined
+          : "_No turn has completed yet — categories will populate after the first response._",
+      });
+      return;
+    }
+
+    case "usage": {
+      // Mirrors the CLI's /usage view: three plan-quota bars (and a row
+      // for purchased credits if the account has any). Token + context
+      // breakdown lives in /context — keep this card focused on plan
+      // limits so the user reads it in <1 second.
+      const acc = ctx.account;
+      const bars: UsageBar[] = [];
+      if (acc?.five_hour) {
+        bars.push({
+          label: "Current session",
+          value: acc.five_hour.utilization,
+          meta: formatReset(acc.five_hour.resets_at),
+        });
+      }
+      if (acc?.weekly) {
+        bars.push({
+          label: "Current week (all models)",
+          value: acc.weekly.utilization,
+          meta: formatReset(acc.weekly.resets_at),
+        });
+      }
+      if (acc?.weekly_sonnet) {
+        bars.push({
+          label: "Current week (Sonnet only)",
+          value: acc.weekly_sonnet.utilization,
+        });
+      }
+
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: acc ? `${acc.name} · plan limits` : daemonOfflineHint(ctx),
+        bars: bars.length > 0 ? bars : undefined,
+        body:
+          bars.length === 0
+            ? "_Daemon hasn't reported quota for this account yet — try again in a few seconds._"
+            : undefined,
+      });
+      return;
+    }
+
+    case "cost": {
+      // SDK ships total_cost_usd on each `result` message. The field is
+      // cumulative for the SDK session, so we read the last value rather
+      // than summing — summing would double-count completed turns.
+      let lastCost: number | null = null;
+      let turns = 0;
+      let lastDuration: number | null = null;
+      let totalDuration = 0;
+      for (const m of ctx.chat.history) {
+        if (m.type !== "result") continue;
+        turns++;
+        const r = m as { total_cost_usd?: number; duration_ms?: number };
+        if (typeof r.total_cost_usd === "number") lastCost = r.total_cost_usd;
+        if (typeof r.duration_ms === "number") {
+          lastDuration = r.duration_ms;
+          totalDuration += r.duration_ms;
+        }
+      }
+      const acc = ctx.account;
+      const bars: UsageBar[] = [];
+      if (acc?.five_hour) {
+        bars.push({
+          label: "Session 5h",
+          value: acc.five_hour.utilization,
+          meta: formatReset(acc.five_hour.resets_at),
+        });
+      }
+      if (acc?.weekly) {
+        bars.push({
+          label: "Week 7d",
+          value: acc.weekly.utilization,
+          meta: formatReset(acc.weekly.resets_at),
+        });
+      }
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: turns === 0 ? "No turns completed yet" : "Session cost",
+        bars: bars.length > 0 ? bars : undefined,
+        rows: [
+          { label: "Turns", value: String(turns) },
+          {
+            label: "Total cost (USD)",
+            value: lastCost == null ? "—" : `$${lastCost.toFixed(4)}`,
+          },
+          ...(lastDuration != null
+            ? [{ label: "Last turn", value: formatDuration(lastDuration) }]
+            : []),
+          ...(turns > 0
+            ? [{ label: "Total time", value: formatDuration(totalDuration) }]
+            : []),
+        ],
+      });
+      return;
+    }
+
+    case "model": {
+      const arg = parsed.args.trim();
+      if (!arg) {
+        const body = MODELS.map((m) => {
+          const marker = m.id === ctx.model ? "●" : "○";
+          const window =
+            m.contextWindow >= 1_000_000
+              ? "1M"
+              : `${Math.round(m.contextWindow / 1000)}K`;
+          return `${marker} \`${m.id}\` — ${m.label}${
+            m.badge ? ` (${m.badge})` : ""
+          } · ${window}`;
+        }).join("\n\n");
+        ctx.appendOutput({
+          echo: parsed.raw,
+          subtitle: "Available models",
+          body,
+        });
+        return;
+      }
+      const target =
+        MODELS.find((m) => m.id === arg) ??
+        MODELS.find((m) => m.label.toLowerCase() === arg.toLowerCase());
+      if (!target) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Unknown model: \`${arg}\`. Run \`/model\` (no args) to see options.`,
+        });
+        return;
+      }
+      try {
+        await ctx.patchOptions({ model: target.id });
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "success",
+          body: `Model set to **${target.label}**${
+            target.badge ? ` (${target.badge})` : ""
+          }.`,
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to switch model: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "effort": {
+      const arg = parsed.args.trim().toLowerCase();
+      const m = modelById(ctx.model);
+      const supported = m?.supportedEffortLevels ?? ALL_EFFORTS.slice(0, 3);
+      if (!arg) {
+        const body = ALL_EFFORTS.map((e) => {
+          const allowed = supported.includes(e);
+          const marker = e === ctx.effort ? "●" : allowed ? "○" : "—";
+          return `${marker} \`${e}\` — ${EFFORT_LABELS[e]}${
+            !allowed ? " _(not supported by current model)_" : ""
+          }`;
+        }).join("\n\n");
+        ctx.appendOutput({
+          echo: parsed.raw,
+          subtitle: "Reasoning effort",
+          body,
+        });
+        return;
+      }
+      const target = ALL_EFFORTS.find((e) => e === arg);
+      if (!target) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Unknown effort: \`${arg}\`. Run \`/effort\` (no args) to see options.`,
+        });
+        return;
+      }
+      if (!supported.includes(target)) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `\`${target}\` isn't supported by ${
+            m?.label ?? ctx.model
+          }. Run \`/effort\` for the valid set.`,
+        });
+        return;
+      }
+      try {
+        await ctx.patchOptions({ effort: target });
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "success",
+          body: `Effort set to **${EFFORT_LABELS[target]}**.`,
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to switch effort: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "cwd": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        rows: [{ label: "Working folder", value: ctx.session.cwd }],
+      });
+      return;
+    }
+
+    case "account": {
+      const acc = ctx.account;
+      const bars: UsageBar[] = [];
+      if (acc?.five_hour) {
+        bars.push({
+          label: "Session 5h",
+          value: acc.five_hour.utilization,
+          meta: formatReset(acc.five_hour.resets_at),
+        });
+      }
+      if (acc?.weekly) {
+        bars.push({
+          label: "Week 7d",
+          value: acc.weekly.utilization,
+          meta: formatReset(acc.weekly.resets_at),
+        });
+      }
+      if (acc?.weekly_sonnet) {
+        bars.push({ label: " · Sonnet", value: acc.weekly_sonnet.utilization });
+      }
+      if (acc?.weekly_opus) {
+        bars.push({ label: " · Opus", value: acc.weekly_opus.utilization });
+      }
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: acc ? "Active Claude account" : daemonOfflineHint(ctx),
+        bars: bars.length > 0 ? bars : undefined,
+        rows: [
+          { label: "Account", value: ctx.session.account_name ?? "—" },
+          ...(acc?.email ? [{ label: "Email", value: acc.email }] : []),
+          { label: "Config dir", value: ctx.session.config_dir },
+          ...(acc?.account_uuid
+            ? [{ label: "Account UUID", value: acc.account_uuid }]
+            : []),
+          ...(acc?.error
+            ? [{ label: "Daemon error", value: acc.error }]
+            : []),
+        ],
+      });
+      return;
+    }
+
+    case "status": {
+      const acc = ctx.account;
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Session status",
+        rows: [
+          { label: "Status", value: ctx.chat.status.replace("_", " ") },
+          { label: "Connection", value: ctx.chat.connection },
+          { label: "Messages", value: String(ctx.chat.history.length) },
+          { label: "Errors", value: String(ctx.chat.errors.length) },
+          { label: "Account", value: ctx.session.account_name ?? "—" },
+          ...(acc?.five_hour
+            ? [
+                {
+                  label: "5h utilization",
+                  value: `${(acc.five_hour.utilization * 100).toFixed(1)}%`,
+                },
+              ]
+            : []),
+          ...(acc?.weekly
+            ? [
+                {
+                  label: "Week utilization",
+                  value: `${(acc.weekly.utilization * 100).toFixed(1)}%`,
+                },
+              ]
+            : []),
+          ...(ctx.chat.latestPlan
+            ? [{ label: "Latest plan", value: ctx.chat.latestPlan.id }]
+            : []),
+        ],
+      });
+      return;
+    }
+
+    case "copy": {
+      const text = extractLastAssistantText(ctx.chat.history);
+      if (!text) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "warning",
+          body: "_No assistant message to copy yet._",
+        });
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "success",
+          body: `Copied **${text.length.toLocaleString()}** characters to clipboard.`,
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Clipboard access denied: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "stop": {
+      await ctx.chat.stop();
+      ctx.appendOutput({
+        echo: parsed.raw,
+        tone: "success",
+        body: "Session stopped.",
+      });
+      return;
+    }
+
+    case "exit": {
+      await ctx.chat.stop();
+      ctx.router.push("/");
+      return;
+    }
+
+    case "sessions":
+    case "resume": {
+      try {
+        const res = await fetch("/api/chat");
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        const data = (await res.json()) as { sessions: SessionSummary[] };
+        const arg = parsed.args.trim();
+        if (parsed.command.name === "resume" && arg) {
+          const target = data.sessions.find(
+            (s) => s.id === arg || s.id.startsWith(arg),
+          );
+          if (!target) {
+            ctx.appendOutput({
+              echo: parsed.raw,
+              tone: "error",
+              body: `No active session matched \`${arg}\`. Run \`/sessions\` to list.`,
+            });
+            return;
+          }
+          ctx.router.push(`/chat/${target.id}`);
+          return;
+        }
+        if (data.sessions.length === 0) {
+          ctx.appendOutput({
+            echo: parsed.raw,
+            body: "_No active sessions._",
+          });
+          return;
+        }
+        const body = data.sessions
+          .map((s) => {
+            const marker = s.id === ctx.session.id ? "●" : "○";
+            const cwd = shortenCwd(s.cwd);
+            const title = s.title ?? "_(no input yet)_";
+            return `${marker} \`${s.id.slice(0, 8)}\` · ${cwd} — ${title}`;
+          })
+          .join("\n\n");
+        ctx.appendOutput({
+          echo: parsed.raw,
+          subtitle:
+            parsed.command.name === "resume"
+              ? "Resume a session — pass an id"
+              : "Active sessions",
+          body,
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to list sessions: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "stats": {
+      try {
+        const res = await fetch("/api/chat");
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        const data = (await res.json()) as { sessions: SessionSummary[] };
+        const totals = data.sessions.reduce(
+          (acc, s) => {
+            const u = s.usage;
+            if (u) {
+              acc.input += u.input_tokens;
+              acc.output += u.output_tokens;
+              acc.cacheRead += u.cache_read_input_tokens;
+              acc.cacheCreate += u.cache_creation_input_tokens;
+            }
+            acc.messages += s.history_length;
+            return acc;
+          },
+          { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, messages: 0 },
+        );
+        const acc = ctx.account;
+        const bars: UsageBar[] = [];
+        if (acc?.five_hour) {
+          bars.push({
+            label: "Session 5h",
+            value: acc.five_hour.utilization,
+            meta: formatReset(acc.five_hour.resets_at),
+          });
+        }
+        if (acc?.weekly) {
+          bars.push({
+            label: "Week 7d",
+            value: acc.weekly.utilization,
+            meta: formatReset(acc.weekly.resets_at),
+          });
+        }
+        if (acc?.weekly_sonnet) {
+          bars.push({ label: " · Sonnet", value: acc.weekly_sonnet.utilization });
+        }
+        if (acc?.weekly_opus) {
+          bars.push({ label: " · Opus", value: acc.weekly_opus.utilization });
+        }
+        ctx.appendOutput({
+          echo: parsed.raw,
+          subtitle: `Across ${data.sessions.length} session(s)`,
+          bars: bars.length > 0 ? bars : undefined,
+          rows: [
+            { label: "Sessions", value: String(data.sessions.length) },
+            { label: "Messages", value: totals.messages.toLocaleString() },
+            { label: "Input tokens", value: totals.input.toLocaleString() },
+            { label: "Output tokens", value: totals.output.toLocaleString() },
+            {
+              label: "Cache read",
+              value: totals.cacheRead.toLocaleString(),
+            },
+            {
+              label: "Cache create",
+              value: totals.cacheCreate.toLocaleString(),
+            },
+          ],
+        });
+      } catch (err) {
+        ctx.appendOutput({
+          echo: parsed.raw,
+          tone: "error",
+          body: `Failed to compute stats: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return;
+    }
+
+    case "agents": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Agents",
+        body:
+          "Subagents are loaded from `~/.claude/agents/` and per-project `.claude/agents/`. " +
+          "The web orchestrator doesn't yet enumerate them — ask the agent (e.g. " +
+          "_'list available agents'_) and it will report what it can dispatch via the Skill/Task tools.",
+      });
+      return;
+    }
+
+    case "skills": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Skills",
+        body:
+          "Skills live in `~/.claude/skills/` and plugin marketplaces. " +
+          "The agent surfaces them when relevant — ask Claude to _'list skills'_ to see what's loaded for this session.",
+      });
+      return;
+    }
+
+    case "memory": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Auto-memory",
+        rows: [
+          {
+            label: "Directory",
+            value: `${ctx.session.config_dir}/projects/<project>/memory/`,
+          },
+          { label: "Index", value: "MEMORY.md" },
+        ],
+        body:
+          "Memory files persist across conversations. Edit them by asking Claude " +
+          "to update or remove specific entries.",
+      });
+      return;
+    }
+
+    case "hooks": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Hooks",
+        body:
+          "Hooks are configured in `~/.claude/settings.json` (or per-project " +
+          "`.claude/settings.json`). The web orchestrator doesn't manage hooks " +
+          "in-app — edit the settings file or use the CLI's `/hooks`.",
+      });
+      return;
+    }
+
+    case "mcp": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "MCP servers",
+        body:
+          "MCP servers are configured in `~/.claude/settings.json` and per-project. " +
+          "The submit_plan MCP is wired into every web session for plan approval. " +
+          "Ask Claude to list active MCP tools if you need a session-scoped view.",
+      });
+      return;
+    }
+
+    case "config": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Configuration",
+        body:
+          "Config is stored in `~/.claude/settings.json` and the per-project " +
+          "`.claude/settings.json`. Account swap and limits are managed in the " +
+          "Accounts dialog (sidebar → Accounts).",
+      });
+      return;
+    }
+
+    case "permissions": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Permissions",
+        body:
+          "Tool permissions are gated through the in-chat dialog (deny/allow once " +
+          "or always). Persistent rules live in `~/.claude/settings.json` under " +
+          "`permissions`. The web orchestrator doesn't expose a settings editor yet.",
+      });
+      return;
+    }
+
+    case "fast": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        tone: "warning",
+        body:
+          "`/fast` toggles the CLI's fast mode (Opus 4.6). The web orchestrator " +
+          "uses the SDK directly — switch to Opus 4.6 via `/model` for the same model.",
+      });
+      return;
+    }
+
+    case "rewind": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        tone: "warning",
+        body:
+          "`/rewind` restores file snapshots taken by the CLI before edits. The " +
+          "web orchestrator doesn't snapshot files yet, so there's nothing to " +
+          "restore. Use `git restore` or your editor's undo for now.",
+      });
+      return;
+    }
+
+    case "doctor":
+    case "ide":
+    case "upgrade": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        tone: "warning",
+        body: `\`/${parsed.command.name}\` is a CLI-only diagnostic. Run it from \`claude\` in your terminal.`,
+      });
+      return;
+    }
+
+    case "login":
+    case "logout": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Account management",
+        body:
+          "Open the **Accounts** dialog from the sidebar to swap, add, or " +
+          "re-login an account. The web orchestrator delegates auth to the " +
+          "claude-monitor daemon.",
+      });
+      return;
+    }
+
+    case "feedback":
+    case "bug": {
+      ctx.appendOutput({
+        echo: parsed.raw,
+        subtitle: "Feedback",
+        body:
+          "Report issues or feedback at [github.com/anthropics/claude-code/issues]" +
+          "(https://github.com/anthropics/claude-code/issues).",
+      });
+      return;
+    }
+
+    default: {
+      // Defensive: parseSlashCommand only returns names from the
+      // registry, but TypeScript wants the switch exhaustive. If we
+      // forget a handler, surface it visibly instead of silently
+      // dropping the user's input.
+      ctx.appendOutput({
+        echo: parsed.raw,
+        tone: "warning",
+        body: `Command \`/${parsed.command.name}\` isn't wired up yet.`,
+      });
+    }
+  }
+}
+
+function extractLastAssistantText(history: SDKMessage[]): string | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.type !== "assistant") continue;
+    const parts: string[] = [];
+    for (const block of msg.message.content) {
+      if (block.type === "text") parts.push(block.text);
+    }
+    const joined = parts.join("\n\n").trim();
+    return joined || null;
+  }
+  return null;
+}
+
+// findAccount picks the daemon-known account that backs this chat
+// session. Match by config_dir first since that's what the session was
+// created with; fall back to name to cover sessions started before the
+// daemon snapshot rehydrated.
+function findAccount(
+  accounts: AccountState[] | undefined,
+  configDir: string,
+  name: string | undefined,
+): AccountState | undefined {
+  if (!accounts || accounts.length === 0) return undefined;
+  const byDir = accounts.find((a) => a.config_dir === configDir);
+  if (byDir) return byDir;
+  if (name) return accounts.find((a) => a.name === name);
+  return undefined;
+}
+
+// contextWindowUsed approximates current context size from the latest
+// turn's input + output + cache fragments. SDK ships per-turn deltas in
+// `result.usage`, so we sum the four fields rather than relying on a
+// single one — input_tokens alone undercounts cached prefix.
+function contextWindowUsed(u: SessionUsage | undefined): number {
+  if (!u) return 0;
+  return (
+    u.input_tokens +
+    u.output_tokens +
+    u.cache_read_input_tokens +
+    u.cache_creation_input_tokens
+  );
+}
+
+// aggregateTokens sums per-turn token deltas across the whole session
+// transcript. Used as the session-cumulative footer in /usage; the
+// per-turn split lives in /context.
+function aggregateTokens(history: SDKMessage[]): SessionUsage {
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let cacheCreate = 0;
+  for (const m of history) {
+    if (m.type !== "result") continue;
+    const u = (m as { usage?: Partial<SessionUsage> }).usage;
+    if (!u) continue;
+    input += u.input_tokens ?? 0;
+    output += u.output_tokens ?? 0;
+    cacheRead += u.cache_read_input_tokens ?? 0;
+    cacheCreate += u.cache_creation_input_tokens ?? 0;
+  }
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreate,
+  };
+}
+
+// humanTokens formats large token counts as compact units so bar metas
+// don't blow past the right column. 18420 → "18.4K", 1_000_000 → "1.0M".
+function humanTokens(n: number): string {
+  if (n < 1000) return n.toString();
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}K`;
+  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0)}M`;
+}
+
+// formatReset turns an OAuth-quota reset timestamp into a tight right-
+// aligned hint. Within an hour we show minutes; same calendar day shows
+// HH:MM; otherwise short month + day. The ↻ glyph matches the bar
+// preview the user picked.
+function formatReset(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const ms = date.getTime() - now.getTime();
+  if (ms <= 0) return "↻ now";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `↻ ${minutes}m`;
+  const sameDay = date.toDateString() === now.toDateString();
+  if (sameDay) {
+    return `↻ ${date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`;
+  }
+  return `↻ ${date.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+  })}`;
+}
+
+// formatDuration prints a millisecond duration as "12.3s" / "1m 04s" so
+// /cost rows don't surface bare millisecond counts.
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds - m * 60);
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+// daemonOfflineHint shows a consistent subtitle when the daemon hasn't
+// snapshotted the session's account yet. Distinguishes "nothing to show"
+// from "I just don't know the limits yet" so the user can act on it.
+function daemonOfflineHint(ctx: ChatCommandContext): string {
+  if (!ctx.session.account_name) return "No account bound to this session";
+  return `Daemon hasn't snapshotted ${ctx.session.account_name} yet`;
+}

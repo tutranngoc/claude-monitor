@@ -11,6 +11,7 @@ import (
 	"claude-monitor/internal/api"
 	"claude-monitor/internal/config"
 	"claude-monitor/internal/format"
+	webx "claude-monitor/internal/web"
 )
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -334,8 +335,36 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.showHelp = !m.showHelp
 		return m, nil
+
+	case "o":
+		// Open the web orchestrator in the user's default browser.
+		// In legacy --tui mode this assumes the URL is reachable
+		// (user is running the orchestrator separately or the URL
+		// matches a previous default-mode startup).
+		if m.webURL == "" {
+			m.flash = "no web URL configured"
+			m.flashExpiry = time.Now().Add(2 * time.Second)
+			return m, flashClearCmd(2 * time.Second)
+		}
+		m.flash = "opening " + m.webURL
+		m.flashExpiry = time.Now().Add(1500 * time.Millisecond)
+		return m, tea.Batch(
+			openURLCmd(m.webURL),
+			flashClearCmd(1500*time.Millisecond),
+		)
 	}
 	return m, nil
+}
+
+// openURLCmd asks the OS to open a URL via the platform-specific
+// helper. We treat errors as silent — the user already saw the
+// "opening …" flash; if the OS open helper isn't available, the
+// printed URL on startup is enough to recover manually.
+func openURLCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		_ = webx.OpenBrowser(url)
+		return nil
+	}
 }
 
 func (m *model) persistAndFlash(text string) {

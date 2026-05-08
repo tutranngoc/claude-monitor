@@ -1,0 +1,420 @@
+"use client";
+
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Markdown } from "@/components/markdown/markdown";
+import type { StreamingBlock } from "@/lib/chat-types";
+import { isSubagentDispatchTool } from "@/lib/subagents";
+import { SubagentCard } from "./subagent-card";
+import { useSubagents } from "./subagent-context";
+
+interface Props {
+  msg: SDKMessage;
+}
+
+// MessageBubble is a switch over the SDKMessage discriminated union.
+// We only render the types that meaningfully advance the conversation;
+// noise types (stream_event partial deltas, hook progress, status pings,
+// etc.) are hidden but kept in history so a backend rewind would have
+// the full transcript.
+export function MessageBubble({ msg }: Props) {
+  switch (msg.type) {
+    case "assistant":
+      return <AssistantBubble msg={msg} />;
+    case "user":
+      return <UserBubble msg={msg} />;
+    case "result":
+      return <ResultBubble msg={msg} />;
+    default:
+      // system/init and stream_event variants are silenced — the header
+      // already shows session metadata, and stream deltas drive the
+      // separate live preview rendered in chat-panel.tsx.
+      return null;
+  }
+}
+
+function AssistantBubble({
+  msg,
+}: {
+  msg: Extract<SDKMessage, { type: "assistant" }>;
+}) {
+  const content = msg.message.content;
+  const subagents = useSubagents();
+  return (
+    <div className="space-y-2">
+      {content.map((block, i) => {
+        if (block.type === "text") {
+          return <TextBlock key={i} text={block.text} />;
+        }
+        if (block.type === "tool_use") {
+          // Subagent dispatches (tool name "Agent" in SDK 0.2.133, or
+          // "Task" in older releases — see SUBAGENT_TOOL_NAMES) get
+          // their own card so the user sees the subagent as one
+          // logical unit instead of an opaque tool_use line followed
+          // by every child message inline. Falls back to ToolUseLine
+          // when the provider isn't mounted (e.g. tool_use rendered
+          // outside the chat viewport, or the summary hasn't been
+          // derived yet).
+          if (isSubagentDispatchTool(block.name) && subagents) {
+            const summary = subagents.byTaskId.get(block.id);
+            if (summary) {
+              const children = subagents.childrenByTaskId.get(block.id) ?? [];
+              return (
+                <SubagentCard
+                  key={i}
+                  summary={summary}
+                  childCount={children.length}
+                >
+                  {children.map((child, idx) => (
+                    <MessageBubble key={messageKey(child, idx)} msg={child} />
+                  ))}
+                </SubagentCard>
+              );
+            }
+          }
+          return (
+            <ToolUseLine
+              key={i}
+              name={block.name}
+              input={block.input as Record<string, unknown>}
+              expandedInput={block.input}
+            />
+          );
+        }
+        if (block.type === "thinking") {
+          return <ThinkingBlock key={i} thinking={block.thinking} />;
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+
+// messageKey derives a stable key for nested-timeline rendering. Most
+// SDKMessages carry uuid; system/result messages don't, so we fall
+// back to a positional key. The prefix avoids collisions across kinds.
+function messageKey(msg: SDKMessage, idx: number): string {
+  const uuid = (msg as { uuid?: string }).uuid;
+  if (uuid) return `${msg.type}:${uuid}`;
+  return `${msg.type}:${idx}`;
+}
+
+// Strip Claude CLI's command-output markers so synthetic user messages
+// (emitted on /model, /effort, etc.) render as small inline notices
+// instead of regular user bubbles. Returns null if the string was
+// command output but had no inner text (treat as silent), the inner
+// text if it was, and undefined if it's a regular user message.
+function parseCommandOutput(s: string): string | null | undefined {
+  const m = /^<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/.exec(
+    s.trim(),
+  );
+  if (!m) return undefined;
+  const inner = m[1].trim();
+  return inner ? inner : null;
+}
+
+function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
+  const content = msg.message.content;
+  if (typeof content === "string") {
+    const cmd = parseCommandOutput(content);
+    if (cmd === null) return null;
+    if (cmd !== undefined) {
+      return (
+        <div className="text-center text-xs text-muted-foreground italic">
+          {cmd}
+        </div>
+      );
+    }
+    return (
+      <div className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
+        {content}
+      </div>
+    );
+  }
+  // Tool results echoed back as user messages — render as continuation lines
+  // under the matching tool_use bubble, plus any text/image blocks the user
+  // sent alongside.
+  return (
+    <div className="space-y-1.5">
+      {content.map((block, i) => {
+        if (block.type === "text") {
+          return (
+            <div
+              key={i}
+              className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
+            >
+              {block.text}
+            </div>
+          );
+        }
+        if (block.type === "image") {
+          // Anthropic supports `source.type` of "base64" (inline) and
+          // "url". We always send base64 from this app, but URL-source
+          // messages can arrive when an SDK transcript is replayed.
+          const src =
+            block.source.type === "base64"
+              ? `data:${block.source.media_type};base64,${block.source.data}`
+              : block.source.type === "url"
+                ? block.source.url
+                : undefined;
+          if (!src) return null;
+          return (
+            <div key={i} className="ml-auto flex max-w-[85%] justify-end">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={src}
+                alt="attachment"
+                className="max-h-72 max-w-full rounded-md border bg-background object-contain shadow-sm"
+              />
+            </div>
+          );
+        }
+        if (block.type === "tool_result") {
+          return (
+            <ToolResultLine
+              key={i}
+              content={block.content}
+              isError={Boolean(block.is_error)}
+            />
+          );
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+
+function ResultBubble({
+  msg,
+}: {
+  msg: Extract<SDKMessage, { type: "result" }>;
+}) {
+  return (
+    <div className="rounded-md border-l-2 border-l-muted-foreground/40 bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
+      <span className="font-mono">turn end</span>
+      <span> · {msg.num_turns} turns</span>
+      <span> · {Math.round(msg.duration_ms)}ms</span>
+      <span>
+        {" "}
+        · ${msg.total_cost_usd.toFixed(4)}
+      </span>
+      {msg.is_error && (
+        <span className="ml-2 text-destructive">
+          {msg.subtype.replace("error_", "error: ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Shared block renderers used by both finalized history and the streaming
+// preview. Keeping them here so the in-progress rendering can't drift away
+// from the eventually-finalized rendering.
+
+export function TextBlock({ text }: { text: string }) {
+  return (
+    <div className="rounded-md bg-card px-3 py-2 text-sm">
+      <Markdown source={text} />
+    </div>
+  );
+}
+
+export function ThinkingBlock({ thinking }: { thinking: string }) {
+  return (
+    <details className="group rounded-md border-l-2 border-l-muted-foreground/30 bg-muted/20 px-3 py-1.5 text-xs italic text-muted-foreground">
+      <summary className="cursor-pointer select-none not-italic font-mono text-[11px] text-muted-foreground/80">
+        thinking
+      </summary>
+      <div className="mt-1.5 whitespace-pre-wrap">{thinking}</div>
+    </details>
+  );
+}
+
+// briefToolInput renders the leading "argument" Claude CLI shows after the
+// tool name — `Read(path)`, `Bash(command)`, `Grep(pattern)`. For tools we
+// don't have a curated mapping for, fall back to the first string value.
+const PRIMARY_KEY: Record<string, string> = {
+  Read: "file_path",
+  Edit: "file_path",
+  Write: "file_path",
+  NotebookEdit: "notebook_path",
+  Bash: "command",
+  Glob: "pattern",
+  Grep: "pattern",
+  WebFetch: "url",
+  WebSearch: "query",
+  Task: "description",
+  ExitPlanMode: "plan",
+  Skill: "skill",
+  ToolSearch: "query",
+  ScheduleWakeup: "reason",
+  AskUserQuestion: "question",
+};
+
+function briefToolInput(name: string, input: Record<string, unknown>): string {
+  if (name === "TodoWrite" && Array.isArray(input.todos)) {
+    return `${(input.todos as unknown[]).length} todos`;
+  }
+  const key = PRIMARY_KEY[name];
+  const candidate = key ? input[key] : Object.values(input)[0];
+  if (candidate == null) return "";
+  if (typeof candidate === "string") return truncate(candidate, 80);
+  return truncate(JSON.stringify(candidate), 80);
+}
+
+function truncate(s: string, max: number): string {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  return oneLine.length <= max ? oneLine : oneLine.slice(0, max - 1) + "…";
+}
+
+interface ToolUseLineProps {
+  name: string;
+  input: Record<string, unknown>;
+  expandedInput?: unknown;
+  // While the tool_use input is still streaming via input_json_delta, the
+  // partial JSON string drives the brief preview instead of `input`.
+  streamingPartialJson?: string;
+}
+
+export function ToolUseLine({
+  name,
+  input,
+  expandedInput,
+  streamingPartialJson,
+}: ToolUseLineProps) {
+  // While we're still receiving input_json_delta chunks, attempt to
+  // parse what we have so the brief preview tracks. JSON.parse fails
+  // until the chunk completes a token boundary; on failure we show
+  // an "…" placeholder so the user sees activity.
+  let brief = "";
+  if (streamingPartialJson !== undefined) {
+    if (streamingPartialJson === "") {
+      brief = "";
+    } else {
+      try {
+        const parsed = JSON.parse(streamingPartialJson) as Record<string, unknown>;
+        brief = briefToolInput(name, parsed);
+      } catch {
+        brief = "…";
+      }
+    }
+  } else {
+    brief = briefToolInput(name, input);
+  }
+  return (
+    <details className="group rounded-md hover:bg-muted/30">
+      <summary className="flex cursor-pointer select-none items-baseline gap-2 px-2 py-1 text-sm">
+        <span className="text-emerald-500" aria-hidden>
+          ●
+        </span>
+        <span className="font-mono font-medium">{name}</span>
+        {brief && (
+          <span className="truncate font-mono text-xs text-muted-foreground">
+            ({brief})
+          </span>
+        )}
+      </summary>
+      <pre className="mx-2 mt-1 max-h-72 overflow-auto rounded bg-muted/40 p-2 text-[11px]">
+        {streamingPartialJson !== undefined
+          ? streamingPartialJson || "(empty)"
+          : JSON.stringify(expandedInput ?? input, null, 2)}
+      </pre>
+    </details>
+  );
+}
+
+// stringifyToolResult flattens the tool_result content union into a string
+// so the summary line + expanded view share the same source of truth.
+function stringifyToolResult(
+  content: string | Array<{ type: string; text?: string }> | unknown,
+): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (c.type === "text" && typeof c.text === "string" ? c.text : `[${c.type}]`))
+      .join("\n");
+  }
+  return "";
+}
+
+interface ToolResultLineProps {
+  content: string | Array<{ type: string; text?: string }> | unknown;
+  isError: boolean;
+}
+
+export function ToolResultLine({ content, isError }: ToolResultLineProps) {
+  const full = stringifyToolResult(content);
+  const trimmed = full.trim();
+  let summary: string;
+  if (isError) {
+    const firstLine = trimmed.split("\n", 1)[0] ?? "";
+    summary = firstLine ? truncate(firstLine, 100) : "error";
+  } else if (!trimmed) {
+    summary = "no output";
+  } else {
+    const lines = trimmed.split("\n");
+    summary = lines.length === 1 ? truncate(lines[0], 100) : `${lines.length} lines`;
+  }
+  return (
+    <details className="group ml-2" open={isError}>
+      <summary
+        className={`flex cursor-pointer select-none items-baseline gap-1.5 px-2 py-0.5 text-xs ${
+          isError ? "text-destructive" : "text-muted-foreground"
+        }`}
+      >
+        <span aria-hidden>⎿</span>
+        <span className="truncate font-mono">{summary}</span>
+      </summary>
+      <pre className="mx-2 mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-2 text-[11px]">
+        {full || "(empty)"}
+      </pre>
+    </details>
+  );
+}
+
+// StreamingTurn renders the in-flight assistant turn from the per-block
+// streaming state. Same look as a finalized AssistantBubble plus a pulsing
+// cursor on the most recently active text block.
+export function StreamingTurn({ blocks }: { blocks: StreamingBlock[] }) {
+  if (blocks.length === 0) return null;
+  // Index of the trailing text block, if any — that's where we put the
+  // typing cursor. Tool/thinking blocks don't get a cursor since their
+  // "activity" is implied by streaming JSON / italic text.
+  let cursorIdx = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i]?.type === "text") {
+      cursorIdx = i;
+      break;
+    }
+  }
+  return (
+    <div className="space-y-2">
+      {blocks.map((block, i) => {
+        if (!block) return null;
+        if (block.type === "text") {
+          return (
+            <div key={i} className="rounded-md bg-card px-3 py-2 text-sm">
+              <Markdown source={block.text} />
+              {i === cursorIdx && (
+                <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-foreground/60 align-middle" />
+              )}
+            </div>
+          );
+        }
+        if (block.type === "thinking") {
+          return <ThinkingBlock key={i} thinking={block.thinking} />;
+        }
+        if (block.type === "tool_use") {
+          return (
+            <ToolUseLine
+              key={i}
+              name={block.name}
+              input={{}}
+              streamingPartialJson={block.partial_json}
+            />
+          );
+        }
+        return null;
+      })}
+    </div>
+  );
+}
