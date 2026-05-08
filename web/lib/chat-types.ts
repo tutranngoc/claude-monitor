@@ -36,6 +36,37 @@ export interface SessionSummary {
   // context-window % indicator. input_tokens already accounts for the
   // running history the SDK ships each turn.
   usage?: SessionUsage;
+  // Top-level Task subagents the model has spawned in this session.
+  // Server derives from history so the sidebar can show a tree without
+  // each client re-walking transcripts. Empty/omitted when none yet.
+  subagents?: SubagentSummary[];
+}
+
+// SubagentSummary describes one Task tool_use spawn. The Task tool's
+// children — assistant turns the subagent makes, tool_use blocks it
+// calls, etc. — all carry parent_tool_use_id === task_id, so the UI
+// uses task_id to filter the main timeline and group children under
+// the inline SubagentCard.
+export interface SubagentSummary {
+  // Stable identifier — the parent Task block's tool_use id. Children
+  // reference it via SDKMessage.parent_tool_use_id.
+  task_id: string;
+  // Captured from the Task tool input. subagent_type names the agent
+  // archetype (e.g. "general-purpose", "Explore"); description is the
+  // human-readable summary the model wrote when dispatching.
+  subagent_type?: string;
+  description?: string;
+  // active until the parent timeline receives a tool_result block for
+  // task_id; flips to done/errored based on tool_result.is_error.
+  status: "active" | "done" | "errored";
+  // Number of tool_use blocks the subagent has emitted so far. Drives
+  // the "n tools" chip on the card. Counts nested calls too — including
+  // any sub-subagents the subagent itself dispatched.
+  tool_calls: number;
+  // First non-empty line of the tool_result content, capped to ~200
+  // chars. The sidebar shows this as a one-line preview; the full
+  // result is in the children timeline.
+  result_text?: string;
 }
 
 export interface SessionUsage {
@@ -111,6 +142,11 @@ export interface SessionSnapshot {
   pending_question?: AskUserQuestionRequest;
   latest_plan?: PlanRecord;
 }
+
+export type SubagentNavTarget = {
+  session_id: string;
+  task_id: string;
+};
 
 export interface CreateSessionRequest {
   cwd: string;

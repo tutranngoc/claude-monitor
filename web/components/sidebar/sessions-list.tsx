@@ -2,39 +2,62 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { MessageSquare } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronDown, MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { SessionSummary } from "@/lib/chat-types";
+import type { SessionSummary, SubagentSummary } from "@/lib/chat-types";
 
 // Sidebar's session list. Refetches when the route changes so a freshly
-// created chat appears the moment we navigate into it. Without a server-
-// pushed list we accept the small delay; sessions don't move that often.
+// created chat appears the moment we navigate into it. Also listens
+// for `cm:session-subagents` window events fired by useChatSession so
+// the subagent tree stays live as the active chat dispatches subagents.
 export function SessionsList() {
   const pathname = usePathname();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loaded, setLoaded] = useState(false);
+  // Coalesce rapid-fire fetches — every assistant turn during a
+  // subagent's run flips the fingerprint, but the sidebar only needs
+  // one refresh per ~250ms to feel live.
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refetch = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch("/api/chat", { signal });
+      if (!res.ok) return;
+      const data = (await res.json()) as { sessions: SessionSummary[] };
+      setSessions(data.sessions);
+    } catch {
+      // Aborted or transient — let the next refresh recover.
+    }
+  }, []);
 
   useEffect(() => {
     const ctrl = new AbortController();
     let cancelled = false;
     void (async () => {
-      try {
-        const res = await fetch("/api/chat", { signal: ctrl.signal });
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { sessions: SessionSummary[] };
-        if (!cancelled) setSessions(data.sessions);
-      } catch {
-        // Aborted or transient — let the next refresh recover.
-      } finally {
-        if (!cancelled) setLoaded(true);
-      }
+      await refetch(ctrl.signal);
+      if (!cancelled) setLoaded(true);
     })();
     return () => {
       cancelled = true;
       ctrl.abort();
     };
-  }, [pathname]);
+  }, [pathname, refetch]);
+
+  useEffect(() => {
+    const onUpdate = () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        void refetch();
+      }, 250);
+    };
+    window.addEventListener("cm:session-subagents", onUpdate);
+    return () => {
+      window.removeEventListener("cm:session-subagents", onUpdate);
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    };
+  }, [refetch]);
 
   // Pull the active session id out of /chat/[id]. Avoids carrying the
   // pathname through every row.
@@ -76,26 +99,115 @@ function SessionRow({
 }) {
   const title = session.title ?? "New chat";
   const subtitle = subtitleFor(session);
+  const subagents = session.subagents ?? [];
+  // Collapse subagent tree by default — most rows have at most a few
+  // subagents and clutter compounds across many sessions. Active row
+  // starts expanded so the user landing in /chat/[id] sees the tree
+  // they presumably came to dig into.
+  const [open, setOpen] = useState(active);
 
   return (
-    <Link
-      href={`/chat/${session.id}`}
-      className={cn(
-        "group/row flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors",
-        active
-          ? "bg-sidebar-accent text-sidebar-accent-foreground"
-          : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
-      )}
-    >
-      <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
-      <div className="min-w-0 flex-1 leading-tight">
-        <div className="truncate">{title}</div>
-        <div className="truncate text-[11px] text-muted-foreground">
-          {subtitle}
-        </div>
+    <div className="group/row">
+      <div
+        className={cn(
+          "relative flex items-start rounded-md transition-colors",
+          active
+            ? "bg-sidebar-accent text-sidebar-accent-foreground"
+            : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60",
+        )}
+      >
+        <Link
+          href={`/chat/${session.id}`}
+          className="flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-sm"
+        >
+          <MessageSquare className="mt-0.5 size-3.5 shrink-0 opacity-70" />
+          <div className="min-w-0 flex-1 leading-tight">
+            <div className="truncate">{title}</div>
+            <div className="truncate text-[11px] text-muted-foreground">
+              {subtitle}
+            </div>
+          </div>
+          <StatusDot status={session.status} />
+        </Link>
+        {subagents.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-label={
+              open
+                ? `Hide ${subagents.length} subagents`
+                : `Show ${subagents.length} subagents`
+            }
+            className="flex shrink-0 items-center gap-1 px-1.5 py-1.5 text-[11px] font-mono text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <span>{subagents.length}</span>
+            <ChevronDown
+              className={cn(
+                "size-3 transition-transform",
+                open ? "rotate-0" : "-rotate-90",
+              )}
+              aria-hidden
+            />
+          </button>
+        )}
       </div>
-      <StatusDot status={session.status} />
+
+      {subagents.length > 0 && open && (
+        <ul className="mt-0.5 ml-4 space-y-0.5 border-l border-border/60 pl-2">
+          {subagents.map((sub) => (
+            <li key={sub.task_id}>
+              <SubagentRow sessionId={session.id} subagent={sub} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function SubagentRow({
+  sessionId,
+  subagent,
+}: {
+  sessionId: string;
+  subagent: SubagentSummary;
+}) {
+  const heading = subagent.subagent_type ?? "subagent";
+  const description = subagent.description?.trim();
+  return (
+    <Link
+      href={`/chat/${sessionId}#subagent-${subagent.task_id}`}
+      className="flex items-start gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
+    >
+      <SubagentDot status={subagent.status} />
+      <div className="min-w-0 flex-1 leading-tight">
+        <div className="truncate font-mono">{heading}</div>
+        {description && (
+          <div className="truncate text-[10.5px] text-muted-foreground">
+            {description}
+          </div>
+        )}
+      </div>
+      <span className="shrink-0 self-center font-mono text-[10px] text-muted-foreground">
+        {subagent.tool_calls}
+      </span>
     </Link>
+  );
+}
+
+function SubagentDot({ status }: { status: SubagentSummary["status"] }) {
+  const color =
+    status === "errored"
+      ? "bg-destructive"
+      : status === "active"
+        ? "bg-amber-500 animate-pulse"
+        : "bg-emerald-500";
+  return (
+    <span
+      title={status}
+      className={cn("mt-1.5 inline-block size-1.5 shrink-0 rounded-full", color)}
+    />
   );
 }
 
@@ -119,7 +231,7 @@ function StatusDot({ status }: { status: SessionSummary["status"] }) {
   return (
     <span
       title={status.replace("_", " ")}
-      className={cn("mt-1.5 inline-block size-1.5 shrink-0 rounded-full", color)}
+      className={cn("mt-2 mr-2 inline-block size-1.5 shrink-0 rounded-full", color)}
     />
   );
 }

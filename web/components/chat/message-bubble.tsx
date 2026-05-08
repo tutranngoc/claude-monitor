@@ -3,6 +3,9 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Markdown } from "@/components/markdown/markdown";
 import type { StreamingBlock } from "@/lib/chat-types";
+import { isSubagentDispatchTool } from "@/lib/subagents";
+import { SubagentCard } from "./subagent-card";
+import { useSubagents } from "./subagent-context";
 
 interface Props {
   msg: SDKMessage;
@@ -35,6 +38,7 @@ function AssistantBubble({
   msg: Extract<SDKMessage, { type: "assistant" }>;
 }) {
   const content = msg.message.content;
+  const subagents = useSubagents();
   return (
     <div className="space-y-2">
       {content.map((block, i) => {
@@ -42,6 +46,31 @@ function AssistantBubble({
           return <TextBlock key={i} text={block.text} />;
         }
         if (block.type === "tool_use") {
+          // Subagent dispatches (tool name "Agent" in SDK 0.2.133, or
+          // "Task" in older releases — see SUBAGENT_TOOL_NAMES) get
+          // their own card so the user sees the subagent as one
+          // logical unit instead of an opaque tool_use line followed
+          // by every child message inline. Falls back to ToolUseLine
+          // when the provider isn't mounted (e.g. tool_use rendered
+          // outside the chat viewport, or the summary hasn't been
+          // derived yet).
+          if (isSubagentDispatchTool(block.name) && subagents) {
+            const summary = subagents.byTaskId.get(block.id);
+            if (summary) {
+              const children = subagents.childrenByTaskId.get(block.id) ?? [];
+              return (
+                <SubagentCard
+                  key={i}
+                  summary={summary}
+                  childCount={children.length}
+                >
+                  {children.map((child, idx) => (
+                    <MessageBubble key={messageKey(child, idx)} msg={child} />
+                  ))}
+                </SubagentCard>
+              );
+            }
+          }
           return (
             <ToolUseLine
               key={i}
@@ -58,6 +87,15 @@ function AssistantBubble({
       })}
     </div>
   );
+}
+
+// messageKey derives a stable key for nested-timeline rendering. Most
+// SDKMessages carry uuid; system/result messages don't, so we fall
+// back to a positional key. The prefix avoids collisions across kinds.
+function messageKey(msg: SDKMessage, idx: number): string {
+  const uuid = (msg as { uuid?: string }).uuid;
+  if (uuid) return `${msg.type}:${uuid}`;
+  return `${msg.type}:${idx}`;
 }
 
 // Strip Claude CLI's command-output markers so synthetic user messages

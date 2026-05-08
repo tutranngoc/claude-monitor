@@ -32,6 +32,7 @@ import type {
   SessionUsage,
 } from "@/lib/chat-types";
 import type { PlanRecord } from "@/lib/plan-types";
+import { deriveSubagents } from "@/lib/subagents";
 
 interface PendingPermission {
   request: PermissionRequest;
@@ -102,6 +103,7 @@ function emit(session: ChatSession, event: ChatEvent): void {
 }
 
 function summarize(session: ChatSession): SessionSummary {
+  const subagents = deriveSubagents(session.history).list;
   return {
     id: session.id,
     cwd: session.cwd,
@@ -114,6 +116,7 @@ function summarize(session: ChatSession): SessionSummary {
     model: session.model,
     effort: session.effort,
     usage: session.latestUsage,
+    subagents: subagents.length > 0 ? subagents : undefined,
   };
 }
 

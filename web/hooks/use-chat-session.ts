@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useMemo, useReducer, useRef } from "react";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionAnswers,
@@ -9,8 +9,10 @@ import type {
   PermissionRequest,
   SessionStatus,
   StreamingBlock,
+  SubagentSummary,
 } from "@/lib/chat-types";
 import type { PlanRecord } from "@/lib/plan-types";
+import { deriveSubagents } from "@/lib/subagents";
 
 export type ConnectionState = "connecting" | "open" | "closed";
 
@@ -208,6 +210,14 @@ export interface UseChatSession extends State {
   cancelQuestion: (message?: string) => Promise<void>;
   approvePlan: (planId: string) => Promise<void>;
   stop: () => Promise<void>;
+  // Subagent grouping derived from history. byTaskId is keyed by Task
+  // tool_use_id; childrenByTaskId carries the SDKMessages emitted while
+  // the subagent ran; resultTaskIds names tasks whose tool_result echo
+  // can be hidden from the main viewport (the SubagentCard owns it).
+  subagents: SubagentSummary[];
+  subagentsByTaskId: Map<string, SubagentSummary>;
+  subagentChildrenByTaskId: Map<string, SDKMessage[]>;
+  subagentResultTaskIds: Set<string>;
 }
 
 // useChatSession owns the EventSource subscription for one chat session
@@ -353,5 +363,41 @@ export function useChatSession(sessionId: string): UseChatSession {
     await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
   };
 
-  return { ...state, send, decide, answer, cancelQuestion, approvePlan, stop };
+  // Recompute subagent grouping when history changes. Cheap walk —
+  // history is capped at 1000 messages and most chats stay under 200.
+  // useMemo (not React Compiler — the input is a stable Map/Set so we
+  // want explicit memo identity for downstream consumers).
+  const derived = useMemo(() => deriveSubagents(state.history), [state.history]);
+
+  // Notify the sidebar when this session's subagent grouping changes
+  // so the tree under the row stays in sync without a manual reload.
+  // Triggers on count + status fingerprint so completions also fire,
+  // not just spawns.
+  const fingerprint = useMemo(() => {
+    return derived.list
+      .map((s) => `${s.task_id}:${s.status}:${s.tool_calls}`)
+      .join("|");
+  }, [derived.list]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(
+      new CustomEvent("cm:session-subagents", {
+        detail: { sessionId },
+      }),
+    );
+  }, [sessionId, fingerprint]);
+
+  return {
+    ...state,
+    send,
+    decide,
+    answer,
+    cancelQuestion,
+    approvePlan,
+    stop,
+    subagents: derived.list,
+    subagentsByTaskId: derived.byTaskId,
+    subagentChildrenByTaskId: derived.childrenByTaskId,
+    subagentResultTaskIds: derived.resultTaskIds,
+  };
 }

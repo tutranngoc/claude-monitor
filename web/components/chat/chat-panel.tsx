@@ -34,6 +34,8 @@ import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
 import { AskQuestionCard } from "./ask-question-card";
+import { SubagentProvider } from "./subagent-context";
+import { shouldHideFromMainTimeline } from "@/lib/subagents";
 import {
   CommandOutputBubble,
   type CommandOutput,
@@ -123,6 +125,25 @@ export function ChatPanel({ session }: Props) {
   // Compiler memoizes this — manual useMemo conflicts with its analysis.
   const liveUsage = latestUsage(chat.history) ?? session.usage;
 
+  // Subagent grouping derives from history. We pass it through context
+  // so MessageBubble can render Task tool_use blocks as SubagentCards;
+  // here we use it to filter the main timeline so child messages and
+  // top-level tool_result echoes don't double-render alongside the card.
+  const subagentDerivation = useMemo(
+    () => ({
+      byTaskId: chat.subagentsByTaskId,
+      childrenByTaskId: chat.subagentChildrenByTaskId,
+      resultTaskIds: chat.subagentResultTaskIds,
+      list: chat.subagents,
+    }),
+    [
+      chat.subagentsByTaskId,
+      chat.subagentChildrenByTaskId,
+      chat.subagentResultTaskIds,
+      chat.subagents,
+    ],
+  );
+
   const items = useMemo<ChatItem[]>(() => {
     const out: ChatItem[] = [];
     const sortedCmds = [...commandLog].sort(
@@ -144,7 +165,13 @@ export function ChatPanel({ session }: Props) {
     };
     flushCmdsUpTo(0);
     for (let i = 0; i < chat.history.length; i++) {
-      out.push({ kind: "message", msg: chat.history[i] });
+      const msg = chat.history[i];
+      // Children of a Task subagent live inside that subagent's card,
+      // not in the top-level viewport. Same for the user message that
+      // ferries a Task's tool_result back to the dispatcher.
+      if (!shouldHideFromMainTimeline(msg, subagentDerivation)) {
+        out.push({ kind: "message", msg });
+      }
       flushCmdsUpTo(i + 1);
     }
     flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
@@ -168,6 +195,7 @@ export function ChatPanel({ session }: Props) {
     chat.latestPlan,
     chat.errors,
     commandLog,
+    subagentDerivation,
   ]);
 
   const closed = chat.status === "closed" || chat.status === "errored";
@@ -205,89 +233,95 @@ export function ChatPanel({ session }: Props) {
   const cwdLabel = shortenCwd(session.cwd);
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
-      <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 px-4 py-2">
-        <div className="pointer-events-auto flex min-w-0 items-baseline gap-2 rounded-md bg-background/70 px-2 py-1 backdrop-blur-sm">
-          <span className="min-w-0 truncate text-sm font-medium">
-            {session.title ?? "New chat"}
-          </span>
-          <span
-            title={session.cwd}
-            className="hidden whitespace-nowrap font-mono text-[11px] text-muted-foreground sm:inline"
-          >
-            {cwdLabel}
-            {session.account_name && <> · {session.account_name}</>}
-          </span>
-          <StatusBadge status={chat.status} />
-        </div>
-        <div className="pointer-events-auto flex items-center gap-2">
-          {!closed && (
-            <Button variant="outline" size="sm" onClick={() => chat.stop()}>
-              Stop
-            </Button>
+    <SubagentProvider
+      byTaskId={subagentDerivation.byTaskId}
+      childrenByTaskId={subagentDerivation.childrenByTaskId}
+      resultTaskIds={subagentDerivation.resultTaskIds}
+    >
+      <div className="relative flex h-full min-h-0 flex-col">
+        <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 px-4 py-2">
+          <div className="pointer-events-auto flex min-w-0 items-baseline gap-2 rounded-md bg-background/70 px-2 py-1 backdrop-blur-sm">
+            <span className="min-w-0 truncate text-sm font-medium">
+              {session.title ?? "New chat"}
+            </span>
+            <span
+              title={session.cwd}
+              className="hidden whitespace-nowrap font-mono text-[11px] text-muted-foreground sm:inline"
+            >
+              {cwdLabel}
+              {session.account_name && <> · {session.account_name}</>}
+            </span>
+            <StatusBadge status={chat.status} />
+          </div>
+          <div className="pointer-events-auto flex items-center gap-2">
+            {!closed && (
+              <Button variant="outline" size="sm" onClick={() => chat.stop()}>
+                Stop
+              </Button>
+            )}
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1">
+          {items.length === 0 && chat.status === "starting" ? (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              Starting Claude Code…
+            </div>
+          ) : (
+            <Virtuoso<ChatItem>
+              ref={virtuosoRef}
+              data={items}
+              // Slight default-item-height nudge keeps the virtualizer from
+              // over-budgeting offscreen rows for a typical short message.
+              defaultItemHeight={48}
+              increaseViewportBy={{ top: 200, bottom: 600 }}
+              followOutput={(atBottom) => (atBottom ? "smooth" : false)}
+              initialTopMostItemIndex={
+                items.length > 0 ? items.length - 1 : undefined
+              }
+              computeItemKey={itemKey}
+              // Top spacer matches the floating header's vertical footprint
+              // so the first message clears the absolute header on initial
+              // render. Header is pointer-events-none so scrolling works
+              // through it once content slides up.
+              components={{ Header: HeaderSpacer }}
+              itemContent={(_, item) => (
+                <ItemRow
+                  item={item}
+                  approvePlan={chat.approvePlan}
+                  answerQuestion={chat.answer}
+                  cancelQuestion={chat.cancelQuestion}
+                />
+              )}
+            />
           )}
         </div>
-      </header>
 
-      <div className="min-h-0 flex-1">
-        {items.length === 0 && chat.status === "starting" ? (
-          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-            Starting Claude Code…
+        <footer className="px-4 py-3">
+          <div className="mx-auto max-w-3xl">
+            <Composer
+              mode="session"
+              cwd={session.cwd}
+              model={model}
+              onModelChange={(id) => void patchOptions({ model: id })}
+              effort={effort}
+              onEffortChange={(e) => void patchOptions({ effort: e })}
+              onSubmit={onSubmit}
+              disabled={closed}
+              usage={liveUsage}
+              commands={CHAT_COMMANDS}
+              placeholder={
+                closed
+                  ? "Session ended — start a new one"
+                  : "Describe a task or ask a question · type / for commands"
+              }
+            />
           </div>
-        ) : (
-          <Virtuoso<ChatItem>
-            ref={virtuosoRef}
-            data={items}
-            // Slight default-item-height nudge keeps the virtualizer from
-            // over-budgeting offscreen rows for a typical short message.
-            defaultItemHeight={48}
-            increaseViewportBy={{ top: 200, bottom: 600 }}
-            followOutput={(atBottom) => (atBottom ? "smooth" : false)}
-            initialTopMostItemIndex={
-              items.length > 0 ? items.length - 1 : undefined
-            }
-            computeItemKey={itemKey}
-            // Top spacer matches the floating header's vertical footprint
-            // so the first message clears the absolute header on initial
-            // render. Header is pointer-events-none so scrolling works
-            // through it once content slides up.
-            components={{ Header: HeaderSpacer }}
-            itemContent={(_, item) => (
-              <ItemRow
-                item={item}
-                approvePlan={chat.approvePlan}
-                answerQuestion={chat.answer}
-                cancelQuestion={chat.cancelQuestion}
-              />
-            )}
-          />
-        )}
+        </footer>
+
+        <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
       </div>
-
-      <footer className="px-4 py-3">
-        <div className="mx-auto max-w-3xl">
-          <Composer
-            mode="session"
-            cwd={session.cwd}
-            model={model}
-            onModelChange={(id) => void patchOptions({ model: id })}
-            effort={effort}
-            onEffortChange={(e) => void patchOptions({ effort: e })}
-            onSubmit={onSubmit}
-            disabled={closed}
-            usage={liveUsage}
-            commands={CHAT_COMMANDS}
-            placeholder={
-              closed
-                ? "Session ended — start a new one"
-                : "Describe a task or ask a question · type / for commands"
-            }
-          />
-        </div>
-      </footer>
-
-      <PermissionDialog request={chat.pendingPermission} onDecide={chat.decide} />
-    </div>
+    </SubagentProvider>
   );
 }
 
