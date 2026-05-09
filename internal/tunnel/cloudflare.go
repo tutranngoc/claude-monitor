@@ -201,6 +201,21 @@ func (t *Tunnel) Start(ctx context.Context, localURL string) error {
 		// dance during our subprocess lifetime — we'd rather have
 		// stable behaviour than the latest patch.
 		"--no-autoupdate",
+		// Force HTTP/2 over TCP/443 instead of cloudflared's default
+		// QUIC over UDP/443. QUIC has lower handshake latency in
+		// theory but, on hotel / cafe / corporate Wi-Fi where UDP is
+		// rate-limited or partially filtered, the connector takes
+		// 60-90s to register and produces frequent Error 1033s
+		// ("origin unreachable"). HTTP/2 is the boring TCP path
+		// every load balancer and firewall already handles correctly.
+		// Override with --cf-protocol if a user has the opposite
+		// problem (TCP throttled, UDP open).
+		"--protocol", "http2",
+		// 4 high-availability connections to distinct edge POPs so a
+		// single connector flap doesn't take the tunnel down. Default
+		// is 1; the cost is negligible on idle and the bump materially
+		// reduces 1033 incidents.
+		"--ha-connections", "4",
 		"--url", localURL,
 	}
 	if t.tunnelName != "" {
