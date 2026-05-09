@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, JetBrains_Mono, Instrument_Serif } from "next/font/google";
 import "./globals.css";
 import { WorkspaceShell } from "@/components/workspace-shell";
@@ -29,6 +29,25 @@ const jetBrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "claude-monitor",
   description: "Web orchestrator for claude-monitor accounts",
+};
+
+// viewport-fit=cover lets the body extend under iOS notch / home
+// indicator, so we can apply env(safe-area-inset-*) padding instead of
+// having the system reserve dead space at the top/bottom. user-
+// scalable=no would block pinch-zoom (accessibility regression on
+// mobile), so we leave maximumScale at the default 'no limit'.
+//
+// themeColor matches the painted body background on each scheme so
+// iOS Safari blends the URL bar into the app rather than flashing
+// white against a dark UI.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+  ],
 };
 
 // suppressHydrationWarning on <html> is intentional: the inline init

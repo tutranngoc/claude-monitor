@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { X } from "lucide-react";
 import { useDaemonContext } from "@/lib/daemon-context";
 import { Composer, type ComposerSubmit } from "@/components/composer/composer";
+import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { DEFAULT_EFFORT, DEFAULT_MODEL_ID } from "@/lib/models";
 import {
   CHAT_COMMANDS,
@@ -125,13 +126,21 @@ export function HomeView() {
         : "Daemon offline. Run `claude-monitor --serve 127.0.0.1:8788`.";
 
   return (
-    <div className="flex h-full flex-col items-center justify-center px-6">
+    <div className="relative flex h-full flex-col items-center justify-center px-4 sm:px-6">
+      {/* Mobile hamburger — absolute so it doesn't push the centered
+          hero down. Hidden on md+ where the rail is permanent. */}
+      <div
+        className="absolute top-2 left-2 z-10 md:hidden"
+        style={{ paddingTop: "env(safe-area-inset-top)" }}
+      >
+        <SidebarTrigger />
+      </div>
       <div className="w-full max-w-3xl">
-        <div className="mb-8 text-center">
-          <h1 className="font-display text-5xl font-normal tracking-tight">
+        <div className="mb-6 text-center sm:mb-8">
+          <h1 className="font-display text-3xl font-normal tracking-tight sm:text-5xl">
             What can Claude help you build?
           </h1>
-          <p className="mt-3 text-sm text-muted-foreground">
+          <p className="mt-2 text-xs text-muted-foreground sm:mt-3 sm:text-sm">
             Pick a working folder and a model, then describe the task.
           </p>
         </div>

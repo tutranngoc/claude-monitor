@@ -32,6 +32,7 @@ import {
   parseSlashCommand,
   type ParsedCommand,
 } from "@/lib/slash-commands";
+import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { ThinkingIndicator } from "./thinking-indicator";
 import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
@@ -334,21 +335,29 @@ export function ChatPanel({ session }: Props) {
       resultTaskIds={subagentDerivation.resultTaskIds}
     >
       <div className="relative flex h-full min-h-0 flex-col">
-        <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 px-4 py-2">
-          <div className="pointer-events-auto flex min-w-0 items-baseline gap-2 rounded-md bg-background/70 px-2 py-1 backdrop-blur-sm">
-            <span className="min-w-0 truncate text-sm font-medium">
-              {session.title ?? "New chat"}
-            </span>
-            <span
-              title={session.cwd}
-              className="hidden whitespace-nowrap font-mono text-[11px] text-muted-foreground sm:inline"
-            >
-              {cwdLabel}
-              {session.account_name && <> · {session.account_name}</>}
-            </span>
-            <StatusBadge status={chat.status} />
+        <header
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 px-2 py-2 sm:px-4"
+          // top-aligned with the iOS notch when the page is loaded
+          // standalone — without this the title hides behind it.
+          style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top))" }}
+        >
+          <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
+            <SidebarTrigger />
+            <div className="flex min-w-0 items-baseline gap-2 rounded-md bg-background/70 px-2 py-1 backdrop-blur-sm">
+              <span className="min-w-0 truncate text-sm font-medium">
+                {session.title ?? "New chat"}
+              </span>
+              <span
+                title={session.cwd}
+                className="hidden whitespace-nowrap font-mono text-[11px] text-muted-foreground sm:inline"
+              >
+                {cwdLabel}
+                {session.account_name && <> · {session.account_name}</>}
+              </span>
+              <StatusBadge status={chat.status} />
+            </div>
           </div>
-          <div className="pointer-events-auto flex items-center gap-2">
+          <div className="pointer-events-auto flex shrink-0 items-center gap-2">
             {!closed && (
               <Button variant="outline" size="sm" onClick={() => chat.stop()}>
                 Stop
@@ -434,7 +443,14 @@ export function ChatPanel({ session }: Props) {
           )}
         </div>
 
-        <footer className="px-4 py-3">
+        <footer
+          className="px-2 py-2 sm:px-4 sm:py-3"
+          // Pad past the iOS home-indicator so the composer's bottom
+          // edge clears the gesture bar on standalone-launched PWAs.
+          style={{
+            paddingBottom: "max(0.5rem, env(safe-area-inset-bottom))",
+          }}
+        >
           <div className="mx-auto max-w-3xl space-y-2">
             {queuedMessages.length > 0 && (
               <QueueIndicator

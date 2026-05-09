@@ -65,7 +65,7 @@ export function FolderBrowserDialog({
 }: Props) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100dvh-1rem)] gap-3 overflow-y-auto p-3 sm:max-h-[calc(100dvh-2rem)] sm:max-w-lg sm:gap-4 sm:p-4">
         <DialogHeader>
           <DialogTitle>Choose folder</DialogTitle>
         </DialogHeader>
@@ -221,8 +221,11 @@ function BrowserBody({ initialPath, onChoose, onCancel }: BodyProps) {
       </div>
 
       {/* Listing. min-h keeps the dialog steady while loading so the
-          footer doesn't pop up and down between fetches. */}
-      <div className="max-h-72 min-h-48 overflow-y-auto rounded-md border">
+          footer doesn't pop up and down between fetches. On phones we
+          let it grow more (60dvh) since the dialog is full-height and
+          there's space to spare; desktop stays bounded so the dialog
+          doesn't get unnecessarily tall on a 27" monitor. */}
+      <div className="max-h-[60dvh] min-h-48 overflow-y-auto rounded-md border sm:max-h-72">
         {loading && !data && <SkeletonList />}
         {error && (
           <div className="flex h-40 items-start justify-center gap-1.5 px-3 py-6 text-center text-xs text-destructive">
@@ -246,7 +249,7 @@ function BrowserBody({ initialPath, onChoose, onCancel }: BodyProps) {
                     <button
                       type="button"
                       onClick={() => setTarget(child)}
-                      className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted"
+                      className="flex w-full items-center gap-2 px-2.5 py-2.5 text-left text-xs hover:bg-muted sm:py-1.5"
                     >
                       <Folder
                         className={cn(

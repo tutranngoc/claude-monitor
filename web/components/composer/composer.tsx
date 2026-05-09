@@ -386,63 +386,75 @@ export function Composer(props: Props) {
         className="block w-full resize-none border-0 bg-transparent px-3 py-2.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-60"
       />
 
-      {/* Bottom toolbar */}
-      <div className="flex items-center gap-1.5 border-t px-2 py-1.5">
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          aria-label="Attach files"
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          <Paperclip className="size-4" />
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          accept="image/*,text/*,.md,.json,.yaml,.yml,.toml,.ts,.tsx,.js,.jsx,.go,.py,.rs,.rb,.php,.java,.cs,.swift,.kt,.html,.css,.scss,.sql,.graphql,.xml,.csv,.tsv,.proto,.sh,.bash,.lua,.scala,.c,.h,.cpp,.hpp"
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            if (files.length) void ingest(files);
-            e.currentTarget.value = "";
-          }}
-        />
-        <button
-          type="button"
-          aria-label="Voice input (coming soon)"
-          disabled
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground/50"
-        >
-          <Mic className="size-4" />
-        </button>
+      {/* Bottom toolbar. Two flex clusters: utilities (paperclip + mic)
+          on the left, options (meter + pickers + send) push-right via
+          `ms-auto`. flex-wrap on the outer row lets the right cluster
+          drop to its own line on narrow phones rather than overflowing
+          or squashing the send button off-screen. */}
+      <div className="flex flex-wrap items-center gap-1.5 border-t px-2 py-1.5">
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            aria-label="Attach files"
+            className="flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground sm:size-7"
+          >
+            <Paperclip className="size-4" />
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            accept="image/*,text/*,.md,.json,.yaml,.yml,.toml,.ts,.tsx,.js,.jsx,.go,.py,.rs,.rb,.php,.java,.cs,.swift,.kt,.html,.css,.scss,.sql,.graphql,.xml,.csv,.tsv,.proto,.sh,.bash,.lua,.scala,.c,.h,.cpp,.hpp"
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              if (files.length) void ingest(files);
+              e.currentTarget.value = "";
+            }}
+          />
+          {/* Mic is disabled (coming soon) and consumes precious row
+              space on phones where wrapping is already tight. Hide
+              below sm so the picker chips have room to breathe. */}
+          <button
+            type="button"
+            aria-label="Voice input (coming soon)"
+            disabled
+            className="hidden size-7 items-center justify-center rounded-md text-muted-foreground/50 sm:flex"
+          >
+            <Mic className="size-4" />
+          </button>
+        </div>
 
-        <div className="flex-1" />
+        <div className="ms-auto flex flex-wrap items-center gap-1.5">
+          <ContextMeter
+            breakdown={props.contextUsage}
+            usage={props.usage}
+            contextWindow={contextWindow}
+          />
+          {props.permMode && props.onPermModeChange && (
+            <ModePicker
+              mode={props.permMode}
+              onChange={props.onPermModeChange}
+            />
+          )}
+          <ModelEffortPicker
+            modelId={props.model}
+            effort={props.effort}
+            onModelChange={props.onModelChange}
+            onEffortChange={props.onEffortChange}
+          />
 
-        <ContextMeter
-          breakdown={props.contextUsage}
-          usage={props.usage}
-          contextWindow={contextWindow}
-        />
-        {props.permMode && props.onPermModeChange && (
-          <ModePicker mode={props.permMode} onChange={props.onPermModeChange} />
-        )}
-        <ModelEffortPicker
-          modelId={props.model}
-          effort={props.effort}
-          onModelChange={props.onModelChange}
-          onEffortChange={props.onEffortChange}
-        />
-
-        <Button
-          size="icon-sm"
-          onClick={() => void submitText()}
-          disabled={!canSend}
-          aria-label="Send (Shift+Enter)"
-          className="ml-1 rounded-full"
-        >
-          <ArrowUp className="size-4" />
-        </Button>
+          <Button
+            size="icon"
+            onClick={() => void submitText()}
+            disabled={!canSend}
+            aria-label="Send (Shift+Enter)"
+            className="ml-1 rounded-full sm:size-7"
+          >
+            <ArrowUp className="size-4" />
+          </Button>
+        </div>
       </div>
 
       {(props.helper || errors.length > 0) && (

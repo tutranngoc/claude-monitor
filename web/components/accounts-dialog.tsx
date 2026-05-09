@@ -81,7 +81,14 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl shadow-2xl sm:max-w-3xl">
+      <DialogContent
+        // Cap the dialog inside the dynamic viewport so phone users
+        // can scroll the whole stack (account list + LAN section +
+        // activity log) instead of having tail content clipped off
+        // the bottom edge. p-3 on mobile gives the dense inner
+        // content a touch more breathing room.
+        className="max-h-[calc(100dvh-1rem)] max-w-3xl gap-3 overflow-y-auto p-3 shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:max-w-3xl sm:gap-4 sm:p-4"
+      >
         <DialogHeader>
           {/* pr-8 keeps the dialog's absolute close-X (top-right) from
               overlapping the description. We split title + description
@@ -125,7 +132,7 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
           </div>
         )}
 
-        <div className="max-h-[55vh] space-y-2 overflow-y-auto pr-1">
+        <div className="space-y-2 sm:max-h-[55vh] sm:overflow-y-auto sm:pr-1">
           {accounts.length === 0 ? (
             <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
               {status === "connecting"
@@ -206,11 +213,11 @@ function AccountCard({
         account.active ? "border-primary/30 bg-primary/[0.03]" : "bg-card"
       }`}
     >
-      <div className="flex items-start gap-3">
+      <div className="flex flex-wrap items-start gap-3">
         <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-medium text-primary-foreground">
           {account.name.slice(0, 1).toUpperCase()}
         </div>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-[60%]">
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium">{account.name}</span>
             {!account.error && <ShortStatus a={account} />}
@@ -219,7 +226,11 @@ function AccountCard({
             {account.email ?? "—"}
           </div>
         </div>
-        <div className="flex shrink-0 gap-1">
+        {/* Buttons sit beside name/email on wide cards. On phones the
+            flex-wrap above pushes them to a second row that takes the
+            full card width, where they share space without crowding
+            the email out of the picture. */}
+        <div className="flex w-full shrink-0 justify-end gap-1 sm:w-auto">
           <Button
             size="sm"
             variant="ghost"

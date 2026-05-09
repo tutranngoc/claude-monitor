@@ -386,20 +386,20 @@ function PublicRow({
             <label className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
               Named tunnel (recommended for SSE)
             </label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <input
                 type="text"
                 value={cfTunnelInput}
                 onChange={(e) => onCfTunnelInputChange(e.target.value)}
                 placeholder="tunnel name (e.g. monitor)"
-                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+                className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
               />
               <input
                 type="text"
                 value={cfHostInput}
                 onChange={(e) => onCfHostInputChange(e.target.value)}
                 placeholder="hostname (e.g. monitor.example.com)"
-                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+                className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
               />
             </div>
             {!namedTunnelOK ? (
@@ -450,7 +450,9 @@ function PublicRow({
               value={allowInput}
               onChange={(e) => onAllowInputChange(e.target.value)}
               placeholder="e.g. 203.0.113.7,2001:db8::/32"
-              className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+              // py-1.5 on mobile gives a 36px tap target; sm reverts to
+              // dense desktop sizing.
+              className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
             />
             <p className="text-xs text-muted-foreground">
               Comma-separated IPs / CIDR ranges. Empty = token-only (anyone
