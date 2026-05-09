@@ -410,34 +410,16 @@ function PublicRow({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          {status.enabled && (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={busy || partialNamed}
-              onClick={onEnable}
-              title="Restart tunnel with the current inputs"
-            >
-              {busy ? (
-                <RefreshCw className="mr-1 size-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="mr-1 size-3.5" />
-              )}
-              Reconfigure
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant={status.enabled ? "outline" : "default"}
-            disabled={busy || (!status.enabled && partialNamed)}
-            onClick={status.enabled ? onDisable : onEnable}
-          >
-            {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
-            {!busy && <Globe className="mr-1 size-3.5" />}
-            {status.enabled ? "Disable" : "Enable public"}
-          </Button>
-        </div>
+        <Button
+          size="sm"
+          variant={status.enabled ? "outline" : "default"}
+          disabled={busy || (!status.enabled && partialNamed)}
+          onClick={status.enabled ? onDisable : onEnable}
+        >
+          {busy && <RefreshCw className="mr-1 size-3.5 animate-spin" />}
+          {!busy && <Globe className="mr-1 size-3.5" />}
+          {status.enabled ? "Disable" : "Enable public"}
+        </Button>
       </header>
 
       {status.error && status.error.includes("cloudflared binary not found") && (
@@ -465,11 +447,8 @@ function PublicRow({
           </Alert>
         )}
 
-      {/* Inputs visible regardless of enable state — when public is on
-          but the backend is tracking a quick tunnel (e.g. auto-start at
-          boot with empty config), the user can still type the named-
-          tunnel fields and click Reconfigure to switch over. */}
-      <div className="space-y-3">
+      {!status.enabled && (
+        <div className="space-y-3">
           <div className="space-y-1.5">
             <label className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
               Named tunnel (recommended for SSE)
@@ -582,15 +561,17 @@ function PublicRow({
             )}
           </div>
         </div>
+      )}
 
       {status.enabled && !status.pending && status.url && (
         <PublicDetails
           url={status.url}
-          // configuredHost is what the user typed into the named-tunnel
-          // hostname field. When it differs from the active URL (e.g.
-          // backend is still on a stale quick tunnel while a named
-          // tunnel is also reachable), we render both so the user can
-          // pick whichever works. Empty when no named hostname is set.
+          // configuredHost is what the user typed (or last persisted)
+          // as the named-tunnel hostname. When it differs from the
+          // active URL — e.g. backend is still on a stale quick tunnel
+          // while a named tunnel is also reachable — we render both so
+          // the user can pick whichever works. Empty when no named
+          // hostname is set or it already matches the active URL.
           configuredHost={hostTrim && !status.url.includes(hostTrim) ? hostTrim : undefined}
           token={lanStatus?.token}
           allowIPs={status.allow_ips}
