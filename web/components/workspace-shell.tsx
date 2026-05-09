@@ -24,7 +24,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
 }
 
 function ShellLayout({ children }: { children: ReactNode }) {
-  const { open, isMobile, setOpen } = useSidebar();
+  const { open, setOpen } = useSidebar();
   return (
     // h-dvh tracks the dynamic viewport (iOS Safari shrinks/grows the
     // chrome) so the layout never gets clipped by the address bar
@@ -32,10 +32,12 @@ function ShellLayout({ children }: { children: ReactNode }) {
     // can flex shrink instead of pushing the body off-screen.
     <div className="relative flex h-dvh min-h-0 w-full">
       <AppSidebar />
-      {/* Backdrop — only painted when the mobile drawer is open. Tap
-          dismisses. Pointer-events-none on desktop so nothing blocks
-          the main panel. */}
-      {isMobile && open && (
+      {/* Backdrop — painted only when the drawer is open AND the
+          viewport is below md. The `md:hidden` keeps it off desktop
+          even on the brief moment after a user resizes from mobile to
+          desktop with the drawer open (SidebarProvider doesn't auto-
+          close in that case to keep the user's intent). */}
+      {open && (
         <button
           type="button"
           aria-label="Close sidebar"

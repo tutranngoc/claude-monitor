@@ -111,6 +111,18 @@ export function HomeView() {
       if (!sendRes.ok) {
         throw new Error(`send: ${sendRes.status}: ${await sendRes.text()}`);
       }
+      // Nudge the sidebar's session list to refetch so the new chat's
+      // row appears (and is already in "Working…" state) before the
+      // user lands on it. Without this the row pops in on the 5s
+      // poll-interval boundary which feels broken on a snappy create-
+      // and-go flow.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("cm:session-subagents", {
+            detail: { sessionId: summary.id },
+          }),
+        );
+      }
       router.push(`/chat/${summary.id}`);
     } finally {
       setBusy(false);

@@ -770,6 +770,17 @@ function getOrResume(id: string): ChatSession | undefined {
 
 async function driveSession(session: ChatSession): Promise<void> {
   try {
+    // The SDK Query iterator is constructed synchronously in
+    // buildLiveSession but only starts producing messages once a user
+    // message lands in the input queue. Sitting on "starting" until
+    // then leaves the sidebar forever spinning the sky-blue loader for
+    // a /clear-created chat that's actually just waiting for the user
+    // to type. Flip to "idle" the moment the loop is live; sendMessage
+    // (which flips to "thinking") races us harmlessly because both
+    // setStatus calls are no-ops when the target state already matches.
+    if (session.status === "starting") {
+      setStatus(session, "idle");
+    }
     for await (const msg of session.query) {
       // stream_event messages are token deltas — we push them through
       // SSE so live clients can render incremental text, but we do NOT

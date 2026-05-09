@@ -151,6 +151,25 @@ export function LANSection() {
   const onPubEnable = useCallback(async () => {
     setPubBusy(true);
     setError(null);
+    // Optimistically flip pub.pending=true so the UI shows "Starting
+    // tunnel…" + the polling effect (gated on pub?.pending) takes over
+    // immediately. We do this BEFORE the await because the enable
+    // request itself can fail mid-flight: the daemon recycles Next.js
+    // to apply MONITOR_AUTH_TOKEN, which severs the in-flight response
+    // even though the tunnel is actually starting fine on the server.
+    // Polling fetches /api/public/status until ground truth arrives.
+    // Don't preserve prev.url — the user may have just switched from
+    // quick → named tunnel (or vice versa), and showing the previous
+    // URL during the restart would be misleading. The polling effect
+    // fills in the fresh URL once the server confirms the tunnel is
+    // up.
+    setPub({
+      enabled: true,
+      pending: true,
+      allow_ips: allowInput.trim() || undefined,
+      cf_tunnel_name: cfTunnelInput.trim() || undefined,
+      cf_hostname: cfHostInput.trim() || undefined,
+    });
     try {
       const fresh = await enablePublic({
         allowIPs: allowInput.trim(),
@@ -161,14 +180,40 @@ export function LANSection() {
       // Public toggle also flips the auth gate on, so loopback
       // sessions need the token cookie afterwards. Refresh LAN status
       // first to grab the (possibly newly-generated) token, then
-      // redirect with ?token= to re-trigger the cookie set.
-      const lanFresh = await fetchLANStatus();
-      setLan(lanFresh);
-      if (lanFresh.token && !document.cookie.includes("cm_token=")) {
-        window.location.href = `/?token=${encodeURIComponent(lanFresh.token)}`;
+      // redirect with ?token= to re-trigger the cookie set. Wrapped in
+      // try/catch — fetch may be in flight while the proxy recycles,
+      // and the polling effect catches up either way.
+      try {
+        const lanFresh = await fetchLANStatus();
+        setLan(lanFresh);
+        if (
+          lanFresh.auth_enabled &&
+          lanFresh.token &&
+          !document.cookie.includes("cm_token=")
+        ) {
+          window.location.href = `/?token=${encodeURIComponent(lanFresh.token)}`;
+        }
+      } catch {
+        // proxy recycle in flight — polling resolves it
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // Distinguish a network blip (proxy recycle severed the request,
+      // tunnel still starting) from a real server error. TypeError
+      // "Failed to fetch" is the canonical browser network error;
+      // server-reported failures come back as Error with the message
+      // from the daemon's JSON body.
+      const msg = e instanceof Error ? e.message : String(e);
+      const isNetwork =
+        msg === "Failed to fetch" ||
+        msg.toLowerCase().includes("networkerror") ||
+        msg.toLowerCase().includes("load failed");
+      if (!isNetwork) {
+        setError(msg);
+      }
+      // Either way, leave pub.pending=true so polling resolves the
+      // ground truth — for the network case the tunnel is starting,
+      // for a hard server error the next poll will return enabled=
+      // false and pending=false, and the polling effect stops.
     } finally {
       setPubBusy(false);
     }

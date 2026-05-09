@@ -238,12 +238,19 @@ func (t *Tunnel) Start(ctx context.Context, localURL string) error {
 	go t.scan(stderr, os.Stderr)
 
 	// Reaper: marks the tunnel as not-running once cloudflared exits
-	// (clean stop or crash). Records the exit error into Status so a
-	// crashed tunnel doesn't silently stay "Running=false, URL=''".
+	// (clean stop or crash). Also clears URL/registered so a follow-up
+	// Status() — or a subsequent Start with a different tunnel mode —
+	// doesn't leak the previous run's identity into the UI (e.g. user
+	// disables a quick tunnel, configures a named tunnel, re-enables;
+	// without this clear the bridge's first Status() return after
+	// Start would race against the new t.url assignment and could
+	// stamp the response with the stale trycloudflare URL).
 	go func() {
 		err := cmd.Wait()
 		t.mu.Lock()
 		t.running = false
+		t.url = ""
+		t.registered = false
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.err = err
 		}
@@ -272,12 +279,24 @@ func (t *Tunnel) scan(r io.Reader, mirror io.Writer) {
 		registered := t.registered
 		t.mu.RUnlock()
 		if !captured {
-			if m := urlRe.Find(line); m != nil {
-				t.mu.Lock()
-				if t.url == "" {
-					t.url = string(m)
+			// Named tunnels never want a trycloudflare match — the URL
+			// comes from the user's hostname, not a quick-tunnel hostname
+			// that cloudflared might emit in passing log output. The
+			// `captured` guard above already skips the regex when t.url
+			// is non-empty (which it is for named tunnels, set in Start),
+			// but we double-check tunnelName here so a future refactor
+			// that briefly nils t.url can't regress the named-tunnel UI.
+			t.mu.RLock()
+			named := t.tunnelName != ""
+			t.mu.RUnlock()
+			if !named {
+				if m := urlRe.Find(line); m != nil {
+					t.mu.Lock()
+					if t.url == "" {
+						t.url = string(m)
+					}
+					t.mu.Unlock()
 				}
-				t.mu.Unlock()
 			}
 		}
 		if !registered && registeredRe.Match(line) {

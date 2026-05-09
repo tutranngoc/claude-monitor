@@ -19,7 +19,7 @@ import { AttentionIndicator } from "./attention-indicator";
 export function AppSidebar() {
   const pathname = usePathname();
   const isHome = pathname === "/";
-  const { open, isMobile, setOpen } = useSidebar();
+  const { open, setOpen } = useSidebar();
 
   return (
     <SessionsProvider>
@@ -32,17 +32,17 @@ export function AppSidebar() {
         //   - desktop (md+): static flex child, always visible
         //   - mobile open: fixed drawer at left, full height, slid in
         //   - mobile closed: fixed drawer translated -100% off-screen
-        // We use translate-x rather than display:none so the drawer
-        // animates open instead of popping. inset-y-0 on mobile lets
-        // the drawer span the full viewport height even when the chat
-        // panel above isn't tall enough for the sessions list.
+        // The `max-md:-translate-x-full` is keyed on a media query
+        // (not React state), so the closed-on-mobile style applies on
+        // the very first paint — no SSR/hydration flash where the
+        // drawer briefly covers the chat panel + composer (which had
+        // been swallowing taps because `isMobile` started false).
         className={cn(
           "z-40 flex h-full w-72 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground",
           "fixed inset-y-0 left-0 transition-transform duration-200 ease-out",
-          "md:static md:translate-x-0",
-          isMobile && (open ? "translate-x-0 shadow-2xl" : "-translate-x-full"),
+          "md:static md:translate-x-0 md:shadow-none",
+          open ? "translate-x-0 shadow-2xl" : "max-md:-translate-x-full",
         )}
-        aria-hidden={isMobile && !open}
       >
         <div
           className="flex items-center justify-between gap-2 px-3 py-3"

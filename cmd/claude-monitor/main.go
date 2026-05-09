@@ -674,14 +674,17 @@ func (b tunnelBridge) Enable(ctx context.Context, cfg server.PublicConfig) (serv
 		return server.PublicStatus{}, fmt.Errorf("start tunnel: %w", err)
 	}
 
-	awaitCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-	if _, err := tu.AwaitURL(awaitCtx); err != nil {
-		// Don't tear down on URL-not-yet-published — the user might
-		// retry the status fetch in a moment. Surface the error in
-		// Status.Error so the UI can show "still starting…".
-		return b.Status(), nil
-	}
+	// Return immediately with Pending=true so the response reaches the
+	// browser before the manager loop's 250ms grace expires and recycles
+	// Next.js (which kills the in-flight response). Cloudflared takes
+	// 5-25s to publish the URL; that progress is tracked by the UI via
+	// /api/public/status polling, not by blocking this handler.
+	//
+	// (The previous version called tu.AwaitURL(25s) here, which made the
+	// HTTP response race with the recycle and lost — the browser saw a
+	// fetch error even though the tunnel was actually starting fine.
+	// See feedback_public_enable_response_race.md if you're tempted to
+	// re-add the wait.)
 	return b.Status(), nil
 }
 
