@@ -6,6 +6,7 @@ import { useMemo, useState, useTransition } from "react";
 import {
   CheckCircle2,
   ChevronDown,
+  Clock,
   Loader2,
   MessageSquare,
   Moon,
@@ -139,6 +140,9 @@ function PlanGroupBlock({
   const runningCount = group.sessions.filter(
     (s) => s.status === "thinking" || s.status === "starting",
   ).length;
+  const rateLimitedCount = group.sessions.filter(
+    (s) => s.status === "rate_limited",
+  ).length;
 
   return (
     <div className="px-1">
@@ -152,9 +156,15 @@ function PlanGroupBlock({
           <span className="truncate">plan {planShort}</span>
         </Link>
         <span className="shrink-0 normal-case tabular-nums">
-          {runningCount > 0
-            ? `${runningCount}/${group.sessions.length} running`
-            : `${group.sessions.length} phases`}
+          {rateLimitedCount > 0 ? (
+            <span className="text-rose-600 dark:text-rose-400">
+              {rateLimitedCount}/{group.sessions.length} rate-limited
+            </span>
+          ) : runningCount > 0 ? (
+            `${runningCount}/${group.sessions.length} running`
+          ) : (
+            `${group.sessions.length} phases`
+          )}
         </span>
         <button
           type="button"
@@ -235,6 +245,10 @@ function SessionRow({
   // Render with a sleeping icon + muted label so the user can tell at
   // a glance it's a stored session waiting to wake up on click.
   const interrupted = session.status === "interrupted";
+  // "rate_limited" = SDK is auto-retrying after a 429. Distinct icon +
+  // rose tint surfaces "blocked, wait it out" without the user having
+  // to open the chat to find out why nothing's happening.
+  const rateLimited = session.status === "rate_limited";
 
   const onStop = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -257,6 +271,9 @@ function SessionRow({
           // Starting rows: same wash family but cooler, signaling
           // "booting up" vs "actively working".
           starting && !active && "bg-sky-500/[0.07]",
+          // Rate-limited rows pull the eye with a rose wash so the
+          // user spots blocked work without scanning labels.
+          rateLimited && !active && "bg-rose-500/[0.07]",
           // Active row: stronger accent + a primary-colored vertical
           // bar on the left edge so the eye snaps to it even in a long
           // list with multiple amber/sky-washed rows. Previously the
@@ -292,6 +309,11 @@ function SessionRow({
             // starting → idle (or → thinking) flips the color naturally.
             <Loader2
               className="mt-0.5 size-3.5 shrink-0 animate-spin text-sky-500"
+              aria-hidden
+            />
+          ) : rateLimited ? (
+            <Clock
+              className="mt-0.5 size-3.5 shrink-0 animate-pulse text-rose-500"
               aria-hidden
             />
           ) : interrupted ? (
@@ -336,6 +358,14 @@ function SessionRow({
                   {" · "}
                   <span>{subtitle}</span>
                 </>
+              ) : rateLimited ? (
+                <>
+                  <span className="font-medium text-rose-600 dark:text-rose-400">
+                    Rate limited
+                  </span>
+                  {" · "}
+                  <span>{subtitle}</span>
+                </>
               ) : interrupted ? (
                 <>
                   <span className="font-medium">Restored</span>
@@ -361,7 +391,7 @@ function SessionRow({
               colored label, so an extra dot would just be noise.
               Errored / closed / idle keep the dot since they fall back
               to the generic MessageSquare icon. */}
-          {!running && !starting && !interrupted && !done && (
+          {!running && !starting && !interrupted && !done && !rateLimited && (
             <StatusDot status={session.status} />
           )}
         </Link>

@@ -32,7 +32,36 @@ export type SessionStatus =
   // is materialised lazily on first interaction (sendMessage / SSE
   // subscribe / updateSessionOptions) via SDK `resume` and flips back
   // to "starting"/"idle" once the binary is alive again.
-  | "interrupted";
+  | "interrupted"
+  // Set when the SDK emits a `rate_limit_event` with status="rejected".
+  // The SDK auto-retries internally (CLAUDE_CODE_MAX_RETRIES, default
+  // 10) so we don't manage the timer — we just surface the wait so the
+  // user knows why the session stopped progressing. Flips back to
+  // thinking when the next assistant/stream_event arrives (i.e. the
+  // SDK's internal retry got through).
+  | "rate_limited";
+
+// RateLimitInfo mirrors SDKRateLimitInfo verbatim so client code (which
+// can only type-import the SDK) has a runtime-safe value. status drives
+// the badge color (allowed = silent heads-up isn't surfaced; warning = ⚠;
+// rejected = 🛑); resetsAt feeds the countdown.
+export interface RateLimitInfo {
+  status: "allowed" | "allowed_warning" | "rejected";
+  // Unix epoch in seconds (the SDK preserves Anthropic API
+  // convention). Client converts to ms for Date math.
+  resetsAt?: number;
+  rate_limit_type?:
+    | "five_hour"
+    | "seven_day"
+    | "seven_day_opus"
+    | "seven_day_sonnet"
+    | "overage";
+  utilization?: number;
+  overage_status?: "allowed" | "allowed_warning" | "rejected";
+  overage_resets_at?: number;
+  is_using_overage?: boolean;
+  surpassed_threshold?: number;
+}
 
 export interface SessionSummary {
   id: string;
@@ -69,6 +98,15 @@ export interface SessionSummary {
   // under a "Plan" header so phase fanout is visible at a glance.
   plan_id?: string;
   phase_slug?: string;
+  // Most recent rate_limit_event seen on this session. Persists across
+  // restarts via session-store. The status flip back to thinking
+  // doesn't clear this — the badge stays visible (greyed once
+  // resetsAt has passed) so the user has receipt of the recent wait.
+  rate_limit?: RateLimitInfo;
+  // Wall-clock time the rate_limit was observed (server side). Lets
+  // the UI distinguish "rate-limited an hour ago" from "currently
+  // rate-limited" without parsing Unix seconds in resetsAt.
+  rate_limit_observed_at?: string;
 }
 
 // SubagentSummary describes one Task tool_use spawn. The Task tool's
@@ -217,6 +255,13 @@ export type ChatEvent =
   | { type: "plan_approved"; data: PlanRecord }
   | { type: "plan_failed"; data: PlanRecord }
   | { type: "context_usage"; data: ContextUsageBreakdown }
+  // Fired on every SDKRateLimitEvent. Carries the full rate_limit_info
+  // plus the server's observed_at so a late-joining SSE client (after
+  // history replay) gets the same data the initial snapshot shows.
+  | {
+      type: "rate_limit";
+      data: { info: RateLimitInfo; observed_at: string };
+    }
   // queue_edited carries the FULL replaced SDKMessage so the client
   // reducer can swap by uuid. Fired when the user rewrites a queued
   // user message via PATCH /api/chat/<id>/queue/<uuid>.

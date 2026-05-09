@@ -2,10 +2,17 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowRight, GitCommit, Loader2, RotateCw, ShieldCheck } from "lucide-react";
+import {
+  ArrowRight,
+  Clock,
+  GitCommit,
+  Loader2,
+  RotateCw,
+  ShieldCheck,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Phase, PhaseSession, PlanRecord } from "@/lib/plan-types";
-import type { SessionStatus, SessionSummary } from "@/lib/chat-types";
+import type { RateLimitInfo, SessionStatus, SessionSummary } from "@/lib/chat-types";
 import { Badge } from "@/components/ui/badge";
 
 type Column = "todo" | "running" | "awaiting" | "done";
@@ -27,8 +34,13 @@ function bucketFor(status: SessionStatus | undefined): Column {
   if (!status) return "todo";
   if (status === "starting") return "todo";
   if (status === "thinking") return "running";
-  if (status === "awaiting_permission") return "awaiting";
-  return "done"; // idle | closed | errored — colored at row level
+  if (status === "awaiting_permission" || status === "rate_limited") {
+    // rate_limited groups under "awaiting" so the user notices at a
+    // glance that this phase is paused (even though the SDK is auto-
+    // retrying internally — the user-facing fact is "no progress").
+    return "awaiting";
+  }
+  return "done"; // idle | closed | errored | interrupted — colored at row level
 }
 
 export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
@@ -179,7 +191,10 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     const errored = phaseRows.filter(
       (r) => r.session?.status === "errored",
     ).length;
-    return { total, running, awaiting, done, errored };
+    const rateLimited = phaseRows.filter(
+      (r) => r.session?.status === "rate_limited",
+    ).length;
+    return { total, running, awaiting, done, errored, rateLimited };
   }, [buckets, phaseRows]);
 
   return (
@@ -200,6 +215,13 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           <Counter label="running" value={counters.running} tone="amber" />
           <Counter label="awaiting" value={counters.awaiting} tone="blue" />
           <Counter label="done" value={counters.done} tone="emerald" />
+          {counters.rateLimited > 0 && (
+            <Counter
+              label="rate-limited"
+              value={counters.rateLimited}
+              tone="rose"
+            />
+          )}
           {counters.errored > 0 && (
             <Counter label="errored" value={counters.errored} tone="rose" />
           )}
@@ -298,6 +320,7 @@ function PhaseRowCard({
         status === "errored" && "border-destructive/40",
         status === "thinking" && "border-amber-500/50",
         status === "awaiting_permission" && "border-blue-500/50",
+        status === "rate_limited" && "border-rose-500/50",
       )}
     >
       <div className="flex items-start gap-2">
@@ -346,6 +369,14 @@ function PhaseRowCard({
         )}
       </div>
 
+      {session?.rate_limit && (
+        <RateLimitBadge
+          info={session.rate_limit}
+          observedAt={session.rate_limit_observed_at}
+          active={session.status === "rate_limited"}
+        />
+      )}
+
       {link ? (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Link
@@ -384,6 +415,103 @@ function PhaseRowCard({
       )}
     </div>
   );
+}
+
+// RateLimitBadge renders the most recent rate_limit_event as a top-line
+// notice on the row: rose-tinted while the SDK is still backing off
+// (`active` mirrors the server's "rate_limited" status), muted gray
+// once the reset has passed and a successful retry has flipped status
+// back to thinking/idle. Tick state recomputes the countdown once per
+// second only while it actually matters; we don't repaint after the
+// limit clears.
+function RateLimitBadge({
+  info,
+  observedAt,
+  active,
+}: {
+  info: RateLimitInfo;
+  observedAt?: string;
+  active: boolean;
+}) {
+  // Hooks must run unconditionally — `info.status === "allowed"` short-
+  // circuit lives below, after useState/useEffect so a status flip
+  // doesn't change the call ordering.
+  const resetMs = info.resetsAt ? info.resetsAt * 1000 : null;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!resetMs || !active) return;
+    if (resetMs <= Date.now()) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [resetMs, active]);
+  // Only render for non-"allowed" states. allowed_warning is a
+  // courtesy heads-up worth showing; rejected is the actual block.
+  // We render lapsed badges too so the user sees that the wait already
+  // happened (helpful when reading a transcript hours later).
+  if (info.status === "allowed") return null;
+  const remainingMs = resetMs ? Math.max(0, resetMs - now) : null;
+  const countdown =
+    remainingMs !== null && remainingMs > 0 ? formatDuration(remainingMs) : null;
+  const tone =
+    active && info.status === "rejected"
+      ? "border-rose-500/50 bg-rose-500/10 text-rose-700 dark:text-rose-300"
+      : info.status === "allowed_warning"
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-muted bg-muted/40 text-muted-foreground";
+  const label =
+    info.status === "rejected"
+      ? active
+        ? "rate limited"
+        : "rate limit lapsed"
+      : "rate limit warning";
+  const tier =
+    info.rate_limit_type === "five_hour"
+      ? "5h"
+      : info.rate_limit_type === "seven_day"
+        ? "7d"
+        : info.rate_limit_type === "seven_day_opus"
+          ? "7d opus"
+          : info.rate_limit_type === "seven_day_sonnet"
+            ? "7d sonnet"
+            : info.rate_limit_type === "overage"
+              ? "overage"
+              : null;
+  const utilPct =
+    typeof info.utilization === "number"
+      ? Math.round(info.utilization * 100)
+      : null;
+  return (
+    <div
+      className={cn(
+        "mt-2 flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-[11px]",
+        tone,
+      )}
+      title={observedAt ? `observed ${observedAt}` : undefined}
+    >
+      <Clock className="size-3" aria-hidden />
+      <span>{label}</span>
+      {tier && <span className="opacity-70">· {tier}</span>}
+      {utilPct !== null && <span className="opacity-70">· {utilPct}%</span>}
+      {countdown && (
+        <span className="font-semibold">· resets in {countdown}</span>
+      )}
+    </div>
+  );
+}
+
+// formatDuration renders ms remaining as the most legible compact form:
+// "12s", "4m 30s", "1h 12m". Keeps the badge narrow.
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) {
+    const rs = s % 60;
+    return rs === 0 ? `${m}m` : `${m}m ${rs}s`;
+  }
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm === 0 ? `${h}h` : `${h}h ${rm}m`;
 }
 
 // CommitBadge surfaces the result of the most recent /complete call.
@@ -455,11 +583,13 @@ function SessionStatusDot({ status }: { status: SessionStatus }) {
         ? "bg-amber-500 animate-pulse"
         : status === "awaiting_permission"
           ? "bg-blue-500"
-          : status === "closed"
-            ? "bg-muted-foreground/40"
-            : status === "idle"
-              ? "bg-emerald-500"
-              : "bg-muted-foreground/60";
+          : status === "rate_limited"
+            ? "bg-rose-500 animate-pulse"
+            : status === "closed"
+              ? "bg-muted-foreground/40"
+              : status === "idle"
+                ? "bg-emerald-500"
+                : "bg-muted-foreground/60";
   return (
     <span
       title={status.replace("_", " ")}

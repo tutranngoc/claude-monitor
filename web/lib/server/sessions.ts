@@ -37,6 +37,7 @@ import type {
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
+  RateLimitInfo,
   SessionSnapshot,
   SessionStatus,
   SessionSummary,
@@ -119,6 +120,11 @@ interface ChatSession {
   // circuit identical Bash invocations regardless of what the binary
   // decides — matching the user's mental model of "I clicked Always".
   alwaysAllowRules: PermissionRuleValue[];
+  // Most recent rate_limit_event observed. The SDK auto-retries
+  // internally — we just hold this so the UI can render a countdown
+  // and the field survives restart via session-store.
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -142,6 +148,8 @@ interface InterruptedSession {
   latestPlan?: PlanRecord;
   planId?: string;
   phaseSlug?: string;
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -205,6 +213,8 @@ async function initFromDisk(): Promise<void> {
         latestPlan: s.latest_plan,
         planId: s.plan_id,
         phaseSlug: s.phase_slug,
+        rateLimit: s.rate_limit,
+        rateLimitObservedAt: s.rate_limit_observed_at,
       });
     }
     if (stored.length > 0) {
@@ -255,6 +265,8 @@ async function persistNow(id: string): Promise<void> {
       latest_plan: s.latestPlan,
       plan_id: s.planId,
       phase_slug: s.phaseSlug,
+      rate_limit: s.rateLimit,
+      rate_limit_observed_at: s.rateLimitObservedAt,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -304,7 +316,54 @@ function summarize(session: ChatSession): SessionSummary {
     subagents: subagents.length > 0 ? subagents : undefined,
     plan_id: session.planId,
     phase_slug: session.phaseSlug,
+    rate_limit: session.rateLimit,
+    rate_limit_observed_at: session.rateLimitObservedAt,
   };
+}
+
+// handleRateLimitEvent translates an SDKRateLimitEvent into our
+// snake_case wire shape, persists it on the session for restart-
+// survivability, and emits a `rate_limit` SSE event. Status flips to
+// `rate_limited` only on the `rejected` outcome — `allowed_warning` is
+// a heads-up the badge can show without claiming the agent is paused;
+// `allowed` is silent (we still record it so a UI countdown clock has
+// something to display once it expires, but no SSE noise).
+function handleRateLimitEvent(
+  session: ChatSession,
+  msg: Extract<SDKMessage, { type: "rate_limit_event" }>,
+): void {
+  const raw = msg.rate_limit_info;
+  const info: RateLimitInfo = {
+    status: raw.status,
+    resetsAt: raw.resetsAt,
+    rate_limit_type: raw.rateLimitType,
+    utilization: raw.utilization,
+    overage_status: raw.overageStatus,
+    overage_resets_at: raw.overageResetsAt,
+    is_using_overage: raw.isUsingOverage,
+    surpassed_threshold: raw.surpassedThreshold,
+  };
+  const observedAt = new Date().toISOString();
+  session.rateLimit = info;
+  session.rateLimitObservedAt = observedAt;
+  schedulePersist(session.id);
+  emit(session, {
+    type: "rate_limit",
+    data: { info, observed_at: observedAt },
+  });
+  if (info.status === "rejected") {
+    // Don't trample awaiting_permission — a pending tool dialog is
+    // strictly more important and the user-facing state stays accurate
+    // (the dialog will resolve, then the next turn either gets through
+    // or hits the same rate limit and re-emits).
+    if (
+      session.status !== "awaiting_permission" &&
+      session.status !== "errored" &&
+      session.status !== "closed"
+    ) {
+      setStatus(session, "rate_limited");
+    }
+  }
 }
 
 // refreshContextUsage queries the SDK control channel for an
@@ -634,6 +693,8 @@ interface BuildLiveInit {
   latestPlan?: PlanRecord;
   planId?: string;
   phaseSlug?: string;
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
   // isResume → query() is launched with `resume` instead of
   // `sessionId`, telling the claude binary to load the session's
   // transcript from ~/.claude/projects/<dir>/<id>.jsonl and continue
@@ -675,6 +736,8 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     latestContextUsage: init.latestContextUsage,
     latestPlan: init.latestPlan,
     alwaysAllowRules: [],
+    rateLimit: init.rateLimit,
+    rateLimitObservedAt: init.rateLimitObservedAt,
     query: undefined as unknown as Query, // assigned below
   };
 
@@ -772,6 +835,8 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     latestUsage: stored.latestUsage,
     latestContextUsage: stored.latestContextUsage,
     latestPlan: stored.latestPlan,
+    rateLimit: stored.rateLimit,
+    rateLimitObservedAt: stored.rateLimitObservedAt,
     isResume: true,
   });
   interruptedSessions.delete(stored.id);
@@ -847,9 +912,18 @@ async function driveSession(session: ChatSession): Promise<void> {
       if (msg.type === "result") {
         setStatus(session, "idle");
         void refreshContextUsage(session);
+      } else if (msg.type === "rate_limit_event") {
+        // SDK auto-retries internally up to CLAUDE_CODE_MAX_RETRIES;
+        // we observe so the UI can render a countdown. We DON'T
+        // pause input or change the abort signal — that would compete
+        // with the SDK's own retry. Status flip is purely informational
+        // and reverts on the next assistant/stream_event.
+        handleRateLimitEvent(session, msg);
       } else if (
         (msg.type === "assistant" || msg.type === "stream_event") &&
-        (session.status === "starting" || session.status === "idle")
+        (session.status === "starting" ||
+          session.status === "idle" ||
+          session.status === "rate_limited")
       ) {
         // Real model output is starting — Claude is working. Earlier
         // we flipped on *any* non-result message, but the SDK also
@@ -857,6 +931,9 @@ async function driveSession(session: ChatSession): Promise<void> {
         // setPermissionMode acknowledgements; flipping on those left
         // the session stuck on "thinking" after a mode change with
         // no actual turn in flight.
+        // Including "rate_limited" here lets the SDK's successful
+        // internal retry naturally clear the badge state when output
+        // resumes.
         setStatus(session, "thinking");
       }
     }
@@ -898,6 +975,8 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     subagents: subagents.length > 0 ? subagents : undefined,
     plan_id: s.planId,
     phase_slug: s.phaseSlug,
+    rate_limit: s.rateLimit,
+    rate_limit_observed_at: s.rateLimitObservedAt,
   };
 }
 
