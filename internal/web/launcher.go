@@ -20,10 +20,22 @@ import (
 // flags Next's `next start` understands; DaemonURL is forwarded as
 // DAEMON_INTERNAL_URL so the App Router proxy at /daemon/[...path]/
 // can reach the in-process Go daemon.
+//
+// AuthToken, when non-empty, is forwarded as MONITOR_AUTH_TOKEN so the
+// Next.js proxy.ts can refuse requests that don't carry a matching
+// cookie (or first-touch ?token=…). Empty disables the gate — fine for
+// loopback binds where the OS already isolates the surface.
+//
+// AllowIPs is a comma-separated allowlist (IPs / CIDRs) forwarded as
+// MONITOR_ALLOW_IPS for the proxy.ts IP-gate. Empty disables the IP
+// check (token alone). Useful as defense-in-depth for public exposure
+// where token leakage is the primary threat.
 type Options struct {
 	Port      int
 	Hostname  string
 	DaemonURL string
+	AuthToken string
+	AllowIPs  string
 	WebDir    string // optional override; empty = auto-discover.
 }
 
@@ -142,6 +154,18 @@ func Launch(ctx context.Context, opts Options) (*exec.Cmd, string, error) {
 	if opts.DaemonURL != "" {
 		env = append(env, "DAEMON_INTERNAL_URL="+opts.DaemonURL)
 	}
+	if opts.AuthToken != "" {
+		// proxy.ts reads this on every request; empty/unset means "no
+		// gate". We never echo this back to the user beyond the QR/URL
+		// the Go side prints.
+		env = append(env, "MONITOR_AUTH_TOKEN="+opts.AuthToken)
+	}
+	if opts.AllowIPs != "" {
+		// proxy.ts parses comma-split entries (IPs + CIDRs) and gates
+		// non-loopback requests against the list. Empty/unset = no
+		// IP gate (token alone is enough).
+		env = append(env, "MONITOR_ALLOW_IPS="+opts.AllowIPs)
+	}
 	// Pass PORT/HOSTNAME too so any code that reads them (e.g. Next's
 	// internal logging, or the standalone server's bind selection)
 	// agrees with the requested values.
@@ -157,7 +181,15 @@ func Launch(ctx context.Context, opts Options) (*exec.Cmd, string, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("spawn next: %w", err)
 	}
-	url := fmt.Sprintf("http://%s:%d/", opts.Hostname, opts.Port)
+	// Return a loopback URL even when bound to 0.0.0.0, so the caller's
+	// "open in browser" / startup banner stays clean. LAN reachability
+	// is communicated separately (see main.go printing the discovered
+	// LAN IP + QR).
+	displayHost := opts.Hostname
+	if displayHost == "0.0.0.0" || displayHost == "::" || displayHost == "" {
+		displayHost = "127.0.0.1"
+	}
+	url := fmt.Sprintf("http://%s:%d/", displayHost, opts.Port)
 	return cmd, url, nil
 }
 

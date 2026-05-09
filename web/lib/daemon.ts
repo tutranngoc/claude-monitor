@@ -149,3 +149,121 @@ export async function createWorktrees(
   });
   return jsonOrThrow(res);
 }
+
+// LANStatus mirrors server.LANStatus in the Go side. Driven by
+// /api/lan/{status,enable,disable} — see internal/server/lan.go.
+//
+// The token is sensitive (anyone holding it gets full access to the
+// running daemon). It's transmitted over the same-origin proxy back to
+// loopback browsers, never persisted in client storage.
+export interface LANStatus {
+  enabled: boolean;
+  auth_enabled?: boolean; // gate is on (true whenever LAN or Public on)
+  host: string;
+  lan_ip?: string;
+  port: number;
+  token?: string;
+  url?: string; // loopback URL
+  lan_url?: string; // LAN URL with ?token= when enabled
+  allow_ips?: string;
+  pending?: boolean;
+}
+
+// PublicStatus mirrors server.PublicStatus. Independent of LANStatus —
+// public tunnel can be on while LAN bind stays loopback.
+export interface PublicStatus {
+  enabled: boolean;
+  url?: string; // public HTTPS URL via cloudflared
+  pending?: boolean; // tunnel started but URL not yet captured
+  allow_ips?: string;
+  // Named-tunnel config. Both empty = quick tunnel mode (the default,
+  // *.trycloudflare.com); both set = pre-created cloudflared named
+  // tunnel. Required for SSE to stream — quick tunnels deliberately
+  // buffer text/event-stream GET responses.
+  cf_tunnel_name?: string;
+  cf_hostname?: string;
+  error?: string;
+}
+
+export async function fetchLANStatus(signal?: AbortSignal): Promise<LANStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/lan/status`, { signal });
+  return jsonOrThrow(res);
+}
+
+// enableLAN toggles the Next.js bind to 0.0.0.0 with a token gate. The
+// daemon waits for the new child to bind before returning, so this
+// resolves only after the gate is live (~150-300ms typical).
+//
+// Caller should immediately navigate to `/?token=<status.token>` after
+// success — the LAN gate just turned on, and the current cookie-less
+// loopback session would otherwise 401 on its next fetch. The redirect
+// re-enters proxy.ts's first-touch flow and gets the cookie set.
+export async function enableLAN(
+  token?: string,
+  signal?: AbortSignal,
+): Promise<LANStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/lan/enable`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(token ? { token } : {}),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
+export async function disableLAN(signal?: AbortSignal): Promise<LANStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/lan/disable`, {
+    method: "POST",
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
+// QR endpoint is a same-origin SVG asset; using the URL string directly
+// in <img src> avoids a fetch+blob dance. The path lives behind the
+// daemon proxy so the auth gate covers it the same as everything else.
+export function lanQRURL(): string {
+  // Cache-bust by status: same QR data ⇒ same URL ⇒ browser caches.
+  // Re-rendered after enable/disable because token may rotate.
+  return `${DAEMON_URL}/api/lan/qr.svg`;
+}
+
+export async function fetchPublicStatus(
+  signal?: AbortSignal,
+): Promise<PublicStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/public/status`, { signal });
+  return jsonOrThrow(res);
+}
+
+// enablePublic spawns / keeps a `cloudflared tunnel` subprocess + flips
+// the auth gate on. allowIPs is the comma-separated list (IPs / CIDRs)
+// — empty string = no IP filter (token-only). cfTunnelName/cfHostname
+// switch from quick tunnel to a pre-created named tunnel (required for
+// SSE to stream). Daemon may take 5-15s for the tunnel to publish a
+// URL on cold cloudflared starts; the returned status's `pending: true`
+// means "tunnel up but URL not yet captured", and the caller should
+// poll fetchPublicStatus().
+export async function enablePublic(
+  args: { allowIPs: string; cfTunnelName?: string; cfHostname?: string },
+  signal?: AbortSignal,
+): Promise<PublicStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/public/enable`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      allow_ips: args.allowIPs,
+      cf_tunnel_name: args.cfTunnelName ?? "",
+      cf_hostname: args.cfHostname ?? "",
+    }),
+    signal,
+  });
+  return jsonOrThrow(res);
+}
+
+export async function disablePublic(signal?: AbortSignal): Promise<PublicStatus> {
+  const res = await fetch(`${DAEMON_URL}/api/public/disable`, {
+    method: "POST",
+    signal,
+  });
+  return jsonOrThrow(res);
+}

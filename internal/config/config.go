@@ -47,6 +47,48 @@ type Config struct {
 	// password so future swaps stay silent. Always true on
 	// non-darwin platforms (no partition list there).
 	KeychainSetupDone bool `json:"keychainSetupDone"`
+
+	// LANEnabled, when true, makes the orchestrator boot the Next.js
+	// subprocess bound to 0.0.0.0 + a token gate so a phone on the
+	// same Wi-Fi can scan the printed QR and connect. Toggled from
+	// the web UI (POST /api/lan/{enable,disable}) — recycles the
+	// Next.js child to take effect, ~2s blip.
+	LANEnabled bool `json:"lanEnabled,omitempty"`
+
+	// LANToken is the bearer token enforced by web/proxy.ts. Persisted
+	// across restarts so re-enabling LAN reuses the same token (so
+	// existing QR codes / bookmarked URLs keep working). Cleared by
+	// daemon endpoint POST /api/lan/disable when the user wants a
+	// fresh secret.
+	LANToken string `json:"lanToken,omitempty"`
+
+	// PublicEnabled, when true, makes the orchestrator spawn a
+	// `cloudflared tunnel --url ...` subprocess pointing at the
+	// loopback Next.js so a public HTTPS URL exposes the UI without
+	// port-forwarding. Auth still rides on LANToken (no separate
+	// public token); IP allowlist via AllowIPs is the second factor.
+	PublicEnabled bool `json:"publicEnabled,omitempty"`
+
+	// AllowIPs is a comma-separated list of IPs / CIDR ranges that
+	// proxy.ts permits when set (empty = token-only, no IP gate).
+	// Checked against the client's `CF-Connecting-IP` header for
+	// public-tunnel traffic, falling back to direct remote IP for
+	// LAN traffic. Useful as a second factor for public exposure:
+	// even if your QR/token leaks, the attacker also needs to be on
+	// an allowlisted IP.
+	AllowIPs string `json:"allowIPs,omitempty"`
+
+	// CfTunnelName + CfHostname switch the public tunnel from
+	// quick-tunnel mode (`*.trycloudflare.com`) to a pre-created
+	// named tunnel. Required because Cloudflare deliberately buffers
+	// SSE GET responses on quick tunnels (cloudflared#1449), which
+	// breaks our /api/events stream and leaves the UI showing zero
+	// accounts. Both empty = quick tunnel; both set = named tunnel.
+	// The user must run `cloudflared tunnel login` + `tunnel create
+	// <name>` + `tunnel route dns <name> <host>` once before turning
+	// public on with these set.
+	CfTunnelName string `json:"cfTunnelName,omitempty"`
+	CfHostname   string `json:"cfHostname,omitempty"`
 }
 
 const (

@@ -21,6 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { LANSection } from "@/components/lan-section";
 import type { ConnectionStatus } from "@/hooks/use-daemon";
 
 interface Props {
@@ -153,6 +154,8 @@ export function AccountsDialog({ open, onOpenChange }: Props) {
             })
           )}
         </div>
+
+        <LANSection />
 
         {(swapEvents.length > 0 || errors.length > 0) && (
           <section className="space-y-1.5">

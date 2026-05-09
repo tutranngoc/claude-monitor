@@ -38,9 +38,9 @@ const tickInterval = 60 * time.Second
 // Server is the daemon: a cached snapshot, an SSE hub, and a ticker
 // that periodically calls swap.FetchAll to refresh both.
 type Server struct {
-	rootSpec string
-	cfg      config.Config
-	logger   *slog.Logger
+	rootSpec  string
+	cfg       config.Config
+	logger    *slog.Logger
 	startedAt time.Time
 
 	mu        sync.RWMutex
@@ -48,6 +48,13 @@ type Server struct {
 	snapErr   error
 	skipUntil map[string]time.Time
 	prevUtil  map[string]float64
+	// lanCtrl is the optional bridge into web.Manager so /api/lan/*
+	// can recycle the Next.js child. Nil in --serve mode.
+	lanCtrl LANController
+	// pubCtrl is the optional bridge into the cloudflared subprocess
+	// so /api/public/* can flip the tunnel on/off. Independent of
+	// lanCtrl — same orchestrator wires both, but they're orthogonal.
+	pubCtrl PublicController
 
 	hub *hub
 }
@@ -122,6 +129,18 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/account/add", s.handleAccountAdd)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)
+	// LAN exposure toggle. Available only when the orchestrator wired
+	// a controller via SetLANController; otherwise these endpoints
+	// reply 501 (see handleLAN*).
+	mux.HandleFunc("GET /api/lan/status", s.handleLANStatus)
+	mux.HandleFunc("POST /api/lan/enable", s.handleLANEnable)
+	mux.HandleFunc("POST /api/lan/disable", s.handleLANDisable)
+	mux.HandleFunc("GET /api/lan/qr.svg", s.handleLANQR)
+	// Public exposure via Cloudflare Tunnel. Subprocess managed by
+	// internal/tunnel; daemon just queues toggle requests.
+	mux.HandleFunc("GET /api/public/status", s.handlePublicStatus)
+	mux.HandleFunc("POST /api/public/enable", s.handlePublicEnable)
+	mux.HandleFunc("POST /api/public/disable", s.handlePublicDisable)
 	mux.HandleFunc("OPTIONS /api/{rest...}", s.handleCORSPreflight)
 	return mux
 }
