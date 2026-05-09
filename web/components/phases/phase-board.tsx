@@ -6,12 +6,20 @@ import {
   ArrowRight,
   Clock,
   GitCommit,
+  GitMerge,
   Loader2,
   RotateCw,
   ShieldCheck,
+  XCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { Phase, PhaseSession, PlanRecord } from "@/lib/plan-types";
+import type {
+  Phase,
+  PhaseMergeResult,
+  PhaseSession,
+  PlanMergeStatus,
+  PlanRecord,
+} from "@/lib/plan-types";
 import type { RateLimitInfo, SessionStatus, SessionSummary } from "@/lib/chat-types";
 import { Badge } from "@/components/ui/badge";
 
@@ -57,6 +65,28 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [pendingCompleteSlug, setPendingCompleteSlug] = useState<string | null>(
     null,
   );
+  // Mirror the plan's merge fields locally so the panel updates without
+  // a route nav after POST /merge returns. Default the input to the
+  // last-used integration branch (or "main" on first run).
+  const [mergeStatus, setMergeStatus] = useState<PlanMergeStatus | undefined>(
+    initialPlan.merge_status,
+  );
+  const [mergeResults, setMergeResults] = useState<PhaseMergeResult[]>(
+    initialPlan.merge_results ?? [],
+  );
+  const [mergeHeadSha, setMergeHeadSha] = useState<string | undefined>(
+    initialPlan.merge_head_sha,
+  );
+  const [mergedAt, setMergedAt] = useState<string | undefined>(
+    initialPlan.merged_at,
+  );
+  const [mergeError, setMergeError] = useState<string | undefined>(
+    initialPlan.merge_error,
+  );
+  const [mergeBranch, setMergeBranch] = useState<string>(
+    initialPlan.merge_branch ?? "main",
+  );
+  const [merging, setMerging] = useState(false);
   const initialPlanId = initialPlan.id;
 
   // Poll /api/chat for live status. 1500ms is fast enough that a
@@ -167,6 +197,56 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     [initialPlanId],
   );
 
+  // Plan-level merge — kicks the integration branch checkout +
+  // `git merge --no-ff` per phase branch. Server returns the canonical
+  // updated plan; we splice the merge fields into local state without
+  // touching phaseSessions (the route doesn't mutate them).
+  const handleMerge = useCallback(async () => {
+    setMerging(true);
+    setMergeError(undefined);
+    try {
+      const res = await fetch(
+        `/api/plans/${encodeURIComponent(initialPlanId)}/merge`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ integration_branch: mergeBranch }),
+        },
+      );
+      if (!res.ok) {
+        let detail = await res.text();
+        try {
+          // Server returns {error, ineligible?} for gating failures.
+          const parsed = JSON.parse(detail) as {
+            error?: string;
+            ineligible?: string[];
+          };
+          if (parsed.error) {
+            detail = parsed.ineligible?.length
+              ? `${parsed.error}: ${parsed.ineligible.join(", ")}`
+              : parsed.error;
+          }
+        } catch {
+          // not json — surface raw body
+        }
+        setMergeError(detail);
+        return;
+      }
+      const data = (await res.json()) as { plan: PlanRecord };
+      setMergeStatus(data.plan.merge_status);
+      setMergeResults(data.plan.merge_results ?? []);
+      setMergeHeadSha(data.plan.merge_head_sha);
+      setMergedAt(data.plan.merged_at);
+      setMergeError(data.plan.merge_error);
+      if (data.plan.merge_branch) setMergeBranch(data.plan.merge_branch);
+    } catch (err) {
+      console.error(`[phase-board] merge threw:`, err);
+      setMergeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMerging(false);
+    }
+  }, [initialPlanId, mergeBranch]);
+
   const buckets = useMemo(() => {
     const map: Record<Column, PhaseRow[]> = {
       todo: [],
@@ -180,6 +260,33 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     }
     return map;
   }, [phaseRows]);
+
+  // Merge gate — all phases must have a non-failed commit_status. We
+  // mirror the server's check so the button can disable itself with a
+  // clear hint instead of letting the user click into a 409. Counts
+  // power the inline summary too.
+  const mergeGate = useMemo(() => {
+    const linkBySlug = new Map<string, PhaseSession>(
+      phaseSessions.map((p) => [p.phase_slug, p]),
+    );
+    let ready = 0;
+    const pending: string[] = [];
+    for (const phase of initialPlan.phases) {
+      const link = linkBySlug.get(phase.slug);
+      const status = link?.commit_status;
+      if (status === "clean" || status === "committed") {
+        ready++;
+      } else {
+        pending.push(phase.slug);
+      }
+    }
+    return {
+      ready,
+      total: initialPlan.phases.length,
+      pending,
+      eligible: pending.length === 0 && initialPlan.phases.length > 0,
+    };
+  }, [phaseSessions, initialPlan.phases]);
 
   const counters = useMemo(() => {
     const total = phaseRows.length;
@@ -227,6 +334,19 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           )}
         </div>
       </header>
+
+      <MergePanel
+        gate={mergeGate}
+        status={mergeStatus}
+        results={mergeResults}
+        headSha={mergeHeadSha}
+        mergedAt={mergedAt}
+        error={mergeError}
+        branch={mergeBranch}
+        onBranchChange={setMergeBranch}
+        onMerge={handleMerge}
+        merging={merging}
+      />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-x-auto p-4 md:grid-cols-2 xl:grid-cols-4">
         {COLUMNS.map((col) => (
@@ -602,6 +722,239 @@ function PlanStatusBadge({ status }: { status: PlanRecord["status"] }) {
   if (status === "approved") return <Badge>approved</Badge>;
   if (status === "failed") return <Badge variant="destructive">failed</Badge>;
   return <Badge variant="secondary">awaiting approval</Badge>;
+}
+
+// MergePanel renders the plan-level merge affordance below the header.
+// Three states drive the layout:
+//   1. not-yet-eligible (some phases missing commit_status) → muted
+//      hint + disabled button so the user can see what's left.
+//   2. eligible, no merge yet → highlighted row with input + Merge
+//      button.
+//   3. post-merge → result chips per phase + retry button when status
+//      is "pending" or "failed".
+// We always render the strip when the plan has phases; collapsing the
+// row when not eligible would make the affordance harder to discover.
+function MergePanel({
+  gate,
+  status,
+  results,
+  headSha,
+  mergedAt,
+  error,
+  branch,
+  onBranchChange,
+  onMerge,
+  merging,
+}: {
+  gate: { ready: number; total: number; pending: string[]; eligible: boolean };
+  status: PlanMergeStatus | undefined;
+  results: PhaseMergeResult[];
+  headSha: string | undefined;
+  mergedAt: string | undefined;
+  error: string | undefined;
+  branch: string;
+  onBranchChange: (b: string) => void;
+  onMerge: () => void;
+  merging: boolean;
+}) {
+  if (gate.total === 0) return null;
+
+  const merged = results.filter((r) => r.status === "merged").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
+  const failed = results.filter((r) => r.status === "failed").length;
+
+  const buttonLabel =
+    status === "merged"
+      ? "Re-merge"
+      : status === "pending" || status === "failed"
+        ? "Retry merge"
+        : "Merge into";
+
+  return (
+    <section
+      className={cn(
+        "flex flex-col gap-2 border-b px-6 py-3 text-xs",
+        gate.eligible && status !== "merged" && "bg-emerald-500/5",
+      )}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <GitMerge
+          className={cn(
+            "size-4 shrink-0",
+            gate.eligible ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground",
+          )}
+          aria-hidden
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium">Plan merge</span>
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {gate.ready}/{gate.total} phases committed
+            </span>
+            {status && <MergeStatusBadge status={status} />}
+          </div>
+          {!gate.eligible && (
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              waiting on{" "}
+              <span className="font-mono">
+                {gate.pending.slice(0, 4).join(", ")}
+                {gate.pending.length > 4 ? `, +${gate.pending.length - 4} more` : ""}
+              </span>{" "}
+              — click <span className="font-mono">commit &amp; complete</span> on
+              each phase first.
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className="font-mono text-[11px] text-muted-foreground">
+            {buttonLabel}
+          </span>
+          <input
+            type="text"
+            value={branch}
+            onChange={(e) => onBranchChange(e.target.value)}
+            disabled={merging}
+            spellCheck={false}
+            placeholder="main"
+            className={cn(
+              "h-7 w-32 rounded-md border bg-background px-2 font-mono text-[11px]",
+              "focus:outline-none focus:ring-1 focus:ring-ring",
+              "disabled:cursor-not-allowed disabled:opacity-60",
+            )}
+          />
+          <button
+            type="button"
+            onClick={onMerge}
+            disabled={!gate.eligible || merging || branch.trim().length === 0}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+              "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20",
+              "dark:text-emerald-300",
+              "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-emerald-500/10",
+            )}
+          >
+            {merging ? (
+              <Loader2 className="size-3 animate-spin" aria-hidden />
+            ) : (
+              <GitMerge className="size-3" aria-hidden />
+            )}
+            <span className="font-mono">merge</span>
+          </button>
+        </div>
+      </div>
+
+      {(results.length > 0 || error) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {merged > 0 && (
+            <MergeSummaryChip tone="emerald" label={`${merged} merged`} />
+          )}
+          {skipped > 0 && (
+            <MergeSummaryChip tone="muted" label={`${skipped} skipped`} />
+          )}
+          {failed > 0 && (
+            <MergeSummaryChip tone="rose" label={`${failed} failed`} />
+          )}
+          {headSha && (
+            <span
+              className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
+              title={mergedAt ? `merged ${mergedAt}` : undefined}
+            >
+              <GitCommit className="size-3" aria-hidden />
+              {headSha.slice(0, 7)}
+            </span>
+          )}
+          {results.map((r) => (
+            <MergeResultChip key={r.phase_slug} result={r} />
+          ))}
+          {error && (
+            <span
+              className="inline-flex max-w-full items-center gap-1 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-0.5 font-mono text-[11px] text-destructive"
+              title={error}
+            >
+              <XCircle className="size-3 shrink-0" aria-hidden />
+              <span className="truncate">{error}</span>
+            </span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MergeStatusBadge({ status }: { status: PlanMergeStatus }) {
+  if (status === "merged") {
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      >
+        merged
+      </Badge>
+    );
+  }
+  if (status === "pending") {
+    return (
+      <Badge
+        variant="outline"
+        className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+      >
+        partial
+      </Badge>
+    );
+  }
+  return <Badge variant="destructive">failed</Badge>;
+}
+
+function MergeSummaryChip({
+  tone,
+  label,
+}: {
+  tone: "emerald" | "muted" | "rose";
+  label: string;
+}) {
+  const cls =
+    tone === "emerald"
+      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      : tone === "rose"
+        ? "border-destructive/40 bg-destructive/10 text-destructive"
+        : "border bg-muted/40 text-muted-foreground";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+        cls,
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+function MergeResultChip({ result }: { result: PhaseMergeResult }) {
+  const cls =
+    result.status === "merged"
+      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      : result.status === "skipped"
+        ? "border bg-muted/40 text-muted-foreground"
+        : "border-destructive/40 bg-destructive/10 text-destructive";
+  const detail =
+    result.status === "merged" && result.sha
+      ? result.sha.slice(0, 7)
+      : result.status === "skipped"
+        ? "already merged"
+        : "failed";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]",
+        cls,
+      )}
+      title={result.error ? result.error : `${result.branch}`}
+    >
+      <span>{result.phase_slug}</span>
+      <span className="opacity-70">· {detail}</span>
+    </span>
+  );
 }
 
 function Counter({

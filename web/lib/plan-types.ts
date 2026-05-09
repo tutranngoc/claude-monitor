@@ -45,6 +45,27 @@ export interface PhaseSession {
 
 export type PlanStatus = "submitted" | "approved" | "failed";
 
+// PlanMergeStatus tracks the outcome of POST /api/plans/<id>/merge,
+// which folds every wo/<plan>/<slug> phase branch into an integration
+// branch (default main) on plan.cwd. Per-phase outcomes live on
+// `merge_results` so the UI can show granularity (e.g. "3 merged, 1
+// skipped, 1 failed"). Set on the plan in addition to PlanStatus —
+// merge runs after `status === "approved"`, never replaces it.
+//   pending  → at least one merge run was attempted but had failures;
+//              the user can edit + retry without re-approving the plan
+//   merged   → all phases reachable from integration HEAD
+//   failed   → top-level abort (dirty tree, missing branch, etc.) with
+//              no per-phase progress
+export type PlanMergeStatus = "pending" | "merged" | "failed";
+
+export interface PhaseMergeResult {
+  phase_slug: string;
+  branch: string;
+  status: "merged" | "skipped" | "failed";
+  sha?: string;
+  error?: string;
+}
+
 export interface PlanRecord {
   id: string;
   session_id: string;
@@ -57,4 +78,10 @@ export interface PlanRecord {
   worktrees?: WorktreeInfo[];
   phase_sessions?: PhaseSession[];
   error?: string;
+  merge_status?: PlanMergeStatus;
+  merge_branch?: string;
+  merge_results?: PhaseMergeResult[];
+  merge_head_sha?: string;
+  merged_at?: string;
+  merge_error?: string;
 }

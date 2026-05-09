@@ -103,3 +103,234 @@ function formatErr(err: unknown): string {
   }
   return String(err);
 }
+
+export interface MergePhaseInput {
+  phase_slug: string;
+  branch: string;
+}
+
+export interface MergePhaseResult {
+  phase_slug: string;
+  branch: string;
+  status: "merged" | "skipped" | "failed";
+  sha?: string;
+  error?: string;
+}
+
+// MergeBranchesResult differentiates a top-level abort (couldn't even
+// start — dirty tree, missing integration branch) from a per-phase
+// failure mid-loop. On per-phase failure we stop merging further phases
+// (the integration branch state is now indeterminate and the user
+// should resolve before retrying), but earlier successful merges stay
+// in place.
+export interface MergeBranchesResult {
+  status: "ok" | "failed";
+  integration_branch: string;
+  results: MergePhaseResult[];
+  head_sha?: string;
+  error?: string;
+}
+
+interface MergeBranchesOpts {
+  repoPath: string;
+  integrationBranch: string;
+  phases: MergePhaseInput[];
+  message?: (phase: MergePhaseInput) => string;
+}
+
+// mergePhaseBranches checks out integrationBranch in the main repo and
+// runs `git merge --no-ff` for each phase branch in order. --no-ff
+// preserves a discrete merge commit per phase so the user can
+// `git revert -m 1 <sha>` to roll a single phase back without touching
+// siblings. Idempotent: a branch already reachable from HEAD is reported
+// as "skipped" rather than re-merged.
+//
+// Pre-flight refuses to run if the working tree is dirty — we don't
+// want to risk shuffling the user's WIP when checking out the
+// integration branch. Original HEAD is restored after the run (success
+// or failure) so the user lands back where they started.
+export async function mergePhaseBranches(
+  opts: MergeBranchesOpts,
+): Promise<MergeBranchesResult> {
+  const { repoPath, integrationBranch, phases } = opts;
+  const message =
+    opts.message ?? ((p) => `Merge phase ${p.phase_slug} into ${integrationBranch}`);
+
+  try {
+    await git(repoPath, ["rev-parse", "--git-dir"]);
+  } catch (err) {
+    return {
+      status: "failed",
+      integration_branch: integrationBranch,
+      results: [],
+      error: `not a git working tree at ${repoPath}: ${formatErr(err)}`,
+    };
+  }
+
+  let originalRef: string | null = null;
+  try {
+    const { stdout } = await git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const ref = stdout.trim();
+    // Detached HEAD reports as "HEAD"; carry the sha instead so we can
+    // still restore the user's vantage point.
+    if (ref === "HEAD") {
+      const head = await git(repoPath, ["rev-parse", "HEAD"]);
+      originalRef = head.stdout.trim();
+    } else {
+      originalRef = ref;
+    }
+  } catch (err) {
+    return {
+      status: "failed",
+      integration_branch: integrationBranch,
+      results: [],
+      error: `read HEAD: ${formatErr(err)}`,
+    };
+  }
+
+  try {
+    const { stdout } = await git(repoPath, ["status", "--porcelain"]);
+    if (stdout.trim().length > 0) {
+      return {
+        status: "failed",
+        integration_branch: integrationBranch,
+        results: [],
+        error:
+          "working tree is dirty — commit or stash changes before merging phases",
+      };
+    }
+  } catch (err) {
+    return {
+      status: "failed",
+      integration_branch: integrationBranch,
+      results: [],
+      error: `git status: ${formatErr(err)}`,
+    };
+  }
+
+  try {
+    await git(repoPath, ["rev-parse", "--verify", `refs/heads/${integrationBranch}`]);
+  } catch (err) {
+    return {
+      status: "failed",
+      integration_branch: integrationBranch,
+      results: [],
+      error: `integration branch '${integrationBranch}' not found: ${formatErr(err)}`,
+    };
+  }
+
+  try {
+    await git(repoPath, ["checkout", integrationBranch]);
+  } catch (err) {
+    return {
+      status: "failed",
+      integration_branch: integrationBranch,
+      results: [],
+      error: `checkout ${integrationBranch}: ${formatErr(err)}`,
+    };
+  }
+
+  const results: MergePhaseResult[] = [];
+  let topLevelError: string | undefined;
+  let stoppedEarly = false;
+
+  for (const phase of phases) {
+    if (stoppedEarly) break;
+
+    try {
+      await git(repoPath, ["rev-parse", "--verify", `refs/heads/${phase.branch}`]);
+    } catch (err) {
+      results.push({
+        phase_slug: phase.phase_slug,
+        branch: phase.branch,
+        status: "failed",
+        error: `branch '${phase.branch}' not found: ${formatErr(err)}`,
+      });
+      stoppedEarly = true;
+      break;
+    }
+
+    // is-ancestor exits 0 when branch is already reachable from HEAD —
+    // i.e. the merge would be a no-op. Mark it skipped so the UI can
+    // show "already merged" instead of re-running.
+    let alreadyMerged = false;
+    try {
+      await git(repoPath, ["merge-base", "--is-ancestor", phase.branch, "HEAD"]);
+      alreadyMerged = true;
+    } catch {
+      alreadyMerged = false;
+    }
+
+    if (alreadyMerged) {
+      results.push({
+        phase_slug: phase.phase_slug,
+        branch: phase.branch,
+        status: "skipped",
+      });
+      continue;
+    }
+
+    try {
+      await git(repoPath, [
+        "merge",
+        "--no-ff",
+        "-m",
+        message(phase),
+        phase.branch,
+      ]);
+      const head = await git(repoPath, ["rev-parse", "HEAD"]);
+      results.push({
+        phase_slug: phase.phase_slug,
+        branch: phase.branch,
+        status: "merged",
+        sha: head.stdout.trim(),
+      });
+    } catch (err) {
+      // Conflict (or any merge failure) — abort the in-flight merge so
+      // the index/working-tree are clean before we hand control back.
+      // Earlier merges in this run stay; the user has to resolve this
+      // phase before retrying.
+      try {
+        await git(repoPath, ["merge", "--abort"]);
+      } catch {
+        // If --abort itself fails the repo is in a weird state but
+        // nothing we can do here; surface the original merge error.
+      }
+      results.push({
+        phase_slug: phase.phase_slug,
+        branch: phase.branch,
+        status: "failed",
+        error: formatErr(err),
+      });
+      stoppedEarly = true;
+    }
+  }
+
+  let headSha: string | undefined;
+  try {
+    const head = await git(repoPath, ["rev-parse", "HEAD"]);
+    headSha = head.stdout.trim();
+  } catch {
+    // best-effort
+  }
+
+  // Restore the user's original ref. Best-effort — if it fails we don't
+  // want to flip the entire merge to failed (the merges themselves
+  // landed) but we do want to surface it.
+  if (originalRef && originalRef !== integrationBranch) {
+    try {
+      await git(repoPath, ["checkout", originalRef]);
+    } catch (err) {
+      topLevelError = `merges applied; failed to restore original ref '${originalRef}': ${formatErr(err)}`;
+    }
+  }
+
+  const anyFailure = results.some((r) => r.status === "failed");
+  return {
+    status: anyFailure ? "failed" : "ok",
+    integration_branch: integrationBranch,
+    results,
+    head_sha: headSha,
+    error: topLevelError,
+  };
+}
