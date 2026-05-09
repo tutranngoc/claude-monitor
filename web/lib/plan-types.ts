@@ -95,6 +95,41 @@ export interface PhaseSession {
   // merge-base with the integration branch). Recorded so the user can
   // independently re-run the diff if needed.
   scope_check_base?: string;
+  // Per-phase code review (POST /api/plans/<id>/phases/<slug>/review).
+  // A separate Claude session reads `<base>..HEAD` in the phase worktree
+  // and reports findings via the submit_review MCP tool. Soft signal:
+  // findings never block merge — the user reviews them and decides.
+  //   running    → background agent in flight; UI polls until terminal
+  //   complete   → submit_review fired; findings populated
+  //   failed     → agent finished without calling submit_review (or the
+  //                spawn itself errored). review_error has detail.
+  review_status?: PhaseReviewStatus;
+  review_started_at?: string;
+  review_completed_at?: string;
+  review_summary?: string;
+  review_findings?: ReviewFinding[];
+  review_error?: string;
+  // Sha against which the review was run — typically HEAD at submit
+  // time, but recorded so the user can replay the same diff later.
+  review_base?: string;
+}
+
+export type PhaseReviewStatus = "running" | "complete" | "failed";
+
+export type ReviewSeverity = "info" | "warning" | "error";
+
+// ReviewFinding is the shape submit_review writes per issue. Keep it
+// flat — a single finding may or may not be tied to a specific
+// file/line. `category` is free-form (security, perf, style,
+// correctness, …) so the agent can group thematically without us
+// pinning a fixed taxonomy.
+export interface ReviewFinding {
+  severity: ReviewSeverity;
+  title: string;
+  description: string;
+  file?: string;
+  line?: number;
+  category?: string;
 }
 
 export type PlanStatus = "submitted" | "approved" | "failed";

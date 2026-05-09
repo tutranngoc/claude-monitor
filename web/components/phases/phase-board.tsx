@@ -5,10 +5,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
+  ChevronDown,
+  ChevronRight,
   Clock,
   GitCommit,
   GitMerge,
   Loader2,
+  MessageSquareText,
   RotateCw,
   ScanLine,
   ShieldCheck,
@@ -21,6 +24,8 @@ import type {
   PhaseSession,
   PlanMergeStatus,
   PlanRecord,
+  ReviewFinding,
+  ReviewSeverity,
 } from "@/lib/plan-types";
 import type { RateLimitInfo, SessionStatus, SessionSummary } from "@/lib/chat-types";
 import { Badge } from "@/components/ui/badge";
@@ -67,6 +72,12 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [pendingCompleteSlug, setPendingCompleteSlug] = useState<string | null>(
     null,
   );
+  // Per-row pending state for the review kickoff click. Distinct from
+  // pendingCompleteSlug because the buttons sit on the same row and we
+  // don't want a spinner on one to imply both are in flight.
+  const [pendingReviewSlug, setPendingReviewSlug] = useState<string | null>(
+    null,
+  );
   // Mirror the plan's merge fields locally so the panel updates without
   // a route nav after POST /merge returns. Default the input to the
   // last-used integration branch (or "main" on first run).
@@ -105,6 +116,27 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       // Aborted or transient — wait for the next tick.
     }
   }, []);
+
+  // Refetch the canonical plan record. Used when a review is in flight
+  // — the agent persists findings to disk asynchronously, so the only
+  // way the UI sees them land is by re-reading. Cheaper than threading
+  // an SSE channel for what is effectively a single-bit transition.
+  const refetchPlan = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(initialPlanId)}`,
+          { signal },
+        );
+        if (!res.ok) return;
+        const next = (await res.json()) as PlanRecord;
+        setPhaseSessions(next.phase_sessions ?? []);
+      } catch {
+        // ignore; tick again
+      }
+    },
+    [initialPlanId],
+  );
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -146,6 +178,56 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [refetch]);
+
+  // Plan-record poll, gated on having any in-flight review. Reviews
+  // typically complete in 30s-3min; 3000ms balances "user sees results
+  // promptly" with "don't hammer disk for a single-row state change."
+  // Stops as soon as no phase is running so an idle PhaseBoard doesn't
+  // pay the cost.
+  const anyReviewRunning = useMemo(
+    () => phaseSessions.some((p) => p.review_status === "running"),
+    [phaseSessions],
+  );
+  useEffect(() => {
+    if (!anyReviewRunning) return;
+    const ctrl = new AbortController();
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const tick = () => {
+      if (document.visibilityState === "visible") {
+        void (async () => {
+          await refetchPlan();
+        })();
+      }
+    };
+    const start = () => {
+      if (timer) return;
+      timer = setInterval(tick, 3000);
+    };
+    const stop = () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        tick();
+        start();
+      } else {
+        stop();
+      }
+    };
+    void (async () => {
+      await refetchPlan(ctrl.signal);
+    })();
+    start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      ctrl.abort();
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [anyReviewRunning, refetchPlan]);
 
   const phaseRows = useMemo<PhaseRow[]>(() => {
     const sessionByPhaseSlug = new Map<string, SessionSummary>();
@@ -194,6 +276,38 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         console.error(`[phase-board] complete ${slug} threw:`, err);
       } finally {
         setPendingCompleteSlug(null);
+      }
+    },
+    [initialPlanId],
+  );
+
+  // Kick a per-phase code review. Server runs the agent in the
+  // background and writes findings to disk; the plan-record poll above
+  // surfaces them as they land. POST returns 202 with the running
+  // record so the badge flips immediately.
+  const handleReview = useCallback(
+    async (slug: string) => {
+      setPendingReviewSlug(slug);
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(initialPlanId)}/phases/${encodeURIComponent(slug)}/review`,
+          { method: "POST" },
+        );
+        if (!res.ok && res.status !== 202) {
+          const detail = await res.text();
+          console.error(
+            `[phase-board] review ${slug} failed:`,
+            res.status,
+            detail,
+          );
+          return;
+        }
+        const data = (await res.json()) as { plan: PlanRecord };
+        setPhaseSessions(data.plan.phase_sessions ?? []);
+      } catch (err) {
+        console.error(`[phase-board] review ${slug} threw:`, err);
+      } finally {
+        setPendingReviewSlug(null);
       }
     },
     [initialPlanId],
@@ -359,6 +473,8 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
             rows={buckets[col.id]}
             onComplete={handleComplete}
             pendingCompleteSlug={pendingCompleteSlug}
+            onReview={handleReview}
+            pendingReviewSlug={pendingReviewSlug}
           />
         ))}
       </div>
@@ -372,12 +488,16 @@ function ColumnView({
   rows,
   onComplete,
   pendingCompleteSlug,
+  onReview,
+  pendingReviewSlug,
 }: {
   label: string;
   tint: string;
   rows: PhaseRow[];
   onComplete: (slug: string) => void;
   pendingCompleteSlug: string | null;
+  onReview: (slug: string) => void;
+  pendingReviewSlug: string | null;
 }) {
   return (
     <div className="flex min-h-0 flex-col">
@@ -404,6 +524,8 @@ function ColumnView({
                 row={row}
                 onComplete={onComplete}
                 pending={pendingCompleteSlug === row.phase.slug}
+                onReview={onReview}
+                reviewPending={pendingReviewSlug === row.phase.slug}
               />
             </li>
           ))
@@ -417,10 +539,14 @@ function PhaseRowCard({
   row,
   onComplete,
   pending,
+  onReview,
+  reviewPending,
 }: {
   row: PhaseRow;
   onComplete: (slug: string) => void;
   pending: boolean;
+  onReview: (slug: string) => void;
+  reviewPending: boolean;
 }) {
   const { phase, link, session } = row;
   const status = session?.status;
@@ -435,6 +561,22 @@ function PhaseRowCard({
       session.status === "closed" ||
       session.status === "errored");
   const canComplete = !!link && sessionIdleLike && !link.commit_status;
+  // Review eligibility: phase must be committed (clean or committed
+  // status) and not currently under review. We allow re-running a
+  // failed review, and re-running a complete one ("re-review") so the
+  // user can iterate after pushing follow-up commits.
+  const reviewState = link?.review_status;
+  const canReview =
+    !!link &&
+    (link.commit_status === "clean" || link.commit_status === "committed") &&
+    reviewState !== "running";
+  // Local expand toggle for the findings panel. Default: open when a
+  // fresh review with findings has just landed; collapse otherwise so
+  // long phase lists stay compact. The user can flip it manually via
+  // the chevron on ReviewBadge.
+  const [reviewOpen, setReviewOpen] = useState<boolean>(
+    reviewState === "complete" && (link?.review_findings?.length ?? 0) > 0,
+  );
   return (
     <div
       className={cn(
@@ -500,37 +642,81 @@ function PhaseRowCard({
       )}
 
       {link ? (
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Link
-            href={`/chat/${link.session_id}`}
-            className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 text-[11px] hover:bg-muted"
-          >
-            <span className="font-mono">open agent</span>
-            <ArrowRight className="size-3" aria-hidden />
-          </Link>
-          {canComplete && (
-            <button
-              type="button"
-              onClick={() => onComplete(phase.slug)}
-              disabled={pending}
-              className={cn(
-                "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
-                "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20",
-                "dark:text-emerald-300",
-                "disabled:cursor-not-allowed disabled:opacity-60",
-              )}
+        <>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Link
+              href={`/chat/${link.session_id}`}
+              className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 text-[11px] hover:bg-muted"
             >
-              {pending ? (
-                <Loader2 className="size-3 animate-spin" aria-hidden />
-              ) : (
-                <ShieldCheck className="size-3" aria-hidden />
-              )}
-              <span className="font-mono">commit & complete</span>
-            </button>
-          )}
-          <CommitBadge link={link} onRetry={() => onComplete(phase.slug)} pending={pending} />
-          <ScopeBadge link={link} />
-        </div>
+              <span className="font-mono">open agent</span>
+              <ArrowRight className="size-3" aria-hidden />
+            </Link>
+            {canComplete && (
+              <button
+                type="button"
+                onClick={() => onComplete(phase.slug)}
+                disabled={pending}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+                  "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20",
+                  "dark:text-emerald-300",
+                  "disabled:cursor-not-allowed disabled:opacity-60",
+                )}
+              >
+                {pending ? (
+                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                ) : (
+                  <ShieldCheck className="size-3" aria-hidden />
+                )}
+                <span className="font-mono">commit & complete</span>
+              </button>
+            )}
+            <CommitBadge link={link} onRetry={() => onComplete(phase.slug)} pending={pending} />
+            <ScopeBadge link={link} />
+            {canReview && (
+              <button
+                type="button"
+                onClick={() => onReview(phase.slug)}
+                disabled={reviewPending}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
+                  "border-violet-500/40 bg-violet-500/10 text-violet-700 hover:bg-violet-500/20",
+                  "dark:text-violet-300",
+                  "disabled:cursor-not-allowed disabled:opacity-60",
+                )}
+                title={
+                  reviewState === "complete"
+                    ? "Run review again — useful after follow-up commits"
+                    : reviewState === "failed"
+                      ? "Retry review"
+                      : "Spawn a read-only agent that reviews this phase's diff"
+                }
+              >
+                {reviewPending ? (
+                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                ) : (
+                  <MessageSquareText className="size-3" aria-hidden />
+                )}
+                <span className="font-mono">
+                  {reviewState === "complete"
+                    ? "re-review"
+                    : reviewState === "failed"
+                      ? "retry review"
+                      : "review"}
+                </span>
+              </button>
+            )}
+            <ReviewBadge
+              link={link}
+              open={reviewOpen}
+              onToggle={() => setReviewOpen((v) => !v)}
+            />
+          </div>
+          {reviewOpen &&
+            (link.review_findings || link.review_summary || link.review_error) && (
+              <ReviewPanel link={link} />
+            )}
+        </>
       ) : (
         <div className="mt-3 inline-flex items-center gap-1 text-[11px] italic text-muted-foreground">
           no agent spawned
@@ -734,6 +920,228 @@ function ScopeBadge({ link }: { link: PhaseSession }) {
     >
       <AlertTriangle className="size-3" aria-hidden />
       {list.length} out of scope
+    </span>
+  );
+}
+
+// ReviewBadge encodes the four review states the row can be in:
+//   undefined (no review run)        → render nothing
+//   "running"                        → spinner + "reviewing…"
+//   "complete" with 0 findings       → emerald "✓ clean review"
+//   "complete" with N findings       → severity-colored chip with
+//                                       "<errors>e · <warnings>w · <info>i"
+//   "failed"                         → rose "review failed" with title
+// Click toggles the parent row's expanded findings panel.
+function ReviewBadge({
+  link,
+  open,
+  onToggle,
+}: {
+  link: PhaseSession;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const status = link.review_status;
+  if (!status) return null;
+  if (status === "running") {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+          "border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+        )}
+        title={
+          link.review_started_at
+            ? `started ${link.review_started_at}`
+            : undefined
+        }
+      >
+        <Loader2 className="size-3 animate-spin" aria-hidden />
+        reviewing…
+      </span>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <button
+        type="button"
+        onClick={onToggle}
+        title={link.review_error}
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+          "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20",
+        )}
+      >
+        <AlertTriangle className="size-3" aria-hidden />
+        review failed
+        {open ? (
+          <ChevronDown className="size-3" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3" aria-hidden />
+        )}
+      </button>
+    );
+  }
+  // complete
+  const findings = link.review_findings ?? [];
+  const counts = countBySeverity(findings);
+  const totalIssues = counts.error + counts.warning + counts.info;
+  if (totalIssues === 0) {
+    return (
+      <button
+        type="button"
+        onClick={onToggle}
+        title={link.review_summary}
+        className={cn(
+          "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+        )}
+      >
+        <ShieldCheck className="size-3" aria-hidden />
+        clean review
+        {open ? (
+          <ChevronDown className="size-3" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3" aria-hidden />
+        )}
+      </button>
+    );
+  }
+  // Pick the worst-severity color so the badge reflects the headline at a glance.
+  const tone =
+    counts.error > 0
+      ? "border-destructive/40 bg-destructive/10 text-destructive"
+      : counts.warning > 0
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={link.review_summary}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+        tone,
+      )}
+    >
+      <MessageSquareText className="size-3" aria-hidden />
+      <span>
+        {counts.error > 0 && <span>{counts.error}e</span>}
+        {counts.warning > 0 && (
+          <span>
+            {counts.error > 0 ? " · " : ""}
+            {counts.warning}w
+          </span>
+        )}
+        {counts.info > 0 && (
+          <span>
+            {counts.error > 0 || counts.warning > 0 ? " · " : ""}
+            {counts.info}i
+          </span>
+        )}
+      </span>
+      {open ? (
+        <ChevronDown className="size-3" aria-hidden />
+      ) : (
+        <ChevronRight className="size-3" aria-hidden />
+      )}
+    </button>
+  );
+}
+
+function countBySeverity(findings: ReviewFinding[]) {
+  let error = 0;
+  let warning = 0;
+  let info = 0;
+  for (const f of findings) {
+    if (f.severity === "error") error++;
+    else if (f.severity === "warning") warning++;
+    else info++;
+  }
+  return { error, warning, info };
+}
+
+// ReviewPanel renders the agent's summary + per-finding bullets when
+// the user expands the badge. Findings are sorted error → warning →
+// info so the most actionable items rise to the top regardless of the
+// order the agent submitted them in.
+function ReviewPanel({ link }: { link: PhaseSession }) {
+  const sorted = useMemo(() => {
+    const findings = link.review_findings ?? [];
+    const order: Record<ReviewSeverity, number> = {
+      error: 0,
+      warning: 1,
+      info: 2,
+    };
+    return [...findings].sort((a, b) => order[a.severity] - order[b.severity]);
+  }, [link.review_findings]);
+  return (
+    <div className="mt-2 rounded-md border bg-muted/30 p-3 text-[11px]">
+      {link.review_error ? (
+        <div className="flex items-start gap-2 text-destructive">
+          <AlertTriangle className="size-3 shrink-0" aria-hidden />
+          <span className="font-mono whitespace-pre-wrap">{link.review_error}</span>
+        </div>
+      ) : null}
+      {link.review_summary && (
+        <p className="whitespace-pre-wrap text-foreground/80">
+          {link.review_summary}
+        </p>
+      )}
+      {sorted.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-2">
+          {sorted.map((f, i) => (
+            <li
+              key={`${f.severity}-${i}-${f.title}`}
+              className="rounded-md border bg-background/60 p-2"
+            >
+              <div className="flex flex-wrap items-center gap-1.5">
+                <SeverityChip severity={f.severity} />
+                {f.category && (
+                  <Badge variant="outline" className="font-mono text-[10px]">
+                    {f.category}
+                  </Badge>
+                )}
+                <span className="font-medium">{f.title}</span>
+                {f.file && (
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {f.file}
+                    {typeof f.line === "number" ? `:${f.line}` : ""}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-foreground/80">
+                {f.description}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      {link.review_completed_at && (
+        <div className="mt-2 font-mono text-[10px] text-muted-foreground">
+          reviewed {link.review_completed_at}
+          {link.review_base ? ` · base ${link.review_base.slice(0, 7)}` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SeverityChip({ severity }: { severity: ReviewSeverity }) {
+  const cls =
+    severity === "error"
+      ? "border-destructive/40 bg-destructive/10 text-destructive"
+      : severity === "warning"
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded border px-1 py-0 font-mono text-[10px] uppercase tracking-wide",
+        cls,
+      )}
+    >
+      {severity}
     </span>
   );
 }
