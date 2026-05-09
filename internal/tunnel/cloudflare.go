@@ -44,6 +44,27 @@ var ErrNotInstalled = errors.New("cloudflared binary not found on PATH; install 
 //	2024-01-01T12:00:00Z INF |  https://thirsty-window-0123.trycloudflare.com
 var urlRe = regexp.MustCompile(`https://[a-z0-9-]+\.trycloudflare\.com`)
 
+// known cloudflared error patterns we want to lift into Status.Err so
+// the UI can show something more useful than "exit status 1". The
+// regex on the right of each entry matches a fragment of cloudflared's
+// stderr; the message on the left is what we surface. Order matters
+// (first match wins) — keep the more specific patterns first.
+var knownErrors = []struct {
+	pat     *regexp.Regexp
+	message string
+}{
+	{regexp.MustCompile(`neither the ID nor the name of any of your tunnels`),
+		"named tunnel not found — run `cloudflared tunnel login`, then `cloudflared tunnel create <name>` and `cloudflared tunnel route dns <name> <hostname>` first"},
+	{regexp.MustCompile(`(?i)cert\.pem.*(no such file|not found)`),
+		"cloudflared credentials missing — run `cloudflared tunnel login` first"},
+	{regexp.MustCompile(`(?i)Cannot determine default origin certificate`),
+		"cloudflared not logged in — run `cloudflared tunnel login` first"},
+	{regexp.MustCompile(`(?i)credentials file.*not found`),
+		"tunnel credentials file missing — run `cloudflared tunnel create <name>` first"},
+	{regexp.MustCompile(`(?i)error parsing tunnel ID`),
+		"tunnel name not recognized — verify with `cloudflared tunnel list`"},
+}
+
 // registeredRe matches cloudflared's confirmation that a tunnel
 // connector has been accepted by the edge. Without this signal we'd
 // flip Status.Pending to false the moment the URL is known, which
@@ -251,7 +272,11 @@ func (t *Tunnel) Start(ctx context.Context, localURL string) error {
 		t.running = false
 		t.url = ""
 		t.registered = false
-		if err != nil && !errors.Is(err, context.Canceled) {
+		// Only stamp the cmd.Wait error if scan() hasn't already lifted
+		// a friendlier message (e.g. "named tunnel not found"). The raw
+		// exit error reads as "exit status 1" which is useless to a
+		// user trying to figure out what went wrong.
+		if err != nil && !errors.Is(err, context.Canceled) && t.err == nil {
 			t.err = err
 		}
 		t.mu.Unlock()
@@ -264,6 +289,12 @@ func (t *Tunnel) Start(ctx context.Context, localURL string) error {
 // scan reads lines from r, mirrors them to mirror, and watches for the
 // trycloudflare.com URL. First match wins; subsequent matches are
 // ignored so a log line that quotes the same URL doesn't reset state.
+//
+// Side-effect: known error fragments (see knownErrors) are lifted into
+// t.err so the UI can show something more useful than "exit status 1"
+// — the most common cause of named-tunnel failure is the user skipping
+// the one-time `cloudflared tunnel login/create/route dns` setup, and
+// that error lands on stderr a beat before cloudflared exits.
 func (t *Tunnel) scan(r io.Reader, mirror io.Writer) {
 	sc := bufio.NewScanner(r)
 	// Cloudflared can dump JSON-formatted logs that exceed 64KB
@@ -277,6 +308,7 @@ func (t *Tunnel) scan(r io.Reader, mirror io.Writer) {
 		t.mu.RLock()
 		captured := t.url != ""
 		registered := t.registered
+		hadErr := t.err != nil
 		t.mu.RUnlock()
 		if !captured {
 			// Named tunnels never want a trycloudflare match — the URL
@@ -303,6 +335,22 @@ func (t *Tunnel) scan(r io.Reader, mirror io.Writer) {
 			t.mu.Lock()
 			t.registered = true
 			t.mu.Unlock()
+		}
+		// Lift known error patterns into t.err so UI can show something
+		// useful. We only set the FIRST one we see — once t.err is
+		// populated, later cascading errors (e.g. "connection failed"
+		// after "credentials missing") would just obscure the root.
+		if !hadErr {
+			for _, ke := range knownErrors {
+				if ke.pat.Match(line) {
+					t.mu.Lock()
+					if t.err == nil {
+						t.err = errors.New(ke.message)
+					}
+					t.mu.Unlock()
+					break
+				}
+			}
 		}
 	}
 }

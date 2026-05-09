@@ -416,7 +416,7 @@ function PublicRow({
         </Button>
       </header>
 
-      {status.error && status.error.includes("not found") && (
+      {status.error && status.error.includes("cloudflared binary not found") && (
         <Alert variant="destructive">
           <AlertTitle>cloudflared not installed</AlertTitle>
           <AlertDescription>
@@ -433,6 +433,13 @@ function PublicRow({
           </AlertDescription>
         </Alert>
       )}
+      {status.error &&
+        !status.error.includes("cloudflared binary not found") && (
+          <Alert variant="destructive">
+            <AlertTitle>Tunnel failed to start</AlertTitle>
+            <AlertDescription>{status.error}</AlertDescription>
+          </Alert>
+        )}
 
       {!status.enabled && (
         <div className="space-y-3">
@@ -456,50 +463,69 @@ function PublicRow({
                 className="w-full rounded border bg-background px-2 py-1.5 font-mono text-xs sm:py-1"
               />
             </div>
-            {partialNamed ? (
+            {partialNamed && (
               <p className="flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400">
                 <ShieldAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
                 {tunnelTrim === ""
                   ? "Tunnel name is required when a hostname is set — cloudflared looks up credentials by name. Leave both fields empty to fall back to a quick tunnel (random *.trycloudflare.com URL)."
                   : "Hostname is required when a tunnel name is set. Leave both fields empty to fall back to a quick tunnel (random *.trycloudflare.com URL)."}
               </p>
-            ) : namedTunnelOK ? (
+            )}
+            {namedTunnelOK && (
               <p className="text-[11px] text-emerald-600 dark:text-emerald-400">
                 Will use named tunnel <code className="font-mono">{tunnelTrim}</code>{" "}
                 routed at <code className="font-mono">{hostTrim}</code>.
               </p>
-            ) : (
-              <details className="text-[11px] text-muted-foreground">
-                <summary className="cursor-pointer select-none underline-offset-2 hover:underline">
-                  Empty = quick tunnel (no setup, but UI may show empty
-                  account list — Cloudflare buffers SSE on quick tunnels).
-                  Click to see one-time setup for a named tunnel.
-                </summary>
-                <ol className="mt-1.5 ml-4 list-decimal space-y-1">
-                  <li>
-                    Run <code className="font-mono">cloudflared tunnel login</code>{" "}
-                    in a terminal — opens a browser to pick the domain you've
-                    added to Cloudflare.
-                  </li>
-                  <li>
-                    Run{" "}
-                    <code className="font-mono">
-                      cloudflared tunnel create &lt;name&gt;
-                    </code>{" "}
-                    to provision the tunnel (the name goes in the left
-                    field).
-                  </li>
-                  <li>
-                    Run{" "}
-                    <code className="font-mono">
-                      cloudflared tunnel route dns &lt;name&gt; &lt;hostname&gt;
-                    </code>{" "}
-                    to point a DNS record at the tunnel (the hostname goes
-                    in the right field).
-                  </li>
-                  <li>Fill both fields above and click Enable.</li>
-                </ol>
-              </details>
+            )}
+            {/* Setup steps stay visible regardless of input state — the
+                most common failure mode is users typing a name + host
+                without realising the cloudflared CLI needs a one-time
+                login + create + route dns first. Burying the steps in
+                a <details> meant Enable would silently fail with "exit
+                status 1" and they'd assume our daemon was broken. */}
+            <details
+              className="text-[11px] text-muted-foreground"
+              open={!namedTunnelOK && !partialNamed}
+            >
+              <summary className="cursor-pointer select-none underline-offset-2 hover:underline">
+                One-time cloudflared setup (required before named tunnel
+                works) — click to expand
+              </summary>
+              <ol className="mt-1.5 ml-4 list-decimal space-y-1">
+                <li>
+                  Run <code className="font-mono">cloudflared tunnel login</code>{" "}
+                  in a terminal — opens a browser to pick the domain you've
+                  added to Cloudflare.
+                </li>
+                <li>
+                  Run{" "}
+                  <code className="font-mono">
+                    cloudflared tunnel create &lt;name&gt;
+                  </code>{" "}
+                  to provision the tunnel (the name goes in the left field).
+                </li>
+                <li>
+                  Run{" "}
+                  <code className="font-mono">
+                    cloudflared tunnel route dns &lt;name&gt; &lt;hostname&gt;
+                  </code>{" "}
+                  to point a DNS record at the tunnel (the hostname goes in
+                  the right field).
+                </li>
+                <li>Fill both fields above and click Enable.</li>
+              </ol>
+              <p className="mt-1.5">
+                Skipping setup leaves cloudflared without credentials, and
+                Enable will fail with a "named tunnel not found" error.
+              </p>
+            </details>
+            {!namedTunnelOK && !partialNamed && (
+              <p className="text-[11px] text-muted-foreground">
+                Both fields empty ={" "}
+                <strong>quick tunnel</strong> (random *.trycloudflare.com URL,
+                no setup needed — but Cloudflare buffers SSE so the UI may
+                show an empty account list).
+              </p>
             )}
           </div>
           <div className="space-y-1.5">
