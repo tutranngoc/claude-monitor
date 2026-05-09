@@ -51,6 +51,36 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 // appears without thrashing the daemon.
 const PENDING_POLL_MS = 1000;
 
+// localStorage keys for input fields. Persisting these means the
+// "Named tunnel hostname" URL row shows up even after a page reload —
+// without storage, cfHostInput resets to "" on mount and the second
+// URL row stays hidden. Backend persistence covers the same use case
+// when an Enable click succeeded, but we still want the named host
+// visible while the backend is stuck on a quick tunnel (auto-start
+// race / partial config state).
+const LS_TUNNEL_KEY = "cm:public:cfTunnelName";
+const LS_HOST_KEY = "cm:public:cfHostname";
+const LS_ALLOW_KEY = "cm:public:allowIPs";
+
+function readLS(key: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeLS(key: string, value: string) {
+  if (typeof window === "undefined") return;
+  try {
+    if (value === "") window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // quota / private mode — best-effort, ignore
+  }
+}
+
 export function LANSection() {
   const [lan, setLan] = useState<LANStatus | null>(null);
   const [pub, setPub] = useState<PublicStatus | null>(null);
@@ -60,14 +90,27 @@ export function LANSection() {
   // allowInput is the working-copy of the IP allowlist while the user
   // is editing. Persisted to daemon only on enable/save click — we
   // don't recycle Next.js on every keystroke.
-  const [allowInput, setAllowInput] = useState("");
+  const [allowInput, setAllowInputRaw] = useState(() => readLS(LS_ALLOW_KEY));
   // cfTunnelInput / cfHostInput are the working copies for the named
   // tunnel — same reason as allowInput. Both empty = quick tunnel
   // (the *.trycloudflare.com path, but SSE breaks); both set = named
   // tunnel (the user has run `cloudflared tunnel login/create/route
-  // dns` once).
-  const [cfTunnelInput, setCfTunnelInput] = useState("");
-  const [cfHostInput, setCfHostInput] = useState("");
+  // dns` once). Initial values come from localStorage so a reload
+  // doesn't lose the user's typed config.
+  const [cfTunnelInput, setCfTunnelInputRaw] = useState(() => readLS(LS_TUNNEL_KEY));
+  const [cfHostInput, setCfHostInputRaw] = useState(() => readLS(LS_HOST_KEY));
+  const setAllowInput = useCallback((v: string) => {
+    setAllowInputRaw(v);
+    writeLS(LS_ALLOW_KEY, v);
+  }, []);
+  const setCfTunnelInput = useCallback((v: string) => {
+    setCfTunnelInputRaw(v);
+    writeLS(LS_TUNNEL_KEY, v);
+  }, []);
+  const setCfHostInput = useCallback((v: string) => {
+    setCfHostInputRaw(v);
+    writeLS(LS_HOST_KEY, v);
+  }, []);
   const [qrTick, setQrTick] = useState(0);
 
   // Initial fetch + soft-hide on --serve mode (501 from daemon).
@@ -81,9 +124,15 @@ export function LANSection() {
         setLan(l);
         if (p) {
           setPub(p);
-          setAllowInput(p.allow_ips ?? "");
-          setCfTunnelInput(p.cf_tunnel_name ?? "");
-          setCfHostInput(p.cf_hostname ?? "");
+          // Backend value wins when present (it's the authoritative
+          // copy of what's actually running). Otherwise keep the
+          // localStorage-restored value so the user's last-typed
+          // config survives a reload — important for the "Named
+          // tunnel hostname" URL row to render when the backend is
+          // stuck on a quick tunnel.
+          if (p.allow_ips) setAllowInput(p.allow_ips);
+          if (p.cf_tunnel_name) setCfTunnelInput(p.cf_tunnel_name);
+          if (p.cf_hostname) setCfHostInput(p.cf_hostname);
         }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
