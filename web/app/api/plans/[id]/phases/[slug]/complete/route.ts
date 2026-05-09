@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { autoCommitWorktree } from "@/lib/server/git";
+import { autoCommitWorktree, checkPhaseScope } from "@/lib/server/git";
 import { findPlanById, updatePlan } from "@/lib/server/plans";
 import type { PhaseSession, PlanRecord } from "@/lib/plan-types";
 
@@ -62,6 +62,37 @@ export async function POST(_req: Request, { params }: Ctx) {
     phaseSlug: slug,
   });
 
+  // Best-effort scope check after the safety-net commit. Runs only
+  // when the phase declared scope.files and the commit didn't fail
+  // (clean trees still get checked — earlier commits by the model
+  // would still be visible against the merge-base). Failures here are
+  // non-fatal: log + skip persistence so the user gets a faster reply
+  // and isn't blocked by a transient git error.
+  const phaseDef = plan.phases.find((p) => p.slug === slug);
+  let scopeViolations: string[] | undefined;
+  let scopeBase: string | undefined;
+  if (
+    result.status !== "failed" &&
+    phaseDef?.scope?.files &&
+    phaseDef.scope.files.length > 0
+  ) {
+    const baseBranch = plan.merge_branch ?? "main";
+    try {
+      const check = await checkPhaseScope({
+        worktreePath: worktree.path,
+        baseBranch,
+        scopeFiles: phaseDef.scope.files,
+      });
+      scopeViolations = check.violations;
+      scopeBase = check.base;
+    } catch (err) {
+      console.warn(
+        `[phase-complete] scope check failed for ${slug}:`,
+        err,
+      );
+    }
+  }
+
   const committedAt = new Date().toISOString();
   const updated = await updatePlan(plan.cwd, plan.id, (p: PlanRecord) => {
     if (!p.phase_sessions) return;
@@ -83,6 +114,14 @@ export async function POST(_req: Request, { params }: Ctx) {
       next.commit_status = "failed";
       next.commit_error = result.error;
       delete next.commit_sha;
+    }
+    if (scopeViolations !== undefined) {
+      // Always replace — empty array means "we checked and found
+      // nothing", which is meaningfully different from "we never
+      // checked" (undefined). UI uses the distinction to render
+      // the green "in scope" affordance vs no badge at all.
+      next.scope_violations = scopeViolations;
+      next.scope_check_base = scopeBase;
     }
     p.phase_sessions[idx] = next;
   });

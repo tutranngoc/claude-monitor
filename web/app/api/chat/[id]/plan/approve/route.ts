@@ -17,6 +17,7 @@ import {
 import type {
   Phase,
   PhaseOverrides,
+  PhaseScope,
   PhaseSession,
   PlanRecord,
 } from "@/lib/plan-types";
@@ -48,12 +49,22 @@ const VALID_EFFORTS: ReadonlySet<Effort> = new Set([
 
 // Sanitize a single user-supplied override entry. Drops unknown effort
 // values and empty strings so downstream code can rely on the shape.
-function sanitizeOverride(
-  raw: unknown,
-): { model?: string; effort?: Effort; tdd_mode?: boolean } | null {
+// scope.files is normalized to a deduped non-empty trimmed string array
+// so the kickoff prompt and post-commit check don't have to re-validate.
+function sanitizeOverride(raw: unknown): {
+  model?: string;
+  effort?: Effort;
+  tdd_mode?: boolean;
+  scope?: PhaseScope;
+} | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  const out: { model?: string; effort?: Effort; tdd_mode?: boolean } = {};
+  const out: {
+    model?: string;
+    effort?: Effort;
+    tdd_mode?: boolean;
+    scope?: PhaseScope;
+  } = {};
   if (typeof r.model === "string" && r.model.trim().length > 0) {
     out.model = r.model.trim();
   }
@@ -62,6 +73,23 @@ function sanitizeOverride(
   }
   if (typeof r.tdd_mode === "boolean") {
     out.tdd_mode = r.tdd_mode;
+  }
+  if (r.scope && typeof r.scope === "object") {
+    const rawScope = r.scope as Record<string, unknown>;
+    if (Array.isArray(rawScope.files)) {
+      const seen = new Set<string>();
+      const files: string[] = [];
+      for (const entry of rawScope.files) {
+        if (typeof entry !== "string") continue;
+        const trimmed = entry.trim();
+        if (trimmed.length === 0 || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        files.push(trimmed);
+      }
+      // Empty array vs undefined matters: empty means "user explicitly
+      // cleared the scope" — propagate so the on-disk plan reflects it.
+      out.scope = { files };
+    }
   }
   return Object.keys(out).length > 0 ? out : null;
 }
@@ -110,6 +138,16 @@ function buildPhasePrompt(
       ].join("\n")
     : "";
 
+  const scopeSection =
+    phase.scope?.files && phase.scope.files.length > 0
+      ? [
+          "",
+          "## File scope (stay within these globs)",
+          ...phase.scope.files.map((g) => `- \`${g}\``),
+          "If you genuinely need to touch a file outside this list, **stop** and use AskUserQuestion to surface why before editing it. The post-commit check flags out-of-scope files as a warning so the user notices either way.",
+        ].join("\n")
+      : "";
+
   return [
     `# Phase: ${phase.title}`,
     "",
@@ -131,6 +169,7 @@ function buildPhasePrompt(
     "- Run the project's tests/typecheck before declaring done.",
     "- When finished, `git add` your changes and create a commit on this branch with a clear message.",
     "- If you get blocked or need a decision, use the AskUserQuestion tool — do not guess.",
+    scopeSection,
     tddSection,
     "",
     "Begin.",
@@ -182,6 +221,16 @@ export async function POST(req: Request, { params }: Ctx) {
       if (sanitized.model !== undefined) phase.model = sanitized.model;
       if (sanitized.effort !== undefined) phase.effort = sanitized.effort;
       if (sanitized.tdd_mode !== undefined) phase.tdd_mode = sanitized.tdd_mode;
+      if (sanitized.scope !== undefined) {
+        // Empty files array → drop the scope entirely so the kickoff
+        // prompt and check both treat the phase as "no declared scope"
+        // rather than "scope = nothing allowed".
+        if (!sanitized.scope.files || sanitized.scope.files.length === 0) {
+          delete phase.scope;
+        } else {
+          phase.scope = { ...phase.scope, files: sanitized.scope.files };
+        }
+      }
     }
   }
 

@@ -3,12 +3,14 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  AlertTriangle,
   ArrowRight,
   Clock,
   GitCommit,
   GitMerge,
   Loader2,
   RotateCw,
+  ScanLine,
   ShieldCheck,
   XCircle,
 } from "lucide-react";
@@ -527,6 +529,7 @@ function PhaseRowCard({
             </button>
           )}
           <CommitBadge link={link} onRetry={() => onComplete(phase.slug)} pending={pending} />
+          <ScopeBadge link={link} />
         </div>
       ) : (
         <div className="mt-3 inline-flex items-center gap-1 text-[11px] italic text-muted-foreground">
@@ -692,6 +695,46 @@ function CommitBadge({
       )}
       commit failed — retry
     </button>
+  );
+}
+
+// ScopeBadge surfaces the post-commit scope check from /complete:
+//   undefined          → no check ran (phase didn't declare scope, or
+//                        check errored). Render nothing — silent.
+//   []                 → checked, no violations. Show subtle green
+//                        "in scope" affordance.
+//   [...paths]         → out-of-scope files. Amber chip with count;
+//                        hover lists the paths so the user can decide
+//                        whether the creep is intentional.
+function ScopeBadge({ link }: { link: PhaseSession }) {
+  if (link.scope_violations === undefined) return null;
+  if (link.scope_violations.length === 0) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 font-mono text-[11px] text-muted-foreground"
+        title={
+          link.scope_check_base
+            ? `scope clean vs ${link.scope_check_base.slice(0, 7)}`
+            : undefined
+        }
+      >
+        <ScanLine className="size-3" aria-hidden />
+        in scope
+      </span>
+    );
+  }
+  const list = link.scope_violations;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]",
+        "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+      )}
+      title={list.join("\n")}
+    >
+      <AlertTriangle className="size-3" aria-hidden />
+      {list.length} out of scope
+    </span>
   );
 }
 

@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowRight, FlaskConical, LayoutGrid } from "lucide-react";
+import { ArrowRight, FlaskConical, LayoutGrid, ScanLine } from "lucide-react";
 import type { Effort } from "@/lib/chat-types";
 import type {
   Phase,
   PhaseOverride,
   PhaseOverrides,
+  PhaseScope,
   PlanRecord,
 } from "@/lib/plan-types";
 import { Badge } from "@/components/ui/badge";
@@ -55,6 +56,9 @@ export function PlanCard({ plan, onApprove }: Props) {
       if (p.model) o.model = p.model;
       if (p.effort) o.effort = p.effort;
       if (p.tdd_mode) o.tdd_mode = p.tdd_mode;
+      if (p.scope?.files && p.scope.files.length > 0) {
+        o.scope = { files: [...p.scope.files] };
+      }
       if (Object.keys(o).length > 0) seed[p.slug] = o;
     }
     return seed;
@@ -68,6 +72,17 @@ export function PlanCard({ plan, onApprove }: Props) {
       if (merged.model === "" || merged.model == null) delete merged.model;
       if (merged.effort === undefined) delete merged.effort;
       if (merged.tdd_mode === false) delete merged.tdd_mode;
+      // scope.files = [] means "user cleared all globs" — still a real
+      // edit (server treats empty array as drop), so keep the empty
+      // PhaseScope until merged is otherwise empty.
+      if (merged.scope) {
+        const files = merged.scope.files ?? [];
+        if (files.length === 0) {
+          delete merged.scope;
+        } else {
+          merged.scope = { files };
+        }
+      }
       const next = { ...prev };
       if (Object.keys(merged).length === 0) {
         delete next[slug];
@@ -208,11 +223,12 @@ export function PlanCard({ plan, onApprove }: Props) {
   );
 }
 
-// PhaseRuntimeRow surfaces the three per-phase runtime knobs (model,
-// effort, TDD mode). Pre-approve it's editable; post-approve it
-// renders as read-only badges so the user can see what was actually
-// spawned. Compact one-row layout to keep PlanCard scannable when
-// plans have many phases.
+// PhaseRuntimeRow surfaces the four per-phase runtime knobs (model,
+// effort, TDD mode, file scope). Pre-approve it's editable; post-
+// approve it renders as read-only badges so the user can see what
+// was actually spawned. Scope is a textarea (one glob per line) —
+// chip-input UX is heavier and globs aren't free-form values that
+// benefit from validation-on-add anyway.
 function PhaseRuntimeRow({
   phase,
   override,
@@ -224,97 +240,149 @@ function PhaseRuntimeRow({
   editable: boolean;
   onChange: (patch: PhaseOverride) => void;
 }) {
-  // Effective values — what the spawn route would actually use. For the
-  // post-approve display we read from phase (which has been merged with
-  // overrides server-side). For the editable state we prefer override
-  // (live edits) → phase (seed from disk).
   const effectiveModel = override.model ?? phase.model;
   const effectiveEffort = override.effort ?? phase.effort;
   const effectiveTdd = override.tdd_mode ?? phase.tdd_mode ?? false;
+  const effectiveScope: PhaseScope | undefined = override.scope ?? phase.scope;
+  const scopeFiles = effectiveScope?.files ?? [];
 
   if (!editable) {
-    if (!effectiveModel && !effectiveEffort && !effectiveTdd) return null;
+    if (
+      !effectiveModel &&
+      !effectiveEffort &&
+      !effectiveTdd &&
+      scopeFiles.length === 0
+    )
+      return null;
     return (
-      <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
-        {effectiveModel && (
-          <Badge variant="outline">{labelFor(effectiveModel)}</Badge>
-        )}
-        {effectiveEffort && (
-          <Badge variant="outline">effort: {effectiveEffort}</Badge>
-        )}
-        {effectiveTdd && (
-          <Badge
-            variant="outline"
-            className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-          >
-            <FlaskConical className="mr-1 size-3" aria-hidden />
-            TDD
-          </Badge>
+      <div className="mt-2 space-y-1.5">
+        <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
+          {effectiveModel && (
+            <Badge variant="outline">{labelFor(effectiveModel)}</Badge>
+          )}
+          {effectiveEffort && (
+            <Badge variant="outline">effort: {effectiveEffort}</Badge>
+          )}
+          {effectiveTdd && (
+            <Badge
+              variant="outline"
+              className="border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+            >
+              <FlaskConical className="mr-1 size-3" aria-hidden />
+              TDD
+            </Badge>
+          )}
+          {scopeFiles.length > 0 && (
+            <Badge variant="outline">
+              <ScanLine className="mr-1 size-3" aria-hidden />
+              scope: {scopeFiles.length}
+            </Badge>
+          )}
+        </div>
+        {scopeFiles.length > 0 && (
+          <ul className="font-mono text-[10px] text-muted-foreground">
+            {scopeFiles.map((g) => (
+              <li key={g}>· {g}</li>
+            ))}
+          </ul>
         )}
       </div>
     );
   }
 
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
-      <label className="inline-flex items-center gap-1">
-        <span className="text-muted-foreground">model:</span>
-        <select
-          value={override.model ?? ""}
-          onChange={(e) => onChange({ model: e.target.value || undefined })}
+    <div className="mt-2 space-y-2 text-[11px]">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="inline-flex items-center gap-1">
+          <span className="text-muted-foreground">model:</span>
+          <select
+            value={override.model ?? ""}
+            onChange={(e) => onChange({ model: e.target.value || undefined })}
+            className={cn(
+              "h-7 rounded-md border bg-background px-1.5 font-mono",
+              "focus:outline-none focus:ring-1 focus:ring-ring",
+            )}
+          >
+            {MODEL_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="inline-flex items-center gap-1">
+          <span className="text-muted-foreground">effort:</span>
+          <select
+            value={override.effort ?? ""}
+            onChange={(e) =>
+              onChange({
+                effort: e.target.value
+                  ? (e.target.value as Effort)
+                  : undefined,
+              })
+            }
+            className={cn(
+              "h-7 rounded-md border bg-background px-1.5 font-mono",
+              "focus:outline-none focus:ring-1 focus:ring-ring",
+            )}
+          >
+            {EFFORT_OPTIONS.map((opt) => (
+              <option key={opt.value || "inherit"} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label
           className={cn(
-            "h-7 rounded-md border bg-background px-1.5 font-mono",
-            "focus:outline-none focus:ring-1 focus:ring-ring",
+            "inline-flex cursor-pointer items-center gap-1 rounded-md border px-2 py-1 font-mono",
+            effectiveTdd
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+              : "bg-muted/40 text-muted-foreground hover:bg-muted",
           )}
+          title="When on, the kickoff prompt instructs the agent to write failing tests before implementing."
         >
-          {MODEL_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="inline-flex items-center gap-1">
-        <span className="text-muted-foreground">effort:</span>
-        <select
-          value={override.effort ?? ""}
-          onChange={(e) =>
-            onChange({
-              effort: e.target.value
-                ? (e.target.value as Effort)
-                : undefined,
-            })
-          }
-          className={cn(
-            "h-7 rounded-md border bg-background px-1.5 font-mono",
-            "focus:outline-none focus:ring-1 focus:ring-ring",
-          )}
-        >
-          {EFFORT_OPTIONS.map((opt) => (
-            <option key={opt.value || "inherit"} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label
-        className={cn(
-          "inline-flex cursor-pointer items-center gap-1 rounded-md border px-2 py-1 font-mono",
-          effectiveTdd
-            ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-            : "bg-muted/40 text-muted-foreground hover:bg-muted",
-        )}
-        title="When on, the kickoff prompt instructs the agent to write failing tests before implementing."
-      >
-        <input
-          type="checkbox"
-          checked={effectiveTdd}
-          onChange={(e) => onChange({ tdd_mode: e.target.checked })}
-          className="size-3"
-        />
-        <FlaskConical className="size-3" aria-hidden />
-        <span>TDD-first</span>
-      </label>
+          <input
+            type="checkbox"
+            checked={effectiveTdd}
+            onChange={(e) => onChange({ tdd_mode: e.target.checked })}
+            className="size-3"
+          />
+          <FlaskConical className="size-3" aria-hidden />
+          <span>TDD-first</span>
+        </label>
+      </div>
+      <div>
+        <label className="block">
+          <span className="flex items-center gap-1 text-muted-foreground">
+            <ScanLine className="size-3" aria-hidden />
+            file scope ({scopeFiles.length} glob
+            {scopeFiles.length === 1 ? "" : "s"})
+          </span>
+          <textarea
+            value={scopeFiles.join("\n")}
+            placeholder="e.g. web/lib/auth/**&#10;web/app/api/auth/route.ts&#10;**/*.test.ts"
+            spellCheck={false}
+            onChange={(e) => {
+              const lines = e.target.value
+                .split("\n")
+                .map((l) => l.trim())
+                .filter((l) => l.length > 0);
+              onChange({
+                scope:
+                  lines.length > 0
+                    ? { files: Array.from(new Set(lines)) }
+                    : undefined,
+              });
+            }}
+            rows={Math.max(2, Math.min(6, scopeFiles.length + 1))}
+            className={cn(
+              "mt-1 block w-full rounded-md border bg-background px-2 py-1 font-mono text-[11px]",
+              "focus:outline-none focus:ring-1 focus:ring-ring",
+            )}
+          />
+        </label>
+      </div>
     </div>
   );
 }

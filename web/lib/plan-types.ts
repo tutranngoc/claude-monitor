@@ -25,6 +25,20 @@ export interface Phase {
   model?: string;
   effort?: Effort;
   tdd_mode?: boolean;
+  // Declarative file scope — list of globs the agent is expected to
+  // stay within. Surfaced in the kickoff prompt so the model has
+  // explicit boundaries, and checked post-commit (soft warning, not a
+  // hard gate — sometimes touching a shared file is legitimate; the
+  // user decides when reviewing). Symbol-level scope is deferred until
+  // file-level proves insufficient.
+  //   Glob syntax: `*` (no slash), `**` (any depth), `?` (single char).
+  //   Examples: "web/lib/auth/**", "web/app/api/auth/route.ts",
+  //             "**/*.test.ts".
+  scope?: PhaseScope;
+}
+
+export interface PhaseScope {
+  files?: string[];
 }
 
 // PhaseOverride is the wire shape for per-phase edits the user makes in
@@ -36,6 +50,7 @@ export interface PhaseOverride {
   model?: string;
   effort?: Effort;
   tdd_mode?: boolean;
+  scope?: PhaseScope;
 }
 
 export type PhaseOverrides = Record<string, PhaseOverride>;
@@ -70,6 +85,16 @@ export interface PhaseSession {
   commit_sha?: string;
   committed_at?: string;
   commit_error?: string;
+  // Files touched by the phase commit that fell outside `phase.scope.files`.
+  // Populated by the /complete route's post-commit check. Soft warning
+  // only — the commit still lands and merge isn't blocked, but the UI
+  // surfaces them so the user can review intentional vs accidental
+  // scope creep. Empty/omitted = no violations or no scope declared.
+  scope_violations?: string[];
+  // Sha against which scope_violations was computed (typically the
+  // merge-base with the integration branch). Recorded so the user can
+  // independently re-run the diff if needed.
+  scope_check_base?: string;
 }
 
 export type PlanStatus = "submitted" | "approved" | "failed";

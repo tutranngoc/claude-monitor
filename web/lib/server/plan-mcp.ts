@@ -73,6 +73,19 @@ export function createPlanMcpServer(ctx: PlanMcpContext) {
               .describe(
                 "If true, the kickoff prompt instructs the agent to write failing tests first, surface them, then implement until they pass.",
               ),
+            scope: z
+              .object({
+                files: z
+                  .array(z.string().min(1))
+                  .optional()
+                  .describe(
+                    "Glob patterns the agent is allowed to modify. Use `*` (no slash), `**` (any depth), `?` (single char). Examples: 'web/lib/auth/**', 'web/app/api/auth/route.ts'.",
+                  ),
+              })
+              .optional()
+              .describe(
+                "Declarative file scope. The kickoff prompt lists these globs to the agent, and a post-commit check flags any files touched outside them as a soft warning.",
+              ),
           }),
         )
         .min(1),

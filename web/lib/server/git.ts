@@ -93,6 +93,91 @@ export async function autoCommitWorktree(
   }
 }
 
+export interface PhaseScopeCheck {
+  base: string;
+  violations: string[];
+}
+
+interface PhaseScopeOpts {
+  worktreePath: string;
+  baseBranch: string;
+  scopeFiles: string[];
+}
+
+// globToRegex compiles the small subset of glob syntax we expose to
+// users (file scope declarations). Supports:
+//   `**/` — zero or more directory components
+//   `**`  — any chars including slashes (trailing only)
+//   `*`   — any chars except slash
+//   `?`   — single non-slash char
+// All other chars match literally with regex metachars escaped. We
+// intentionally do NOT pull in picomatch/minimatch — the surface area
+// here is small, and a transitively-installed dep is fragile to depend
+// on directly.
+export function globToRegex(glob: string): RegExp {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      if (glob[i + 2] === "/") {
+        // **/  — match zero-or-more directory components, trailing slash
+        // is optional so `**/foo` matches `foo` at root too.
+        re += "(?:.*/)?";
+        i += 2;
+      } else {
+        // ** without a trailing slash — bag of any chars including /
+        re += ".*";
+        i += 1;
+      }
+    } else if (c === "*") {
+      re += "[^/]*";
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if ("\\^$.|+(){}[]".includes(c)) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp("^" + re + "$");
+}
+
+export function matchesAnyGlob(path: string, globs: string[]): boolean {
+  for (const g of globs) {
+    if (globToRegex(g).test(path)) return true;
+  }
+  return false;
+}
+
+// checkPhaseScope diffs HEAD against the merge-base with `baseBranch`
+// (caller supplies — typically the integration target, defaults to
+// "main"). Files touched by the phase but not matching any glob in
+// `scopeFiles` are returned as `violations`. Soft check: callers
+// surface as a warning, never block.
+export async function checkPhaseScope(
+  opts: PhaseScopeOpts,
+): Promise<PhaseScopeCheck> {
+  const { worktreePath, baseBranch, scopeFiles } = opts;
+  const mb = await git(worktreePath, ["merge-base", "HEAD", baseBranch]);
+  const base = mb.stdout.trim();
+  if (base.length === 0) {
+    // No merge-base = unrelated histories. Skip check rather than
+    // claiming everything is in violation.
+    return { base, violations: [] };
+  }
+  const diff = await git(worktreePath, [
+    "diff",
+    "--name-only",
+    `${base}..HEAD`,
+  ]);
+  const touched = diff.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const violations = touched.filter((p) => !matchesAnyGlob(p, scopeFiles));
+  return { base, violations };
+}
+
 function formatErr(err: unknown): string {
   if (err instanceof Error) {
     // Promisified execFile attaches stderr to the error object; surface
