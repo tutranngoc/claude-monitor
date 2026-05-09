@@ -118,6 +118,34 @@ const COLUMNS: { id: Column; label: string; tint: string }[] = [
   { id: "done", label: "Done / closed", tint: "border-emerald-500/60" },
 ];
 
+// Stable DOM id for a phase row — used by NotesPanel to scroll into view
+// when the user clicks a note's phase_slug. Kanban renders rows inside
+// columns, DAG renders nodes; only the kanban path uses this anchor for
+// now (the row card is the layout the user instinctively wants to jump
+// to from a note). Slug is plan-unique by construction (validated at
+// submit_plan time), so the id is unambiguous within the board.
+function phaseRowDomId(slug: string): string {
+  return `cm-phase-row-${slug}`;
+}
+
+// revealPhaseRow scrolls the row into view and pulses a violet ring for
+// ~1.2s so the user's eye lands on it after a click. Briefly toggles
+// data-phase-flash via attribute so the styling is colocated on the
+// card instead of fighting React state. No-op if the row isn't in the
+// DOM (e.g. user is on the dag view — fall back to scrolling the
+// kanban tab into existence is out of scope for this slice).
+function revealPhaseRow(slug: string): boolean {
+  if (typeof document === "undefined") return false;
+  const el = document.getElementById(phaseRowDomId(slug));
+  if (!el) return false;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.dataset.phaseFlash = "true";
+  window.setTimeout(() => {
+    delete el.dataset.phaseFlash;
+  }, 1200);
+  return true;
+}
+
 function bucketFor(status: SessionStatus | undefined): Column {
   if (!status) return "todo";
   if (status === "starting") return "todo";
@@ -199,12 +227,65 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   // Phase notes — sibling broadcasts written via the phase_notes MCP
   // tool. Append-only on the agent side; the plan-record poll below
   // refreshes the local mirror as new notes land. Default panel state
-  // is open when the plan ships with notes already (resumed view).
+  // is open when the plan ships with un-dismissed notes (resumed view);
+  // a plan whose every note is already acked stays collapsed so the
+  // active feed doesn't reopen what the human has already triaged.
   const [phaseNotes, setPhaseNotes] = useState<PhaseNote[]>(
     initialPlan.notes ?? [],
   );
   const [notesOpen, setNotesOpen] = useState<boolean>(
-    (initialPlan.notes?.length ?? 0) > 0,
+    (initialPlan.notes ?? []).some((n) => !n.dismissed_at),
+  );
+  // Dismiss a note (or restore a dismissed one). Optimistic — the local
+  // mirror flips immediately; a failed POST rolls back the timestamp.
+  // The poll below would eventually overwrite either way, but rolling
+  // back ourselves prevents a stale "I dismissed this" affordance from
+  // lingering for ~3s when the server rejected the change.
+  const planIdForFetch = initialPlan.id;
+  const handleDismissNote = useCallback(
+    async (noteId: string, dismiss: boolean) => {
+      const stamp = dismiss ? new Date().toISOString() : undefined;
+      let before: PhaseNote[] = [];
+      setPhaseNotes((prev) => {
+        before = prev;
+        return prev.map((n) => {
+          if (n.id !== noteId) return n;
+          if (stamp) return { ...n, dismissed_at: stamp };
+          const next: PhaseNote = { ...n };
+          delete next.dismissed_at;
+          return next;
+        });
+      });
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(planIdForFetch)}/notes/${encodeURIComponent(noteId)}/dismiss`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dismissed: dismiss }),
+          },
+        );
+        if (!res.ok) {
+          setPhaseNotes(before);
+          return;
+        }
+        const data = (await res.json()) as { plan: PlanRecord };
+        if (data.plan?.notes) {
+          setPhaseNotes(data.plan.notes);
+        }
+      } catch {
+        setPhaseNotes(before);
+      }
+    },
+    [planIdForFetch],
+  );
+  // The "active" feed is what the user actually scans; dismissed notes
+  // collapse out unless the panel reveals them via "show dismissed".
+  // Pre-compute once so both the header counter and the panel agree on
+  // what counts as live.
+  const activeNotesCount = useMemo(
+    () => phaseNotes.filter((n) => !n.dismissed_at).length,
+    [phaseNotes],
   );
   // View toggle: kanban (default — same swimlanes as before) or dag
   // (depends_on rendered as a left-to-right node graph). Preference
@@ -670,8 +751,8 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           {counters.errored > 0 && (
             <Counter label="errored" value={counters.errored} tone="rose" />
           )}
-          {phaseNotes.length > 0 && (
-            <Counter label="notes" value={phaseNotes.length} tone="violet" />
+          {activeNotesCount > 0 && (
+            <Counter label="notes" value={activeNotesCount} tone="violet" />
           )}
         </div>
       </header>
@@ -700,6 +781,17 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         notes={phaseNotes}
         open={notesOpen}
         onToggle={() => setNotesOpen((v) => !v)}
+        onDismiss={handleDismissNote}
+        onJumpToPhase={(slug) => {
+          // Scroll-to-row only works in the kanban layout — DAG nodes
+          // live in their own absolute-positioned canvas. Flip the view
+          // first if needed; the next render plants the row in the DOM
+          // and the rAF gives revealPhaseRow a target to find.
+          if (view !== "kanban") writeBoardView(initialPlanId, "kanban");
+          requestAnimationFrame(() => {
+            revealPhaseRow(slug);
+          });
+        }}
       />
 
       {view === "kanban" ? (
@@ -822,8 +914,11 @@ function PhaseRowCard({
   );
   return (
     <div
+      id={phaseRowDomId(phase.slug)}
+      data-phase-slug={phase.slug}
       className={cn(
-        "rounded-md border bg-background p-3 shadow-sm transition-colors",
+        "scroll-mt-24 rounded-md border bg-background p-3 shadow-sm transition-colors",
+        "data-[phase-flash=true]:ring-2 data-[phase-flash=true]:ring-violet-500/60",
         status === "errored" && "border-destructive/40",
         status === "thinking" && "border-amber-500/50",
         status === "awaiting_permission" && "border-blue-500/50",
@@ -2011,27 +2106,82 @@ function MergeResultChip({ result }: { result: PhaseMergeResult }) {
 // up. Collapsible because the list grows over the plan's lifetime —
 // users glance at recent activity, occasionally expand for the full
 // history. Latest-first ordering matches list_phase_notes.
+//
+// Filtering: clickable tag chips scope the visible notes to the
+// intersection of selected tags (an OR within a single tag, AND when
+// multiple are picked is too aggressive given how few notes a plan
+// usually carries — pick OR instead, which behaves like "show me any
+// note tagged x or y"). Dismissed notes hide by default; a small toggle
+// reveals them dimmed with a Restore action so the user can undo.
 function NotesPanel({
   notes,
   open,
   onToggle,
+  onDismiss,
+  onJumpToPhase,
 }: {
   notes: PhaseNote[];
   open: boolean;
   onToggle: () => void;
+  onDismiss: (noteId: string, dismiss: boolean) => void | Promise<void>;
+  onJumpToPhase: (slug: string) => void;
 }) {
+  const [activeTags, setActiveTags] = useState<Set<string>>(new Set());
+  const [showDismissed, setShowDismissed] = useState(false);
   const sorted = useMemo(() => {
     return [...notes].sort((a, b) =>
       a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0,
     );
   }, [notes]);
+  // Distinct tag set across all (non-dismissed) notes, with a count per
+  // tag so the user can spot the busy themes at a glance. Dismissed
+  // notes contribute their tags only when "show dismissed" is on —
+  // otherwise filtering by a tag that exists ONLY on dismissed notes
+  // would yield a confusingly empty list.
+  const tagCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const n of sorted) {
+      if (!showDismissed && n.dismissed_at) continue;
+      for (const t of n.tags ?? []) {
+        m.set(t, (m.get(t) ?? 0) + 1);
+      }
+    }
+    return [...m.entries()].sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    });
+  }, [sorted, showDismissed]);
+  const dismissedCount = useMemo(
+    () => sorted.filter((n) => n.dismissed_at).length,
+    [sorted],
+  );
+  const visible = useMemo(() => {
+    return sorted.filter((n) => {
+      if (n.dismissed_at && !showDismissed) return false;
+      if (activeTags.size === 0) return true;
+      const tags = n.tags ?? [];
+      return tags.some((t) => activeTags.has(t));
+    });
+  }, [sorted, activeTags, showDismissed]);
+  const activeFeed = useMemo(
+    () => sorted.filter((n) => !n.dismissed_at),
+    [sorted],
+  );
   if (notes.length === 0) {
     // Suppress entirely when empty so the board doesn't gain a hollow
     // strip pre-broadcast. The header chip drives discoverability once
     // the first note lands.
     return null;
   }
-  const latest = sorted[0];
+  const latest = activeFeed[0] ?? sorted[0];
+  const toggleTag = (t: string) => {
+    setActiveTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  };
   return (
     <div className="border-b bg-violet-500/5 px-6 py-2 text-xs">
       <button
@@ -2044,7 +2194,10 @@ function NotesPanel({
           Phase notes
         </span>
         <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-violet-600 dark:text-violet-300">
-          {notes.length}
+          {activeFeed.length}
+          {dismissedCount > 0 && (
+            <span className="opacity-60"> / {sorted.length}</span>
+          )}
         </span>
         {!open && latest && (
           <span className="min-w-0 flex-1 truncate text-foreground/70">
@@ -2059,36 +2212,168 @@ function NotesPanel({
         )}
       </button>
       {open && (
-        <ul className="mt-2 flex flex-col gap-2 pb-1">
-          {sorted.map((note) => (
-            <li
-              key={note.id}
-              className="rounded-md border border-violet-500/20 bg-background px-3 py-2"
-            >
-              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-                <span className="font-mono text-foreground/80">
-                  {note.phase_slug}
-                </span>
-                <span className="opacity-70">
-                  {formatNoteTime(note.created_at)}
-                </span>
-                {note.tags?.map((t) => (
-                  <span
+        <div className="mt-2 pb-1">
+          {(tagCounts.length > 0 || dismissedCount > 0) && (
+            <div className="mb-2 flex flex-wrap items-center gap-1.5">
+              {tagCounts.map(([t, count]) => {
+                const on = activeTags.has(t);
+                return (
+                  <button
                     key={t}
-                    className="rounded-full bg-violet-500/10 px-1.5 py-0.5 font-mono text-[10px] text-violet-600 dark:text-violet-300"
+                    type="button"
+                    onClick={() => toggleTag(t)}
+                    className={cn(
+                      "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] transition-colors",
+                      on
+                        ? "border-violet-500/60 bg-violet-500/20 text-violet-700 dark:text-violet-200"
+                        : "border-violet-500/20 bg-violet-500/5 text-muted-foreground hover:text-foreground",
+                    )}
+                    aria-pressed={on}
+                    title={on ? `Stop filtering by ${t}` : `Filter by ${t}`}
                   >
-                    {t}
-                  </span>
-                ))}
-              </div>
-              <p className="mt-1 whitespace-pre-wrap text-sm text-foreground">
-                {note.body}
-              </p>
-            </li>
-          ))}
-        </ul>
+                    <span>{t}</span>
+                    <span className="tabular-nums opacity-70">{count}</span>
+                  </button>
+                );
+              })}
+              {activeTags.size > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTags(new Set())}
+                  className="rounded-full border border-transparent px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                >
+                  clear filter
+                </button>
+              )}
+              {dismissedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowDismissed((v) => !v)}
+                  className={cn(
+                    "ml-auto rounded-full border px-2 py-0.5 font-mono text-[10px] transition-colors",
+                    showDismissed
+                      ? "border-violet-500/60 bg-violet-500/20 text-violet-700 dark:text-violet-200"
+                      : "border-dashed border-violet-500/30 text-muted-foreground hover:text-foreground",
+                  )}
+                  aria-pressed={showDismissed}
+                >
+                  {showDismissed
+                    ? `hide dismissed (${dismissedCount})`
+                    : `show dismissed (${dismissedCount})`}
+                </button>
+              )}
+            </div>
+          )}
+          {visible.length === 0 ? (
+            <p className="px-1 py-2 text-muted-foreground">
+              {activeTags.size > 0
+                ? "No notes match the selected tag(s)."
+                : "All notes dismissed."}
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {visible.map((note) => (
+                <NoteRow
+                  key={note.id}
+                  note={note}
+                  onDismiss={() =>
+                    onDismiss(note.id, !note.dismissed_at)
+                  }
+                  onJumpToPhase={() => onJumpToPhase(note.phase_slug)}
+                  onToggleTag={toggleTag}
+                  activeTags={activeTags}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </div>
+  );
+}
+
+// NoteRow factored out so the per-note dismiss/restore + tag filter
+// chips read cleanly. Dismissed notes get muted styling + a Restore
+// action; active notes get a Dismiss action.
+function NoteRow({
+  note,
+  onDismiss,
+  onJumpToPhase,
+  onToggleTag,
+  activeTags,
+}: {
+  note: PhaseNote;
+  onDismiss: () => void;
+  onJumpToPhase: () => void;
+  onToggleTag: (t: string) => void;
+  activeTags: Set<string>;
+}) {
+  const dismissed = !!note.dismissed_at;
+  return (
+    <li
+      className={cn(
+        "rounded-md border border-violet-500/20 bg-background px-3 py-2 transition-opacity",
+        dismissed && "opacity-60",
+      )}
+    >
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <button
+          type="button"
+          onClick={onJumpToPhase}
+          className="rounded font-mono text-foreground/80 underline-offset-2 hover:text-foreground hover:underline"
+          title={`Jump to ${note.phase_slug} on the board`}
+        >
+          {note.phase_slug}
+        </button>
+        <span className="opacity-70">{formatNoteTime(note.created_at)}</span>
+        {note.tags?.map((t) => {
+          const on = activeTags.has(t);
+          return (
+            <button
+              key={t}
+              type="button"
+              onClick={() => onToggleTag(t)}
+              className={cn(
+                "rounded-full px-1.5 py-0.5 font-mono text-[10px] transition-colors",
+                on
+                  ? "bg-violet-500/25 text-violet-700 dark:text-violet-200"
+                  : "bg-violet-500/10 text-violet-600 hover:bg-violet-500/20 dark:text-violet-300",
+              )}
+              aria-pressed={on}
+              title={on ? `Stop filtering by ${t}` : `Filter by ${t}`}
+            >
+              {t}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="ml-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-violet-500/10 hover:text-foreground"
+          title={dismissed ? "Restore this note" : "Mark this note as handled"}
+        >
+          {dismissed ? (
+            <>
+              <RotateCw className="size-3" aria-hidden />
+              <span>restore</span>
+            </>
+          ) : (
+            <>
+              <XCircle className="size-3" aria-hidden />
+              <span>dismiss</span>
+            </>
+          )}
+        </button>
+      </div>
+      <p
+        className={cn(
+          "mt-1 whitespace-pre-wrap text-sm",
+          dismissed ? "text-muted-foreground" : "text-foreground",
+        )}
+      >
+        {note.body}
+      </p>
+    </li>
   );
 }
 

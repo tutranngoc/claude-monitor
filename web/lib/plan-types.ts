@@ -192,14 +192,22 @@ export interface PhasePending {
 // submit_phase_note MCP tool. Use case: phase A renames a public API,
 // changes a schema, swaps a library — notify siblings who might rely
 // on the old shape so they can adapt without integration-time churn.
-// Notes are append-only (no edit/delete from the agent side); list
-// order is newest-first when surfaced.
+// Notes are append-only from the agent side; list order is newest-first
+// when surfaced.
+//
+// `dismissed_at` is a UI-side ack: the human running the orchestrator
+// marks a note as handled so it stops cluttering the active feed.
+// Persisted on disk so the dismissal sticks across reload and across
+// tabs. Agent-side list_phase_notes does NOT filter dismissed notes —
+// the agents may still need them as context; dismissal is purely the
+// human's "I've read this, hide it from my view".
 export interface PhaseNote {
   id: string;
   phase_slug: string;
   body: string;
   tags?: string[];
   created_at: string;
+  dismissed_at?: string;
 }
 
 export interface PlanRecord {
