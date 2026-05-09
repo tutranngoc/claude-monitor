@@ -14,7 +14,13 @@ import {
   sendMessage,
   setLatestPlan,
 } from "@/lib/server/sessions";
-import type { Phase, PhaseSession, PlanRecord } from "@/lib/plan-types";
+import type {
+  Phase,
+  PhaseOverrides,
+  PhaseSession,
+  PlanRecord,
+} from "@/lib/plan-types";
+import type { Effort } from "@/lib/chat-types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +31,39 @@ interface Ctx {
 
 interface Body {
   plan_id: string;
+  // Per-phase edits made in PlanCard before approve. Merged into the
+  // plan record on disk before spawning so the persisted plan reflects
+  // what actually ran. Unknown slugs in the map are ignored (defensive
+  // — UI shouldn't send them).
+  phase_overrides?: PhaseOverrides;
+}
+
+const VALID_EFFORTS: ReadonlySet<Effort> = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+// Sanitize a single user-supplied override entry. Drops unknown effort
+// values and empty strings so downstream code can rely on the shape.
+function sanitizeOverride(
+  raw: unknown,
+): { model?: string; effort?: Effort; tdd_mode?: boolean } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const out: { model?: string; effort?: Effort; tdd_mode?: boolean } = {};
+  if (typeof r.model === "string" && r.model.trim().length > 0) {
+    out.model = r.model.trim();
+  }
+  if (typeof r.effort === "string" && VALID_EFFORTS.has(r.effort as Effort)) {
+    out.effort = r.effort as Effort;
+  }
+  if (typeof r.tdd_mode === "boolean") {
+    out.tdd_mode = r.tdd_mode;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 // Branch convention: `wo/<plan-id-short>/<slug>`. Short prefix keeps
@@ -41,6 +80,11 @@ function branchFor(planId: string, slug: string): string {
 // commit when done. Sibling list lets the agent reason about boundaries
 // without any inter-phase coordination — each phase relies on the plan
 // brief to stay in lane, not on reading siblings' WIP code.
+//
+// TDD addendum (`phase.tdd_mode === true`) appends a step-1/2/3
+// discipline to the working agreement: tests first, surface for review,
+// implement until green. Light-touch — no scheduler change, just a
+// stronger prompt the model commits to.
 function buildPhasePrompt(
   plan: PlanRecord,
   phase: Phase,
@@ -54,6 +98,17 @@ function buildPhasePrompt(
       : siblings
           .map((p) => `- \`${p.slug}\` — ${p.title}`)
           .join("\n");
+
+  const tddSection = phase.tdd_mode
+    ? [
+        "",
+        "## TDD discipline (required for this phase)",
+        "1. Write failing tests for the behavior described in your brief. Cover happy path + the edge cases you would actually exercise.",
+        "2. Run the tests and confirm they fail for the right reason. Then **stop** — surface the test list and ask the user to confirm coverage before implementing.",
+        "3. Only after step 2 is acknowledged: implement until the tests pass. Don't refactor until they're green.",
+        "Skipping step 2 defeats the point — surface even if you think coverage is obvious.",
+      ].join("\n")
+    : "";
 
   return [
     `# Phase: ${phase.title}`,
@@ -76,6 +131,7 @@ function buildPhasePrompt(
     "- Run the project's tests/typecheck before declaring done.",
     "- When finished, `git add` your changes and create a commit on this branch with a clear message.",
     "- If you get blocked or need a decision, use the AskUserQuestion tool — do not guess.",
+    tddSection,
     "",
     "Begin.",
   ].join("\n");
@@ -113,6 +169,22 @@ export async function POST(req: Request, { params }: Ctx) {
   }
 
   const plan = await readPlan(latest.cwd, latest.id);
+
+  // Apply per-phase overrides from PlanCard. We mutate plan.phases in
+  // place before persisting so the on-disk plan reflects what actually
+  // ran — matters for retro reads of the PhaseBoard and for the
+  // upcoming integration agent which inspects phase metadata.
+  if (body.phase_overrides) {
+    for (const phase of plan.phases) {
+      const raw = body.phase_overrides[phase.slug];
+      const sanitized = sanitizeOverride(raw);
+      if (!sanitized) continue;
+      if (sanitized.model !== undefined) phase.model = sanitized.model;
+      if (sanitized.effort !== undefined) phase.effort = sanitized.effort;
+      if (sanitized.tdd_mode !== undefined) phase.tdd_mode = sanitized.tdd_mode;
+    }
+  }
+
   const phases: WorktreePhasePayload[] = plan.phases.map((p) => ({
     slug: p.slug,
     branch: branchFor(plan.id, p.slug),
@@ -167,8 +239,12 @@ export async function POST(req: Request, { params }: Ctx) {
         cwd: wt.path,
         configDir,
         accountName,
-        model: session.model,
-        effort: session.effort,
+        // Per-phase override falls back to the owner session's model/
+        // effort. Owner session already has these set from the
+        // composer toolbar — defaulting there preserves prior behavior
+        // ("phases inherit from the user's current chat config").
+        model: phase.model ?? session.model,
+        effort: phase.effort ?? session.effort,
         permissionMode: session.permissionMode,
         planId: plan.id,
         phaseSlug: phase.slug,

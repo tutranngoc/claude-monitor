@@ -4,12 +4,41 @@
 // ~/.claude/projects/<encoded-cwd>/plans/<plan-id>.json mirroring Claude
 // CLI's session storage convention.
 
+import type { Effort } from "./chat-types";
+
 export interface Phase {
   slug: string;
   title: string;
   description: string;
   depends_on?: string[];
+  // Per-phase agent runtime overrides. When unset, the approve route
+  // inherits the owner session's value — i.e. "spawn the same way the
+  // user is currently configured." Override exists so the user can run
+  // a heavy-thinking phase on Opus while a boilerplate phase stays on
+  // Haiku, or escalate effort just for one tricky slice.
+  //   model     SDK model id ("claude-opus-4-7", "claude-sonnet-4-6", ...)
+  //   effort    extended-thinking budget (low | medium | high | xhigh | max)
+  //   tdd_mode  when true, kickoff prompt instructs the agent to write
+  //             failing tests first, surface them, then implement until
+  //             they pass — a lightweight TDD discipline driven entirely
+  //             by the prompt (no scheduler change).
+  model?: string;
+  effort?: Effort;
+  tdd_mode?: boolean;
 }
+
+// PhaseOverride is the wire shape for per-phase edits the user makes in
+// PlanCard before clicking Approve. Only fields the user actually
+// changed are present; the approve route merges them into the plan
+// record on disk before spawning so the persisted plan reflects what
+// actually ran.
+export interface PhaseOverride {
+  model?: string;
+  effort?: Effort;
+  tdd_mode?: boolean;
+}
+
+export type PhaseOverrides = Record<string, PhaseOverride>;
 
 export interface WorktreeInfo {
   phase_slug: string;

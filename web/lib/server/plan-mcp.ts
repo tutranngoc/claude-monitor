@@ -50,6 +50,29 @@ export function createPlanMcpServer(ctx: PlanMcpContext) {
               .array(z.string())
               .optional()
               .describe("Slugs of other phases that must finish first."),
+            // Optional overrides — the user can edit these in PlanCard
+            // before approve, but the model can also pre-fill them at
+            // plan-submission time when it has reason to (e.g. "this
+            // phase is hard, request opus + xhigh thinking" or "this is
+            // a refactor with strong invariants, run TDD-mode").
+            model: z
+              .string()
+              .optional()
+              .describe(
+                "SDK model id override, e.g. 'claude-opus-4-7' or 'claude-haiku-4-5-20251001'. Defaults to the owner session's model.",
+              ),
+            effort: z
+              .enum(["low", "medium", "high", "xhigh", "max"])
+              .optional()
+              .describe(
+                "Extended-thinking budget override. Defaults to the owner session's effort.",
+              ),
+            tdd_mode: z
+              .boolean()
+              .optional()
+              .describe(
+                "If true, the kickoff prompt instructs the agent to write failing tests first, surface them, then implement until they pass.",
+              ),
           }),
         )
         .min(1),

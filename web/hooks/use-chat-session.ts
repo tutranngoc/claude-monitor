@@ -257,7 +257,10 @@ export interface UseChatSession extends State {
   decide: (decision: PermissionDecision) => Promise<void>;
   answer: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
-  approvePlan: (planId: string) => Promise<void>;
+  approvePlan: (
+    planId: string,
+    overrides?: import("@/lib/plan-types").PhaseOverrides,
+  ) => Promise<void>;
   stop: () => Promise<void>;
   // Queue mutators — only valid for user messages still waiting in
   // the SDK input queue. The server enforces that constraint and
@@ -452,11 +455,19 @@ export function useChatSession(sessionId: string): UseChatSession {
     }
   };
 
-  const approvePlan = async (planId: string) => {
+  const approvePlan = async (
+    planId: string,
+    overrides?: import("@/lib/plan-types").PhaseOverrides,
+  ) => {
     const res = await fetch(`/api/chat/${sessionId}/plan/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan_id: planId }),
+      body: JSON.stringify({
+        plan_id: planId,
+        ...(overrides && Object.keys(overrides).length > 0
+          ? { phase_overrides: overrides }
+          : {}),
+      }),
     });
     if (!res.ok) {
       const body = await res.text();

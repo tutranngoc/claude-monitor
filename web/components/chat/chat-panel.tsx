@@ -504,7 +504,10 @@ function ItemRow({
   cancelQuestion,
 }: {
   item: ChatItem;
-  approvePlan: (planId: string) => Promise<void>;
+  approvePlan: (
+    planId: string,
+    overrides?: import("@/lib/plan-types").PhaseOverrides,
+  ) => Promise<void>;
   answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
 }) {
