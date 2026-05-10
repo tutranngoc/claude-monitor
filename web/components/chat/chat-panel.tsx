@@ -414,6 +414,16 @@ export function ChatPanel({ session }: Props) {
                 <ItemRow
                   item={item}
                   approvePlan={chat.approvePlan}
+                  discussPlan={async (_planId, feedback) => {
+                    // Discuss-further on PlanCard pipes the user's
+                    // note straight back into the chat as a regular
+                    // user message. The model is still in plan mode
+                    // (read-only), so it can refine and call
+                    // submit_plan again — at which point the plan
+                    // pointer flips and PlanCard re-renders with the
+                    // new revision.
+                    await chat.send(feedback);
+                  }}
                   answerQuestion={chat.answer}
                   cancelQuestion={chat.cancelQuestion}
                 />
@@ -500,6 +510,7 @@ function HeaderSpacer() {
 function ItemRow({
   item,
   approvePlan,
+  discussPlan,
   answerQuestion,
   cancelQuestion,
 }: {
@@ -508,6 +519,7 @@ function ItemRow({
     planId: string,
     overrides?: import("@/lib/plan-types").PhaseOverrides,
   ) => Promise<void>;
+  discussPlan: (planId: string, feedback: string) => Promise<void>;
   answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
 }) {
@@ -517,7 +529,11 @@ function ItemRow({
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}
         {item.kind === "plan" && (
-          <PlanCard plan={item.plan} onApprove={approvePlan} />
+          <PlanCard
+            plan={item.plan}
+            onApprove={approvePlan}
+            onDiscuss={discussPlan}
+          />
         )}
         {item.kind === "ask_question" && (
           <AskQuestionCard

@@ -1,9 +1,11 @@
 "use client";
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Check, CircleDashed, Loader2 } from "lucide-react";
 import { Markdown } from "@/components/markdown/markdown";
 import type { StreamingBlock } from "@/lib/chat-types";
 import { isSubagentDispatchTool } from "@/lib/subagents";
+import { cn } from "@/lib/utils";
 import { SubagentCard } from "./subagent-card";
 import { useSubagents } from "./subagent-context";
 
@@ -46,6 +48,16 @@ function AssistantBubble({
           return <TextBlock key={i} text={block.text} />;
         }
         if (block.type === "tool_use") {
+          // TodoWrite gets a dedicated checklist card — the bullet list
+          // with status glyphs is the whole point of the tool, and
+          // collapsing it under a "N todos" summary line throws away
+          // the only useful surface.
+          if (block.name === "TodoWrite") {
+            const todos = parseTodos(
+              (block.input as Record<string, unknown> | undefined)?.todos,
+            );
+            if (todos) return <TodoListBlock key={i} todos={todos} />;
+          }
           // Subagent dispatches (tool name "Agent" in SDK 0.2.133, or
           // "Task" in older releases — see SUBAGENT_TOOL_NAMES) get
           // their own card so the user sees the subagent as one
@@ -229,6 +241,119 @@ export function ThinkingBlock({ thinking }: { thinking: string }) {
   );
 }
 
+type TodoStatus = "pending" | "in_progress" | "completed";
+interface TodoEntry {
+  content: string;
+  status: TodoStatus;
+  activeForm?: string;
+}
+
+// parseTodos accepts the raw `todos` value from a TodoWrite tool_use
+// (which during streaming may be undefined, a partial array, or an
+// array containing entries that haven't yet received all keys) and
+// returns a clean array of well-formed entries — or null if there's
+// nothing renderable yet. Callers fall back to ToolUseLine on null.
+function parseTodos(raw: unknown): TodoEntry[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: TodoEntry[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const r = entry as Record<string, unknown>;
+    const content = typeof r.content === "string" ? r.content : "";
+    const status =
+      r.status === "pending" ||
+      r.status === "in_progress" ||
+      r.status === "completed"
+        ? (r.status as TodoStatus)
+        : "pending";
+    if (!content) continue;
+    out.push({
+      content,
+      status,
+      activeForm: typeof r.activeForm === "string" ? r.activeForm : undefined,
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+export function TodoListBlock({
+  todos,
+  streaming,
+}: {
+  todos: TodoEntry[];
+  streaming?: boolean;
+}) {
+  // Header pulls the active item's running label so the user sees
+  // "Auditing leader-nudge silent-fail path…" up top — same shape as
+  // the CLI's progress card. Falls back to a count when nothing is
+  // in_progress (all-pending lists right after creation, or terminal
+  // all-done lists).
+  const active = todos.find((t) => t.status === "in_progress");
+  const doneCount = todos.filter((t) => t.status === "completed").length;
+  const headerLabel = active
+    ? `${active.activeForm ?? active.content}…`
+    : `Todos · ${doneCount}/${todos.length} done`;
+  return (
+    <div className="rounded-md border-l-2 border-l-amber-500/60 bg-muted/30 px-3 py-2 text-sm">
+      <div className="flex items-baseline gap-2">
+        <span
+          className={cn(
+            "font-medium",
+            active ? "text-amber-700 dark:text-amber-300" : "text-foreground",
+          )}
+        >
+          {headerLabel}
+        </span>
+        {streaming && (
+          <span className="font-mono text-[10px] text-muted-foreground">
+            (updating…)
+          </span>
+        )}
+      </div>
+      <ul className="mt-1.5 space-y-0.5">
+        {todos.map((t, i) => (
+          <li
+            key={i}
+            className={cn(
+              "flex items-start gap-2 font-mono text-[12px] leading-5",
+              t.status === "completed" && "text-muted-foreground line-through",
+              t.status === "in_progress" &&
+                "font-semibold text-amber-700 dark:text-amber-300",
+              t.status === "pending" && "text-muted-foreground",
+            )}
+          >
+            <TodoGlyph status={t.status} />
+            <span className="whitespace-pre-wrap break-words">{t.content}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function TodoGlyph({ status }: { status: TodoStatus }) {
+  if (status === "completed")
+    return (
+      <Check
+        className="mt-0.5 size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+        aria-label="completed"
+      />
+    );
+  if (status === "in_progress")
+    return (
+      <Loader2
+        className="mt-0.5 size-3.5 shrink-0 animate-spin text-amber-600 dark:text-amber-400"
+        aria-label="in progress"
+      />
+    );
+  return (
+    <CircleDashed
+      className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/60"
+      aria-label="pending"
+    />
+  );
+}
+
 // briefToolInput renders the leading "argument" Claude CLI shows after the
 // tool name — `Read(path)`, `Bash(command)`, `Grep(pattern)`. For tools we
 // don't have a curated mapping for, fall back to the first string value.
@@ -404,6 +529,24 @@ export function StreamingTurn({ blocks }: { blocks: StreamingBlock[] }) {
           return <ThinkingBlock key={i} thinking={block.thinking} />;
         }
         if (block.type === "tool_use") {
+          // Surface the streaming TodoWrite as a partially-filled
+          // checklist as soon as JSON.parse can land on a token
+          // boundary — until then ToolUseLine handles the "…"
+          // placeholder. In practice the tool payload is small enough
+          // that this only blinks for one delta or two before the
+          // checklist locks in.
+          if (block.name === "TodoWrite" && block.partial_json) {
+            try {
+              const parsed = JSON.parse(block.partial_json) as {
+                todos?: unknown;
+              };
+              const todos = parseTodos(parsed.todos);
+              if (todos)
+                return <TodoListBlock key={i} todos={todos} streaming />;
+            } catch {
+              // partial JSON not yet valid — fall through to ToolUseLine
+            }
+          }
           return (
             <ToolUseLine
               key={i}

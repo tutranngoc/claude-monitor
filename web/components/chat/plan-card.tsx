@@ -1,8 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import { ArrowRight, FlaskConical, LayoutGrid, ScanLine } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import {
+  ArrowRight,
+  FlaskConical,
+  LayoutGrid,
+  MessageSquarePlus,
+  ScanLine,
+} from "lucide-react";
 import type { Effort } from "@/lib/chat-types";
 import type {
   Phase,
@@ -19,6 +25,11 @@ import { cn } from "@/lib/utils";
 interface Props {
   plan: PlanRecord;
   onApprove: (planId: string, overrides?: PhaseOverrides) => Promise<void>;
+  // onDiscuss sends a user message back into the same chat so the
+  // owner can ask Claude to revise the plan before approval. Once
+  // the model calls submit_plan again the latest-plan pointer flips
+  // and this card unmounts in favour of the new one.
+  onDiscuss?: (planId: string, feedback: string) => Promise<void>;
 }
 
 // Curated dropdown — surfaces the three current model tiers plus
@@ -42,8 +53,18 @@ const EFFORT_OPTIONS: { value: "" | Effort; label: string }[] = [
   { value: "max", label: "max" },
 ];
 
-export function PlanCard({ plan, onApprove }: Props) {
+export function PlanCard({ plan, onApprove, onDiscuss }: Props) {
   const [busy, setBusy] = useState(false);
+  // Discuss-flow state: open toggles the inline textarea, sending
+  // tracks the in-flight POST so we can disable both action buttons
+  // while the message is on the wire. We don't reset `sending` to
+  // false on success — when Claude calls submit_plan again the
+  // latest-plan pointer flips and the whole card unmounts, so the
+  // local state is moot.
+  const [discussOpen, setDiscussOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [sending, setSending] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Local edits live in component state until the user clicks Approve;
   // we only persist on submit so abandoned edits don't pollute the
   // plan record on disk. Pre-seed from plan.phases so existing values
@@ -104,6 +125,26 @@ export function PlanCard({ plan, onApprove }: Props) {
     }
   };
 
+  const sendFeedback = async () => {
+    const trimmed = feedback.trim();
+    if (!trimmed || !onDiscuss) return;
+    setSending(true);
+    try {
+      await onDiscuss(plan.id, trimmed);
+    } finally {
+      // Don't reset on success — the card unmounts when submit_plan
+      // re-fires. Resetting on error lets the user retry.
+      setSending(false);
+    }
+  };
+
+  const openDiscuss = () => {
+    setDiscussOpen(true);
+    // Focus the textarea on the next tick — the element doesn't
+    // exist until React commits the open=true render.
+    queueMicrotask(() => textareaRef.current?.focus());
+  };
+
   return (
     <div className="rounded-lg border bg-muted/30 p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
@@ -136,16 +177,81 @@ export function PlanCard({ plan, onApprove }: Props) {
             </Link>
           )}
           {plan.status !== "approved" && (
-            <Button size="sm" onClick={onClick} disabled={busy}>
-              {busy
-                ? "Spawning phase agents…"
-                : plan.status === "failed"
-                  ? "Retry"
-                  : "Approve & spawn agents"}
-            </Button>
+            <>
+              {onDiscuss && plan.status !== "failed" && !discussOpen && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={openDiscuss}
+                  disabled={busy || sending}
+                  title="Send Claude a follow-up so it can revise this plan"
+                >
+                  <MessageSquarePlus className="mr-1 size-3.5" aria-hidden />
+                  Discuss further
+                </Button>
+              )}
+              <Button size="sm" onClick={onClick} disabled={busy || sending}>
+                {busy
+                  ? "Spawning phase agents…"
+                  : plan.status === "failed"
+                    ? "Retry"
+                    : "Approve & spawn agents"}
+              </Button>
+            </>
           )}
         </div>
       </div>
+
+      {discussOpen && onDiscuss && plan.status !== "approved" && (
+        <div className="mt-3 rounded-md border bg-background p-3">
+          <label className="block text-xs text-muted-foreground">
+            What should change about this plan? Claude will read your
+            note and call <span className="font-mono">submit_plan</span>{" "}
+            again with a revision.
+          </label>
+          <textarea
+            ref={textareaRef}
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            // Cmd/Ctrl-Enter is the standard chat-app shortcut to send
+            // — keeps the keyboard flow without forcing a mouse hop to
+            // the Send button.
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                void sendFeedback();
+              }
+            }}
+            placeholder="e.g. split the auth phase into two — separate route handler from middleware refactor"
+            rows={3}
+            disabled={sending}
+            className={cn(
+              "mt-1.5 block w-full resize-y rounded-md border bg-background px-2 py-1.5 text-sm",
+              "focus:outline-none focus:ring-1 focus:ring-ring",
+            )}
+          />
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setDiscussOpen(false);
+                setFeedback("");
+              }}
+              disabled={sending}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void sendFeedback()}
+              disabled={sending || feedback.trim().length === 0}
+            >
+              {sending ? "Sending…" : "Send to Claude"}
+            </Button>
+          </div>
+        </div>
+      )}
 
       <ol className="mt-3 space-y-2">
         {plan.phases.map((phase, i) => {
