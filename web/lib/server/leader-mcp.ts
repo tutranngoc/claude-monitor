@@ -8,18 +8,28 @@ import type { PhaseNote, PhaseSession, PlanRecord } from "@/lib/plan-types";
 import type { SessionSummary } from "@/lib/chat-types";
 import { classifyContextZone } from "@/lib/context-thresholds";
 import { findPlanById, updatePlan } from "@/lib/server/plans";
+import {
+  archivePlan,
+  cleanupPlanWorktrees,
+  runIntegrationReviewForPlan,
+  runMergeForPlan,
+} from "@/lib/server/plan-lifecycle";
 
 const exec = promisify(execFile);
 
 // MCP server name. Owner sessions see the tools as
-//   mcp__leader__read_plan_state
-//   mcp__leader__list_phase_notes
-//   mcp__leader__read_phase_diff
-//   mcp__leader__record_shared_context
-// First three are read-only snapshots; record_shared_context writes a
-// single string field (plan.shared_brief) that every phase's kickoff
-// prompt splices in. All four auto-allowed in canUseTool — the data is
-// purely plan-scoped and the owner is the human-trusted session anyway.
+//   mcp__leader__read_plan_state           (read)
+//   mcp__leader__list_phase_notes          (read)
+//   mcp__leader__read_phase_diff           (read)
+//   mcp__leader__record_shared_context     (write: plan.shared_brief)
+//   mcp__leader__merge_plan                (write: git + plan.merge_*)
+//   mcp__leader__run_integration_review    (write: spawns reviewer agent)
+//   mcp__leader__cleanup_worktrees         (DESTRUCTIVE: rm -rf + branch -D)
+//   mcp__leader__archive_plan              (write: plan.archived_at)
+// All except cleanup_worktrees are auto-allowed in canUseTool — the data
+// is plan-scoped and the owner is the human-trusted session anyway.
+// cleanup_worktrees gates through the user dialog because it deletes
+// directories and branches; the leader proposes, the human confirms.
 //
 // "Leader" because the owner session that submit_plan'd is now the
 // natural place to ask cross-phase questions: "what's blocking phase
@@ -32,10 +42,18 @@ export const READ_PLAN_STATE_TOOL_NAME = "read_plan_state";
 export const LEADER_LIST_NOTES_TOOL_NAME = "list_phase_notes";
 export const READ_PHASE_DIFF_TOOL_NAME = "read_phase_diff";
 export const RECORD_SHARED_CONTEXT_TOOL_NAME = "record_shared_context";
+export const MERGE_PLAN_TOOL_NAME = "merge_plan";
+export const RUN_INTEGRATION_REVIEW_TOOL_NAME = "run_integration_review";
+export const CLEANUP_WORKTREES_TOOL_NAME = "cleanup_worktrees";
+export const ARCHIVE_PLAN_TOOL_NAME = "archive_plan";
 export const READ_PLAN_STATE_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PLAN_STATE_TOOL_NAME}`;
 export const LEADER_LIST_NOTES_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${LEADER_LIST_NOTES_TOOL_NAME}`;
 export const READ_PHASE_DIFF_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PHASE_DIFF_TOOL_NAME}`;
 export const RECORD_SHARED_CONTEXT_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${RECORD_SHARED_CONTEXT_TOOL_NAME}`;
+export const MERGE_PLAN_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${MERGE_PLAN_TOOL_NAME}`;
+export const RUN_INTEGRATION_REVIEW_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${RUN_INTEGRATION_REVIEW_TOOL_NAME}`;
+export const CLEANUP_WORKTREES_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${CLEANUP_WORKTREES_TOOL_NAME}`;
+export const ARCHIVE_PLAN_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${ARCHIVE_PLAN_TOOL_NAME}`;
 
 // Cap on shared_brief body. The brief is spliced into every phase's
 // kickoff prompt, so a 50KB primer would multiply across phases. 8KB is
@@ -275,10 +293,208 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
     },
   );
 
+  const mergePlan = tool(
+    MERGE_PLAN_TOOL_NAME,
+    "Fold every phase's wo/<plan>/<slug> branch into an integration branch (default 'main'). Mirrors the UI's Merge button. Gating: plan must be approved AND every phase must have commit_status ∈ {clean, committed} (failed commits abort with the offending slugs). Writes plan.merge_status / merge_results / merge_head_sha. Idempotent on a fully-merged plan: each phase reports 'skipped' and merge_status stays 'merged'. Re-running clears any prior integration_review_* fields since the diff range changed.",
+    {
+      plan_id: z
+        .string()
+        .optional()
+        .describe("Plan id to merge. Defaults to the owner's current plan."),
+      integration_branch: z
+        .string()
+        .optional()
+        .describe(
+          "Branch to merge phases into. Defaults to 'main'. Must match [a-zA-Z0-9._-/]+.",
+        ),
+    },
+    async ({ plan_id, integration_branch }) => {
+      const r = await resolvePlan(plan_id);
+      if ("error" in r) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: r.error }],
+        };
+      }
+      const out = await runMergeForPlan({
+        planId: r.plan.id,
+        integrationBranch: integration_branch ?? "main",
+      });
+      if (!out.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: out.error.message }],
+        };
+      }
+      const merged = out.merge.results.filter((x) => x.status === "merged");
+      const skipped = out.merge.results.filter((x) => x.status === "skipped");
+      const failed = out.merge.results.filter((x) => x.status === "failed");
+      const lines = [
+        `# Merge → ${out.plan.merge_branch} (${out.plan.merge_status})`,
+        `merged: ${merged.length}, skipped: ${skipped.length}, failed: ${failed.length}`,
+        out.plan.merge_head_sha
+          ? `head: ${out.plan.merge_head_sha.slice(0, 7)}`
+          : "",
+        "",
+        ...out.merge.results.map((x) => {
+          const sha = x.sha ? ` ${x.sha.slice(0, 7)}` : "";
+          const err = x.error ? ` — ${x.error}` : "";
+          return `- \`${x.phase_slug}\` → ${x.status}${sha}${err}`;
+        }),
+      ].filter(Boolean);
+      if (out.merge.error) lines.push("", `merge error: ${out.merge.error}`);
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    },
+  );
+
+  const runIntegrationReviewTool = tool(
+    RUN_INTEGRATION_REVIEW_TOOL_NAME,
+    "Spawn a one-shot reviewer that diffs the integration branch against the pre-merge sha and writes findings into plan.integration_review_*. Background — returns immediately with status='running'; poll read_plan_state for completion. Gating: plan must be merged (merge_status === 'merged') with merge_branch + merge_base_sha recorded. If a review is already in flight this call is a no-op (no duplicate spawn).",
+    {
+      plan_id: z
+        .string()
+        .optional()
+        .describe("Plan id. Defaults to the owner's current plan."),
+    },
+    async ({ plan_id }) => {
+      const r = await resolvePlan(plan_id);
+      if ("error" in r) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: r.error }],
+        };
+      }
+      const out = await runIntegrationReviewForPlan({ planId: r.plan.id });
+      if (!out.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: out.error.message }],
+        };
+      }
+      if (out.alreadyRunning) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Integration review already running. Poll read_plan_state for completion.",
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Integration review started against ${out.plan.merge_branch} (head ${out.plan.merge_head_sha?.slice(0, 7) ?? "?"}). Poll read_plan_state to see findings.`,
+          },
+        ],
+      };
+    },
+  );
+
+  const cleanupWorktrees = tool(
+    CLEANUP_WORKTREES_TOOL_NAME,
+    "Tear down phase worktrees and delete the wo/<plan>/<slug> branches. DESTRUCTIVE — gated through the user permission dialog before running. Use only after the integration branch is pushed (or otherwise preserved) since this removes the per-phase commit history from local refs. Plan record stays on disk for inspectability. Gating: plan.merge_status must be 'merged' (refusing to cleanup half-merged work). Idempotent — already-removed worktrees report 'missing'.",
+    {
+      plan_id: z
+        .string()
+        .optional()
+        .describe("Plan id. Defaults to the owner's current plan."),
+    },
+    async ({ plan_id }) => {
+      const r = await resolvePlan(plan_id);
+      if ("error" in r) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: r.error }],
+        };
+      }
+      const out = await cleanupPlanWorktrees({ planId: r.plan.id });
+      if (!out.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: out.error.message }],
+        };
+      }
+      const lines = [
+        `# Cleanup — ${out.outcomes.length} worktree(s)`,
+        `cleaned_at: ${out.plan.worktrees_cleaned_at}`,
+        "",
+        ...out.outcomes.map((o) => {
+          const wt =
+            typeof o.worktree_removed === "object"
+              ? `error: ${o.worktree_removed.error}`
+              : o.worktree_removed;
+          const br =
+            typeof o.branch_deleted === "object"
+              ? `error: ${o.branch_deleted.error}`
+              : o.branch_deleted;
+          return `- \`${o.phase_slug}\` worktree=${wt}, branch=${br}`;
+        }),
+      ];
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    },
+  );
+
+  const archivePlanTool = tool(
+    ARCHIVE_PLAN_TOOL_NAME,
+    "Mark the plan as archived (or un-archive). Sets plan.archived_at to the current timestamp — UI sidebar/list filters can hide archived plans without losing the on-disk record. Reversible via archive=false.",
+    {
+      plan_id: z
+        .string()
+        .optional()
+        .describe("Plan id. Defaults to the owner's current plan."),
+      archive: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true (default), set archived_at. When false, clear it (un-archive).",
+        ),
+    },
+    async ({ plan_id, archive }) => {
+      const r = await resolvePlan(plan_id);
+      if ("error" in r) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: r.error }],
+        };
+      }
+      const out = await archivePlan({
+        planId: r.plan.id,
+        archive: archive !== false,
+      });
+      if (!out.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: out.error.message }],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: out.plan.archived_at
+              ? `Archived plan at ${out.plan.archived_at}.`
+              : "Un-archived plan.",
+          },
+        ],
+      };
+    },
+  );
+
   return createSdkMcpServer({
     name: LEADER_MCP_SERVER_NAME,
     version: "0.1.0",
-    tools: [readPlanState, listNotes, readDiff, recordSharedContext],
+    tools: [
+      readPlanState,
+      listNotes,
+      readDiff,
+      recordSharedContext,
+      mergePlan,
+      runIntegrationReviewTool,
+      cleanupWorktrees,
+      archivePlanTool,
+    ],
   });
 }
 

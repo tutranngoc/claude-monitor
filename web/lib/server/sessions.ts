@@ -28,12 +28,15 @@ import {
   SUBMIT_NOTE_FQN,
 } from "./notes-mcp";
 import {
+  ARCHIVE_PLAN_FQN,
   createLeaderMcpServer,
   LEADER_LIST_NOTES_FQN,
   LEADER_MCP_SERVER_NAME,
+  MERGE_PLAN_FQN,
   READ_PHASE_DIFF_FQN,
   READ_PLAN_STATE_FQN,
   RECORD_SHARED_CONTEXT_FQN,
+  RUN_INTEGRATION_REVIEW_FQN,
 } from "./leader-mcp";
 import {
   deleteStoredSession,
@@ -623,16 +626,19 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
     if (toolName === SUBMIT_NOTE_FQN || toolName === LIST_NOTES_FQN) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
-    // Leader tools are read-only snapshots over plan.json + git diffs
-    // in worktrees the owner already approved, plus record_shared_context
-    // which writes a single string field on plan.json. No surface beyond
-    // plan-scoped data the owner already controls — auto-allow alongside
-    // the other plan-orchestration tools.
+    // Leader read tools + plan-scoped writes (shared brief, merge,
+    // integration review, archive flag) auto-allow — they touch plan.json
+    // and the integration branch the owner already controls. Cleanup
+    // (cleanup_worktrees) intentionally falls through to the user
+    // dialog because it deletes worktree dirs and phase branches.
     if (
       toolName === READ_PLAN_STATE_FQN ||
       toolName === LEADER_LIST_NOTES_FQN ||
       toolName === READ_PHASE_DIFF_FQN ||
-      toolName === RECORD_SHARED_CONTEXT_FQN
+      toolName === RECORD_SHARED_CONTEXT_FQN ||
+      toolName === MERGE_PLAN_FQN ||
+      toolName === RUN_INTEGRATION_REVIEW_FQN ||
+      toolName === ARCHIVE_PLAN_FQN
     ) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }

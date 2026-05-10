@@ -265,6 +265,16 @@ export interface PlanRecord {
   // wave expansion mid-run; on unpause the cascade re-evaluates and
   // drains the queue up to the cap.
   paused?: boolean;
+  // Set by `cleanupPlanWorktrees` (leader's cleanup_worktrees MCP tool
+  // or, eventually, a UI button). Stamps when the post-merge tear-down
+  // ran so subsequent attempts can no-op gracefully and the UI can
+  // surface "tore down 5 worktrees on <date>". Worktrees + branches are
+  // gone; the plan record stays for inspectability.
+  worktrees_cleaned_at?: string;
+  // Set by `archivePlan` so the sidebar / plan list can hide finished
+  // plans without losing the on-disk record. Reversible — clear via
+  // the same tool with archive=false.
+  archived_at?: string;
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;
