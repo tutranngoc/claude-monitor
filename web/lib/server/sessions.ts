@@ -885,6 +885,12 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       cwd: init.cwd,
       env: { ...process.env, CLAUDE_CONFIG_DIR: init.configDir },
       ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
+      // Without this, the Agent SDK uses an empty/agent-flavored system
+      // prompt and the session loses Claude Code's tone guidelines,
+      // environment block (cwd/OS/git), tool tactics, and CLAUDE.md
+      // dynamic injection — output drifts toward generic Claude. Opt
+      // in to match the `claude` CLI.
+      systemPrompt: { type: "preset", preset: "claude_code" },
       permissionMode: init.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK
