@@ -285,8 +285,13 @@ export function ChatPanel({ session }: Props) {
       }
       // Try to extend a tool-run starting at i. Pattern: a leading
       // tool_asst, then any alternation of tool_user / tool_asst (skip
-      // entries pass through transparently). The streak ends at the
-      // first "other" (a real text turn or a system message we surface).
+      // entries pass through transparently). A pure-text assistant
+      // turn ("Now let me check the config…") gets folded INTO the
+      // streak iff another tool_asst follows within the same window —
+      // that interstitial commentary is part of the same investigation
+      // and forcing it to break a run leaves a forest of tiny groups
+      // standing next to each other. Real user input ends the run
+      // unconditionally (that's a new query).
       if (klass[i] === "tool_asst") {
         let end = i + 1;
         let toolTurns = 1;
@@ -300,6 +305,26 @@ export function ChatPanel({ session }: Props) {
             if (c === "tool_asst") toolTurns++;
             end++;
             continue;
+          }
+          // c === "other". Lookahead: if this is an assistant-only-
+          // text turn AND a tool_asst still follows (ignoring skip),
+          // absorb it into the run. User-text "other" stops the
+          // streak — the user is talking, not Claude.
+          if (chat.history[end].type === "assistant") {
+            let look = end + 1;
+            while (
+              look < chat.history.length &&
+              klass[look] === "skip"
+            ) {
+              look++;
+            }
+            if (
+              look < chat.history.length &&
+              klass[look] === "tool_asst"
+            ) {
+              end++;
+              continue;
+            }
           }
           break;
         }
