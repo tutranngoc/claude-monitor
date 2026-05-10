@@ -8,7 +8,36 @@ import type {
   PlanRecord,
   WorktreeInfo,
 } from "@/lib/plan-types";
+import { DEFAULT_MAX_CONCURRENT } from "@/lib/plan-types";
 import { updatePlan } from "@/lib/server/plans";
+
+// Returns the live concurrent-phase count: phase_sessions whose
+// commit_status is NOT terminal. Failed commits free their slot — the
+// agent isn't running anymore; the user can retry /complete to drive
+// dependents but doesn't need a worker-pool seat to do it. clean and
+// committed are also terminal: the phase finished its work.
+//
+// Note: errored sessions (claude binary crashed, network failure)
+// haven't yet had their /complete called and so still register as
+// active. This is conservative — they're occupying a worktree and a
+// reserved account, even though no live process is burning quota. The
+// user has a "restart phase" button to convert errored → fresh, which
+// keeps the slot occupied (correct) while reviving execution.
+export function activePhaseCount(plan: PlanRecord): number {
+  if (!plan.phase_sessions) return 0;
+  let count = 0;
+  for (const s of plan.phase_sessions) {
+    const cs = s.commit_status;
+    if (cs !== "clean" && cs !== "committed" && cs !== "failed") count++;
+  }
+  return count;
+}
+
+export function effectiveMaxConcurrent(plan: PlanRecord): number {
+  return plan.max_concurrent && plan.max_concurrent > 0
+    ? plan.max_concurrent
+    : DEFAULT_MAX_CONCURRENT;
+}
 import {
   createSession,
   sendMessage,
@@ -275,15 +304,24 @@ export function spawnPhaseFromPending(
 // and mutates the plan in place: pending → phase_sessions. Returns the
 // list of newly-spawned slugs so the caller can log/return them.
 //
+// Worker-pool throttle: respects `plan.max_concurrent` (default 5).
+// Phases whose deps cleared but whose spawn would push active count
+// past the cap stay in `pending_phases` — they'll be picked up on the
+// next /complete (which frees a slot). Phases blocked on `plan.paused`
+// also stay pending; on unpause the next call drains them up to the cap.
+//
 // Iterative: a single call may release a small wave (e.g. two phases
 // both blocked only on the just-committed phase). Does NOT cascade
 // across multiple commits — that comes from successive /complete
 // invocations, each calling this helper.
 export function spawnReadyPending(plan: PlanRecord): string[] {
   if (!plan.pending_phases || plan.pending_phases.length === 0) return [];
+  if (plan.paused) return [];
   const phaseBySlug = new Map(plan.phases.map((p) => [p.slug, p]));
   if (!plan.phase_sessions) plan.phase_sessions = [];
 
+  const cap = effectiveMaxConcurrent(plan);
+  let active = activePhaseCount(plan);
   const stillPending: PhasePending[] = [];
   const newlySpawned: string[] = [];
   // Single pass — depsBlocking is computed against plan.phase_sessions
@@ -306,10 +344,19 @@ export function spawnReadyPending(plan: PlanRecord): string[] {
       stillPending.push(pending);
       continue;
     }
+    if (active >= cap) {
+      // Deps clear but the worker pool is full. Hold the phase in
+      // `pending_phases`; the next /complete will free a slot and
+      // re-evaluate. Order in `pending_phases` is preserved so the
+      // user's plan ordering acts as a tiebreaker among ready phases.
+      stillPending.push(pending);
+      continue;
+    }
     try {
       const link = spawnPhaseFromPending(plan, phase, pending);
       plan.phase_sessions.push(link);
       newlySpawned.push(pending.phase_slug);
+      active++;
     } catch (err) {
       // One bad spawn shouldn't trap others. Leave this phase pending
       // — user can retry by re-running /complete on its blocking dep

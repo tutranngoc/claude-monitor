@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from "react";
@@ -15,12 +16,15 @@ import {
   ChevronRight,
   Clock,
   GitCommit,
+  BookText,
   GitMerge,
   KanbanSquare,
   Loader2,
   Megaphone,
   MessageSquareText,
   Network,
+  Pause,
+  Play,
   RotateCw,
   ScanLine,
   ShieldCheck,
@@ -38,6 +42,10 @@ import type {
   PlanRecord,
   ReviewFinding,
   ReviewSeverity,
+} from "@/lib/plan-types";
+import {
+  DEFAULT_MAX_CONCURRENT,
+  MAX_MAX_CONCURRENT,
 } from "@/lib/plan-types";
 import type {
   ContextUsageBreakdown,
@@ -254,6 +262,49 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [notesOpen, setNotesOpen] = useState<boolean>(
     (initialPlan.notes ?? []).some((n) => !n.dismissed_at),
   );
+  // Plan-level shared brief — sibling UI to the leader's
+  // mcp__leader__record_shared_context tool. Both write to
+  // plan.shared_brief on disk; the poll below mirrors back so an edit
+  // through MCP shows up in the panel within ~3s, and vice versa.
+  const [sharedBrief, setSharedBrief] = useState<string>(
+    initialPlan.shared_brief ?? "",
+  );
+  const [sharedBriefUpdatedAt, setSharedBriefUpdatedAt] = useState<
+    string | undefined
+  >(initialPlan.shared_brief_updated_at);
+  const [sharedBriefSaving, setSharedBriefSaving] = useState(false);
+  const [sharedBriefError, setSharedBriefError] = useState<string | undefined>(
+    undefined,
+  );
+  // Ref tracks the in-flight save so the polling refetchPlan callback
+  // can skip mirroring during a write — closure-captured `sharedBriefSaving`
+  // would be stale across the polling tick. Updated synchronously alongside
+  // the state setter.
+  const sharedBriefSavingRef = useRef(false);
+  // Default-collapsed when no brief yet; default-open when one already
+  // exists so resumed plans surface their context anchors immediately.
+  const [sharedBriefOpen, setSharedBriefOpen] = useState<boolean>(
+    !!initialPlan.shared_brief,
+  );
+  // Worker-pool controls. `maxConcurrent` mirrors plan.max_concurrent
+  // (undefined → DEFAULT_MAX_CONCURRENT); `paused` mirrors plan.paused.
+  // The PoolControls header strip writes to /settings; the cascade in
+  // the /complete route reads these to decide whether to spawn next
+  // phases. The poll mirrors back so MCP-driven edits (none today, but
+  // possible) or other-tab edits propagate.
+  const [maxConcurrent, setMaxConcurrent] = useState<number>(
+    initialPlan.max_concurrent ?? DEFAULT_MAX_CONCURRENT,
+  );
+  const [paused, setPaused] = useState<boolean>(!!initialPlan.paused);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | undefined>(
+    undefined,
+  );
+  // Same pattern as sharedBriefSavingRef — refetchPlan is closed over
+  // its initial state, so we use a ref to skip mirroring while a save
+  // is in flight (otherwise the cap input flickers back to the
+  // pre-save value mid-write).
+  const settingsSavingRef = useRef(false);
   // Dismiss a note (or restore a dismissed one). Optimistic — the local
   // mirror flips immediately; a failed POST rolls back the timestamp.
   // The poll below would eventually overwrite either way, but rolling
@@ -293,6 +344,100 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         }
       } catch {
         setPhaseNotes(before);
+      }
+    },
+    [planIdForFetch],
+  );
+  // Save the shared brief. Optimistic on the server-confirmed timestamp:
+  // we keep the user's textarea contents authoritative until the POST
+  // resolves, then stamp updated_at from the response. Unlike
+  // handleDismissNote we don't need a rollback path — the textarea
+  // already shows what the user typed, and on failure we surface an
+  // inline error rather than reverting their input.
+  const handleSaveSharedBrief = useCallback(
+    async (body: string) => {
+      sharedBriefSavingRef.current = true;
+      setSharedBriefSaving(true);
+      setSharedBriefError(undefined);
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(planIdForFetch)}/shared-brief`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ body }),
+          },
+        );
+        if (!res.ok) {
+          const data = (await res.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          setSharedBriefError(data.error ?? `save failed (${res.status})`);
+          return;
+        }
+        const data = (await res.json()) as { plan: PlanRecord };
+        // Mirror back from server so updated_at reflects the canonical
+        // timestamp; sharedBrief content is the same string we just sent
+        // (trim happens server-side, so it may be slightly different).
+        setSharedBrief(data.plan.shared_brief ?? "");
+        setSharedBriefUpdatedAt(data.plan.shared_brief_updated_at);
+      } catch (err) {
+        setSharedBriefError(
+          err instanceof Error ? err.message : "save failed",
+        );
+      } finally {
+        sharedBriefSavingRef.current = false;
+        setSharedBriefSaving(false);
+      }
+    },
+    [planIdForFetch],
+  );
+  // Worker-pool settings save. Patches `max_concurrent` and/or `paused`
+  // on the plan via /settings. Server returns the updated plan plus the
+  // list of slugs the cap-bump or unpause just released — we mirror
+  // pending_phases / phase_sessions back from the response so the
+  // cascade-released phases show up immediately rather than waiting
+  // ~3s for the next poll.
+  const handleSetSettings = useCallback(
+    async (patch: { maxConcurrent?: number | null; paused?: boolean }) => {
+      settingsSavingRef.current = true;
+      setSettingsSaving(true);
+      setSettingsError(undefined);
+      try {
+        const res = await fetch(
+          `/api/plans/${encodeURIComponent(planIdForFetch)}/settings`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...("maxConcurrent" in patch
+                ? { max_concurrent: patch.maxConcurrent }
+                : {}),
+              ...("paused" in patch ? { paused: patch.paused } : {}),
+            }),
+          },
+        );
+        if (!res.ok) {
+          const data = (await res.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          setSettingsError(data.error ?? `save failed (${res.status})`);
+          return;
+        }
+        const data = (await res.json()) as { plan: PlanRecord };
+        setMaxConcurrent(
+          data.plan.max_concurrent ?? DEFAULT_MAX_CONCURRENT,
+        );
+        setPaused(!!data.plan.paused);
+        setPendingPhases(data.plan.pending_phases ?? []);
+        setPhaseSessions(data.plan.phase_sessions ?? []);
+      } catch (err) {
+        setSettingsError(
+          err instanceof Error ? err.message : "save failed",
+        );
+      } finally {
+        settingsSavingRef.current = false;
+        setSettingsSaving(false);
       }
     },
     [planIdForFetch],
@@ -366,6 +511,21 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         // Phases.depends_on now mutates via /deps PATCH. The poll is
         // also where another tab's edit becomes visible to this one.
         setPhases(next.phases);
+        // Shared brief mirrors what the leader's MCP tool wrote — the
+        // panel stays read-aligned with disk even when an MCP edit
+        // happened from a leader chat the user isn't currently looking at.
+        // Skip the mirror while a save is in flight: the optimistic
+        // local value is already what the user wants, and overwriting
+        // with the pre-save server state mid-write would flicker the
+        // textarea contents back. The post-save handler re-syncs.
+        if (!sharedBriefSavingRef.current) {
+          setSharedBrief(next.shared_brief ?? "");
+          setSharedBriefUpdatedAt(next.shared_brief_updated_at);
+        }
+        if (!settingsSavingRef.current) {
+          setMaxConcurrent(next.max_concurrent ?? DEFAULT_MAX_CONCURRENT);
+          setPaused(!!next.paused);
+        }
       } catch {
         // ignore; tick again
       }
@@ -831,6 +991,15 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         </div>
         <div className="flex shrink-0 items-center gap-2 text-xs">
           <ViewToggle value={view} onChange={handleSetView} />
+          <PoolControls
+            maxConcurrent={maxConcurrent}
+            paused={paused}
+            running={counters.running}
+            queued={pendingPhases.length}
+            saving={settingsSaving}
+            error={settingsError}
+            onSet={handleSetSettings}
+          />
           <Counter label="running" value={counters.running} tone="amber" />
           <Counter label="awaiting" value={counters.awaiting} tone="blue" />
           <Counter label="done" value={counters.done} tone="emerald" />
@@ -868,6 +1037,16 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         }
         onIntegrationReview={handleIntegrationReview}
         integrationReviewPending={integrationReviewPending}
+      />
+
+      <SharedBriefPanel
+        body={sharedBrief}
+        updatedAt={sharedBriefUpdatedAt}
+        open={sharedBriefOpen}
+        onToggle={() => setSharedBriefOpen((v) => !v)}
+        onSave={handleSaveSharedBrief}
+        saving={sharedBriefSaving}
+        error={sharedBriefError}
       />
 
       <NotesPanel
@@ -2286,6 +2465,178 @@ function MergeResultChip({ result }: { result: PhaseMergeResult }) {
   );
 }
 
+// SharedBriefPanel surfaces the plan-level shared brief. Mirror of the
+// leader's mcp__leader__record_shared_context tool — both edit the same
+// plan.shared_brief on disk. Frozen-at-spawn semantics matter: phases
+// already running do NOT pick up edits, only phases spawned after the
+// save. The panel surfaces this in a small caveat below the textarea
+// so the user isn't surprised when a running phase ignores fresh content.
+//
+// Collapsed by default for empty plans; auto-open when a brief already
+// exists so resumed plans surface their context anchors immediately.
+const SHARED_BRIEF_BYTE_CAP = 8 * 1024;
+function SharedBriefPanel({
+  body,
+  updatedAt,
+  open,
+  onToggle,
+  onSave,
+  saving,
+  error,
+}: {
+  body: string;
+  updatedAt?: string;
+  open: boolean;
+  onToggle: () => void;
+  onSave: (body: string) => Promise<void> | void;
+  saving: boolean;
+  error?: string;
+}) {
+  // Local draft. Decoupled from the persisted body so the user can edit
+  // without every keystroke racing the poll. Sync down whenever the
+  // committed body changes (server wrote, MCP tool wrote, plan reload).
+  const [draft, setDraft] = useState(body);
+  // Track the last value we synced from props so we can distinguish
+  // "props updated because the user just saved" (don't overwrite local
+  // draft if equal) vs "props updated by external write" (overwrite).
+  const lastSyncedRef = useRef(body);
+  useEffect(() => {
+    if (body !== lastSyncedRef.current) {
+      lastSyncedRef.current = body;
+      setDraft(body);
+    }
+  }, [body]);
+  const dirty = draft !== body;
+  const overCap = draft.length > SHARED_BRIEF_BYTE_CAP;
+  const handleSave = async () => {
+    if (saving || overCap) return;
+    await onSave(draft);
+  };
+  const handleClear = async () => {
+    if (saving) return;
+    setDraft("");
+    await onSave("");
+  };
+  return (
+    <div className="border-b bg-sky-500/5 px-6 py-2 text-xs">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <BookText className="size-3.5 text-sky-500" aria-hidden />
+        <span className="font-medium uppercase tracking-wide">
+          Shared brief
+        </span>
+        {body.length > 0 ? (
+          <span className="rounded-full bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-sky-600 dark:text-sky-300">
+            {body.length}b
+          </span>
+        ) : (
+          <span className="font-mono text-[10px] uppercase text-muted-foreground/70">
+            empty
+          </span>
+        )}
+        {!open && body.length > 0 && (
+          <span className="min-w-0 flex-1 truncate text-foreground/70">
+            {body.replace(/\s+/g, " ").slice(0, 140)}
+          </span>
+        )}
+        {open ? (
+          <ChevronDown className="ml-auto size-3.5" aria-hidden />
+        ) : (
+          <ChevronRight className="ml-auto size-3.5" aria-hidden />
+        )}
+      </button>
+      {open && (
+        <div className="mt-2 pb-1">
+          <p className="mb-1.5 text-[11px] text-muted-foreground">
+            Plan-level anchors every <em>future</em> phase splices into its
+            kickoff prompt. Use it for file paths, conventions, contracts,
+            and gotchas you have already discovered. Phases already running
+            will not pick up edits — only phases spawned after Save.
+          </p>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            spellCheck={false}
+            placeholder="e.g. Auth lives in web/lib/auth/. SDK rate-limit info uses Unix-seconds. The merge branch is integration/<plan-short>."
+            className={cn(
+              "block w-full resize-y rounded-md border bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed shadow-sm focus:outline-none focus:ring-2",
+              overCap
+                ? "border-destructive/60 focus:ring-destructive/40"
+                : "border-sky-500/30 focus:ring-sky-500/40",
+            )}
+            rows={Math.min(20, Math.max(6, draft.split("\n").length + 1))}
+          />
+          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
+            <span
+              className={cn(
+                "tabular-nums",
+                overCap && "text-destructive",
+                !overCap &&
+                  draft.length > SHARED_BRIEF_BYTE_CAP * 0.8 &&
+                  "text-amber-600 dark:text-amber-400",
+              )}
+            >
+              {draft.length} / {SHARED_BRIEF_BYTE_CAP} bytes
+            </span>
+            {updatedAt && (
+              <span className="opacity-70">· last saved {updatedAt}</span>
+            )}
+            {dirty && !saving && (
+              <span className="text-amber-600 dark:text-amber-400">
+                · unsaved changes
+              </span>
+            )}
+            {error && (
+              <span className="text-destructive">· {error}</span>
+            )}
+            <div className="ml-auto flex items-center gap-1.5">
+              {body.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleClear}
+                  disabled={saving}
+                  className="inline-flex items-center gap-1 rounded border border-destructive/30 bg-destructive/5 px-2 py-0.5 text-[10px] font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                  title="Clear the shared brief — running phases keep what they were spawned with"
+                >
+                  Clear
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving || overCap || !dirty}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-50",
+                  "border-sky-500/40 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 dark:text-sky-300",
+                )}
+                title={
+                  overCap
+                    ? "Body exceeds 8 KB cap"
+                    : !dirty
+                      ? "No changes to save"
+                      : "Save — affects future phase spawns only"
+                }
+              >
+                {saving ? (
+                  <>
+                    <Loader2 className="size-3 animate-spin" aria-hidden />
+                    saving
+                  </>
+                ) : (
+                  "Save"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // NotesPanel surfaces the phase_notes broadcast log. Phases write via
 // the submit_phase_note MCP tool; the plan-record poll above picks them
 // up. Collapsible because the list grows over the plan's lifetime —
@@ -2570,6 +2921,134 @@ function formatNoteTime(iso: string): string {
   if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
   if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
   return new Date(t).toLocaleString();
+}
+
+// PoolControls bundles the worker-pool affordances into one compact
+// header strip: pause toggle, max-concurrent input, and a `running/cap`
+// readout with a queued-count pill when phases are throttled. The cap
+// input commits on blur or Enter so a user typing "12" doesn't fire
+// three POSTs as they pass 1 → 12. Paused state turns the running
+// readout amber so the user spots a stalled cascade at a glance.
+function PoolControls({
+  maxConcurrent,
+  paused,
+  running,
+  queued,
+  saving,
+  error,
+  onSet,
+}: {
+  maxConcurrent: number;
+  paused: boolean;
+  running: number;
+  queued: number;
+  saving: boolean;
+  error?: string;
+  onSet: (patch: {
+    maxConcurrent?: number | null;
+    paused?: boolean;
+  }) => void | Promise<void>;
+}) {
+  // Uncontrolled input — keyed on `maxConcurrent` so a server-side
+  // change (poll, MCP edit, other tab) re-mounts the input with the
+  // fresh value. Avoids the setState-in-effect pattern React 19 lint
+  // forbids while still tracking persisted value out of band. We read
+  // .value at commit time rather than mirroring every keystroke.
+  const inputRef = useRef<HTMLInputElement>(null);
+  const commitCap = () => {
+    const raw = inputRef.current?.value ?? "";
+    const n = parseInt(raw, 10);
+    if (
+      !Number.isFinite(n) ||
+      !Number.isInteger(n) ||
+      n < 1 ||
+      n > MAX_MAX_CONCURRENT
+    ) {
+      // Revert visually; the inline error would lag behind blur.
+      if (inputRef.current) inputRef.current.value = String(maxConcurrent);
+      return;
+    }
+    if (n === maxConcurrent) return;
+    void onSet({ maxConcurrent: n });
+  };
+  const overCap = running > maxConcurrent;
+  const stalled = paused || (queued > 0 && running >= maxConcurrent);
+  return (
+    <div
+      className="inline-flex items-center gap-1.5 rounded-md border bg-muted/30 px-1.5 py-0.5 font-mono text-[11px]"
+      title={
+        paused
+          ? "Paused — no new phases will spawn even when deps clear"
+          : `Worker pool: ${running} running, ${queued} queued, cap ${maxConcurrent}`
+      }
+    >
+      <button
+        type="button"
+        onClick={() => void onSet({ paused: !paused })}
+        disabled={saving}
+        className={cn(
+          "inline-flex items-center gap-1 rounded px-1 py-0.5 transition-colors disabled:opacity-50",
+          paused
+            ? "bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-300"
+            : "text-muted-foreground hover:bg-muted hover:text-foreground",
+        )}
+        aria-pressed={paused}
+        title={paused ? "Resume cascade" : "Pause cascade (running phases keep going)"}
+      >
+        {paused ? (
+          <Play className="size-3" aria-hidden />
+        ) : (
+          <Pause className="size-3" aria-hidden />
+        )}
+        <span>{paused ? "paused" : "pause"}</span>
+      </button>
+      <span
+        className={cn(
+          "tabular-nums",
+          stalled
+            ? "text-amber-600 dark:text-amber-300"
+            : "text-muted-foreground",
+          overCap && "text-destructive",
+        )}
+      >
+        {running}/
+      </span>
+      <input
+        ref={inputRef}
+        key={maxConcurrent}
+        type="number"
+        inputMode="numeric"
+        min={1}
+        max={MAX_MAX_CONCURRENT}
+        defaultValue={maxConcurrent}
+        onBlur={commitCap}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            (e.target as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            (e.target as HTMLInputElement).value = String(maxConcurrent);
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        disabled={saving}
+        className="w-10 rounded border bg-background px-1 py-0.5 text-center tabular-nums focus:outline-none focus:ring-1 focus:ring-primary/40 disabled:opacity-50"
+        title="Max concurrent phases. Enter to commit."
+      />
+      {queued > 0 && (
+        <span
+          className="rounded-full bg-amber-500/15 px-1.5 py-0 text-[10px] tabular-nums text-amber-700 dark:text-amber-300"
+          title={`${queued} pending phases (deps-blocked or throttled)`}
+        >
+          q{queued}
+        </span>
+      )}
+      {error && (
+        <span className="text-destructive" title={error}>
+          !
+        </span>
+      )}
+    </div>
+  );
 }
 
 // ViewToggle is a 2-button segmented control for kanban / dag. Sits in

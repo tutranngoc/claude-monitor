@@ -6,6 +6,16 @@
 
 import type { Effort, PermissionMode } from "./chat-types";
 
+// Default cap when plan.max_concurrent is unset. Picked to match the
+// orchestrator's "small fleet of phases the user can actually keep
+// track of" mental model — going above this risks UI overwhelm and
+// account/process exhaustion. User can override per plan.
+export const DEFAULT_MAX_CONCURRENT = 5;
+// Hard ceiling on user-set max_concurrent. The cap protects against an
+// accidental three-digit input and from a runaway plan with hundreds of
+// no-deps phases all spawning at once.
+export const MAX_MAX_CONCURRENT = 50;
+
 export interface Phase {
   slug: string;
   title: string;
@@ -241,6 +251,20 @@ export interface PlanRecord {
   // time; phases spawned after the rewrite see the new content.
   shared_brief?: string;
   shared_brief_updated_at?: string;
+  // Worker-pool throttle. Caps how many phases can have a live spawned
+  // session at once (commit_status ∉ {clean, committed, failed}). The
+  // cascade (`spawnReadyPending`) will leave deps-ready phases sitting
+  // in `pending_phases` when running phases >= cap, draining as each
+  // /complete frees a slot. Default DEFAULT_MAX_CONCURRENT (5) when
+  // unset; users can override per-plan from the PhaseBoard header. The
+  // 8-OAuth-account fleet doesn't enforce a hard upper bound, so the
+  // worst-case "100 phases, no deps" plan can no longer melt the host.
+  max_concurrent?: number;
+  // When true, `spawnReadyPending` refuses to spawn ANY new phases —
+  // existing running phases keep going. Toggle from the UI to halt
+  // wave expansion mid-run; on unpause the cascade re-evaluates and
+  // drains the queue up to the cap.
+  paused?: boolean;
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;
