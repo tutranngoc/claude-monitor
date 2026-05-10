@@ -4,6 +4,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Check, CircleDashed, Loader2 } from "lucide-react";
 import { Markdown } from "@/components/markdown/markdown";
 import type { StreamingBlock } from "@/lib/chat-types";
+import { parseCliEnvelope } from "@/lib/cli-envelope";
 import { isSubagentDispatchTool } from "@/lib/subagents";
 import { cn } from "@/lib/utils";
 import { SubagentCard } from "./subagent-card";
@@ -110,35 +111,25 @@ function messageKey(msg: SDKMessage, idx: number): string {
   return `${msg.type}:${idx}`;
 }
 
-// Strip Claude CLI's command-output markers so synthetic user messages
-// (emitted on /model, /effort, etc.) render as small inline notices
-// instead of regular user bubbles. Returns null if the string was
-// command output but had no inner text (treat as silent), the inner
-// text if it was, and undefined if it's a regular user message.
-function parseCommandOutput(s: string): string | null | undefined {
-  const m = /^<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/.exec(
-    s.trim(),
-  );
-  if (!m) return undefined;
-  const inner = m[1].trim();
-  return inner ? inner : null;
-}
-
 function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
   const content = msg.message.content;
   if (typeof content === "string") {
-    const cmd = parseCommandOutput(content);
-    if (cmd === null) return null;
-    if (cmd !== undefined) {
+    // Claude CLI wraps slash commands and local command output in
+    // synthetic <command-name>/<local-command-stdout>/... envelopes.
+    // Pure-envelope messages render as a small inline notice; mixed
+    // messages (envelope + prose) render the stripped prose.
+    const env = parseCliEnvelope(content);
+    if (env.kind === "silent") return null;
+    if (env.kind === "notice") {
       return (
         <div className="text-center text-xs text-muted-foreground italic">
-          {cmd}
+          {env.label}
         </div>
       );
     }
     return (
       <div className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground">
-        {content}
+        {env.text}
       </div>
     );
   }
@@ -149,12 +140,24 @@ function UserBubble({ msg }: { msg: Extract<SDKMessage, { type: "user" }> }) {
     <div className="space-y-1.5">
       {content.map((block, i) => {
         if (block.type === "text") {
+          const env = parseCliEnvelope(block.text);
+          if (env.kind === "silent") return null;
+          if (env.kind === "notice") {
+            return (
+              <div
+                key={i}
+                className="text-center text-xs text-muted-foreground italic"
+              >
+                {env.label}
+              </div>
+            );
+          }
           return (
             <div
               key={i}
               className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
             >
-              {block.text}
+              {env.text}
             </div>
           );
         }
