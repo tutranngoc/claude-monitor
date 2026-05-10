@@ -467,7 +467,7 @@ export function ChatPanel({ session }: Props) {
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
               permMode={permissionMode}
-              onPermModeChange={(m) => void patchOptions({ permission_mode: m })}
+              onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
               disabled={closed}
               usage={liveUsage}

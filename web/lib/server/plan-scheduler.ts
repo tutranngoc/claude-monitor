@@ -207,11 +207,19 @@ export function spawnPhaseSession(input: SpawnPhaseSessionInput): PhaseSession {
 }
 
 // restartPhaseSession tears down a phase's current chat session and
-// spawns a fresh one in the same worktree, with the same configDir/
-// account, replaying the kickoff prompt. Shared by the manual restart
-// route and the rate-limit-reset watchdog so both paths follow the
-// same sequence: snapshot prev runtime config → stop old session →
-// spawn fresh → patch the on-disk plan in one atomic mutate.
+// spawns a fresh one in the same worktree, replaying the kickoff
+// prompt. Shared by the manual restart route and the rate-limit-reset
+// watchdog so both paths follow the same sequence: snapshot prev
+// runtime config → stop old session → spawn fresh → patch the on-disk
+// plan in one atomic mutate.
+//
+// `accountOverride` swaps the phase onto a different account in the
+// daemon pool — used when rl-watchdog detects a long rate-limit (>30m)
+// and decides to migrate the phase rather than waiting for the bucket
+// to refill. When omitted we reuse `link.account_name` / `config_dir`,
+// preserving today's behavior. The previous account is appended to
+// `account_attempts` on the resulting PhaseSession so future swaps
+// don't cycle back to a known-exhausted account.
 //
 // Caller is responsible for refusing to restart a phase whose
 // commit_status is already terminal (clean / committed) — the route
@@ -222,8 +230,9 @@ export async function restartPhaseSession(input: {
   phase: Phase;
   link: PhaseSession;
   worktree: WorktreeInfo;
+  accountOverride?: { configDir: string; accountName: string };
 }): Promise<{ plan: PlanRecord; link: PhaseSession }> {
-  const { plan, phase, link, worktree } = input;
+  const { plan, phase, link, worktree, accountOverride } = input;
 
   // Recover the previous run's runtime config so the restart matches
   // what was running before. snapshotSession serves both live and
@@ -252,12 +261,23 @@ export async function restartPhaseSession(input: {
     phase,
     worktreePath: worktree.path,
     worktreeBranch: worktree.branch,
-    configDir: link.config_dir,
-    accountName: link.account_name,
+    configDir: accountOverride?.configDir ?? link.config_dir,
+    accountName: accountOverride?.accountName ?? link.account_name,
     permissionMode: prevPermissionMode,
     model: prevModel,
     effort: prevEffort,
   });
+
+  // Carry the burnt-account history forward so a subsequent swap
+  // doesn't reach for one we've already exhausted on this phase. We
+  // dedupe but preserve order: oldest-tried first.
+  if (accountOverride && link.account_name) {
+    const prior = link.account_attempts ?? [];
+    const merged = Array.from(new Set([...prior, link.account_name]));
+    fresh.account_attempts = merged;
+  } else if (link.account_attempts && link.account_attempts.length > 0) {
+    fresh.account_attempts = link.account_attempts.slice();
+  }
 
   const updated = await updatePlan(plan.cwd, plan.id, (p) => {
     if (!p.phase_sessions) return;

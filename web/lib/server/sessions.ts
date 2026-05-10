@@ -311,6 +311,21 @@ async function rehydratePhaseSessions(): Promise<void> {
 
 const PERSIST_DEBOUNCE_MS = 500;
 
+// Appended to every owner/leader session's system prompt. Default
+// behavior is unchanged — act like a normal Claude Code session. The
+// only addition is recognizing the explicit multi-phase directive the
+// composer's MultiPhaseToggle prepends to a user message.
+//
+// We deliberately don't teach the model to triage or volunteer the
+// multi-phase path on its own — the user has the toggle in the
+// composer for that. Phase sessions don't see this append: they have
+// a curated kickoff prompt and a single-purpose scope.
+const OWNER_TRIAGE_APPEND = `## Orchestrator: multi-phase directive
+
+This chat runs inside the claude-monitor orchestrator. By default behave as a normal Claude Code single-session agent — plan, edit, and run tools in this chat as usual.
+
+If a user message arrives with a leading \`<orchestrator-intent>multi-phase</orchestrator-intent>\` directive, the chat has already been flipped into Plan mode (\`permissionMode: "plan"\`) by the composer — Edit / Write / Bash file-modifying tools are blocked. Use the read-only window to research the codebase (Read, Grep, Glob), then draft the phases and call the \`mcp__plans__submit_plan\` MCP tool with them. \`submit_plan\` is auto-approved past Plan mode's read-only gate; it serves as your plan-mode exit and writes the structured plan into the orchestrator. After it returns, the user reviews and approves the plan in the chat panel; phase agents then spawn into their own git worktrees and this chat becomes the leader (\`mcp__leader__*\` tools). Without the directive, do NOT volunteer the multi-phase path or call \`submit_plan\`.`;
+
 // schedulePersist coalesces rapid changes (token deltas + history pushes
 // + status flips during a single turn) into one write. The first
 // schedule sets a 500ms timer; subsequent calls within that window reset
@@ -910,7 +925,17 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       // environment block (cwd/OS/git), tool tactics, and CLAUDE.md
       // dynamic injection — output drifts toward generic Claude. Opt
       // in to match the `claude` CLI.
-      systemPrompt: { type: "preset", preset: "claude_code" },
+      //
+      // For owner/leader sessions (no phaseSlug → there is no parent
+      // plan agent driving them) we append a triage instruction so the
+      // model offers the user an explicit single-vs-multi-phase choice
+      // before doing work. Phase sessions get a curated kickoff prompt
+      // and shouldn't see this.
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        ...(init.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
+      },
       permissionMode: init.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK

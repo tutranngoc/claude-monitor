@@ -302,7 +302,7 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
 
   const mergePlan = tool(
     MERGE_PLAN_TOOL_NAME,
-    "Fold every phase's wo/<plan>/<slug> branch into an integration branch (default 'main'). Mirrors the UI's Merge button. Gating: plan must be approved AND every phase must have commit_status ∈ {clean, committed} (failed commits abort with the offending slugs). Writes plan.merge_status / merge_results / merge_head_sha. Idempotent on a fully-merged plan: each phase reports 'skipped' and merge_status stays 'merged'. Re-running clears any prior integration_review_* fields since the diff range changed.",
+    "Fold every phase's wo/<plan>/<slug> branch into a feature integration branch. NEVER merges into a protected trunk — the server rejects 'main' / 'master' / 'develop' / 'trunk'. After this returns successfully you MUST push the integration branch and open a PR (e.g. `git push -u origin <branch>` then `gh pr create --base main --head <branch>`); the PR is the only path into trunk. Gating: plan must be approved AND every phase must have commit_status ∈ {clean, committed} (failed commits abort with the offending slugs). ALSO blocks when any phase has scope_violations (files committed outside its declared scope.files glob) unless its slug is in acknowledge_scope_violations — call mcp__leader__read_plan_state / mcp__leader__read_phase_diff to inspect violations first, decide whether the drift is intentional, then list the slugs you want to merge anyway. Writes plan.merge_status / merge_results / merge_head_sha. Idempotent on a fully-merged plan: each phase reports 'skipped' and merge_status stays 'merged'. Re-running clears any prior integration_review_* fields since the diff range changed.",
     {
       plan_id: z
         .string()
@@ -310,12 +310,17 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
         .describe("Plan id to merge. Defaults to the owner's current plan."),
       integration_branch: z
         .string()
+        .describe(
+          "Feature branch the phases get folded into. REQUIRED — there is no default. Must match [a-zA-Z0-9._-/]+ and must NOT be a protected trunk ('main', 'master', 'develop', 'trunk'). Convention: `integration/<plan-slug>` or `phase-merge/<topic>`.",
+        ),
+      acknowledge_scope_violations: z
+        .array(z.string())
         .optional()
         .describe(
-          "Branch to merge phases into. Defaults to 'main'. Must match [a-zA-Z0-9._-/]+.",
+          "Phase slugs whose scope_violations you've reviewed and are merging anyway. Required when ANY phase has scope_violations.length > 0. Per-slug, not blanket — only the listed phases get a free pass; any other phase with violations still blocks. Phases with no violations don't need entries here. Empty/omitted means no acknowledgments.",
         ),
     },
-    async ({ plan_id, integration_branch }) => {
+    async ({ plan_id, integration_branch, acknowledge_scope_violations }) => {
       const r = await resolvePlan(plan_id);
       if ("error" in r) {
         return {
@@ -325,7 +330,8 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
       }
       const out = await runMergeForPlan({
         planId: r.plan.id,
-        integrationBranch: integration_branch ?? "main",
+        integrationBranch: integration_branch,
+        acknowledgeScopeViolations: acknowledge_scope_violations,
       });
       if (!out.ok) {
         return {
@@ -512,6 +518,10 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
       }
       const updated = await updatePlan(plan.cwd, plan.id, (p) => {
         p.leader_session_id = ctx.sessionId;
+        // Adoption resolves the "leader unreachable" condition that
+        // last_nudge surfaces — the banner should disappear immediately,
+        // not wait for the next milestone nudge to overwrite it.
+        delete p.last_nudge;
       });
       ctx.bindCurrentPlan(updated);
       return {

@@ -29,6 +29,7 @@ import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
 import { ModePicker, type PermissionMode } from "./mode-picker";
+import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
 import { useGitBranch } from "@/hooks/use-git-branch";
 import { SlashCommandMenu } from "./slash-command-menu";
 
@@ -62,7 +63,12 @@ interface CommonProps {
   // wire it up just don't render the mode pill. Named permMode to
   // avoid colliding with the home|session discriminator on Props.
   permMode?: PermissionMode;
-  onPermModeChange?: (m: PermissionMode) => void;
+  // Returning a Promise lets callers await the actual server PATCH
+  // before continuing — the multi-phase flow needs the mode flip to
+  // land *before* the message arrives at the SDK so the leader's plan
+  // research is read-only-gated. Fire-and-forget callers (ModePicker)
+  // ignore the promise.
+  onPermModeChange?: (m: PermissionMode) => void | Promise<void>;
   // localStorage key for draft persistence. When provided, the
   // composer hydrates `text` from storage on mount + writes back on
   // every change (debounced) + clears the entry on successful submit.
@@ -105,6 +111,12 @@ export function Composer(props: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
+  // One-shot toggle: when true, the next message is prefixed with the
+  // multi-phase directive (see hintForMultiPhase) and the leader is
+  // expected to call submit_plan instead of editing files. Resets to
+  // false after submit so follow-up messages on the same task aren't
+  // re-tagged once the multi-phase flow is already running.
+  const [multiPhase, setMultiPhase] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // Guard against concurrent submits: a slow onSubmit + a quick
@@ -198,8 +210,34 @@ export function Composer(props: Props) {
     // forcing a write here keeps the storage in sync with what's
     // actually in the textarea (empty).
     if (props.draftKey) writeDraft(props.draftKey, "");
+    // Splice the multi-phase directive ahead of the user's text when
+    // the toggle is on. Slash commands (override path) bypass the
+    // prefix entirely since they're CLI directives, not natural-
+    // language tasks. Reset the toggle so the next message defaults
+    // back to single-session.
+    const isSlashOverride =
+      override !== undefined && override.trimStart().startsWith("/");
+    const hint = !isSlashOverride && multiPhase ? hintForMultiPhase() : null;
+    const finalText = hint ? `${hint}\n\n${textToSend}` : textToSend;
+    if (multiPhase) setMultiPhase(false);
     try {
-      await props.onSubmit({ text: textToSend, attachments: restoreAtt });
+      // Multi-phase flow: flip the session into permissionMode "plan"
+      // before the message arrives so the leader's research phase is
+      // read-only-gated (matches Claude Code CLI plan mode). submit_plan
+      // still runs because canUseTool auto-allows it past the read-only
+      // gate. Skip when already in plan mode or when no permMode plumbing
+      // exists (e.g. home composer pre-session). We deliberately don't
+      // restore the prior mode after approval — the leader keeps a
+      // read-only stance and the user can override via ModePicker.
+      if (
+        hint &&
+        props.permMode &&
+        props.permMode !== "plan" &&
+        props.onPermModeChange
+      ) {
+        await props.onPermModeChange("plan");
+      }
+      await props.onSubmit({ text: finalText, attachments: restoreAtt });
     } catch (e) {
       // Restore so the user keeps their draft on failure.
       setText(restoreText);
@@ -438,6 +476,7 @@ export function Composer(props: Props) {
               onChange={props.onPermModeChange}
             />
           )}
+          <MultiPhaseToggle active={multiPhase} onChange={setMultiPhase} />
           <ModelEffortPicker
             modelId={props.model}
             effort={props.effort}

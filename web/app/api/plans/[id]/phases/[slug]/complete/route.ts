@@ -165,8 +165,11 @@ export async function POST(_req: Request, { params }: Ctx) {
     }) &&
     (plan.pending_phases?.length ?? 0) === 0;
   if (allTerminalNow && !allTerminalBefore) {
-    void nudgeLeader({
+    // Awaited so plan.last_nudge persists before we respond; the next
+    // GET /api/plans/<id> sees the leader-unreachable banner state.
+    await nudgeLeader({
       planId: updated.id,
+      milestone: "all_committed",
       message: buildAllCommittedNudge(updated.title),
     });
   }

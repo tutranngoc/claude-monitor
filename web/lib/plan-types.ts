@@ -91,6 +91,13 @@ export interface PhaseSession {
   config_dir: string;
   account_name?: string;
   spawned_at: string;
+  // Account names this phase has burned through (rate-limit / auth
+  // exhaustion) before landing on the current `account_name`. The
+  // rl-watchdog's swap path appends here so a subsequent failure picks
+  // a different account from the daemon pool instead of cycling back to
+  // one we just walked away from. Always includes the current account
+  // as the last entry so failure paths can union with it cheaply.
+  account_attempts?: string[];
   commit_status?: PhaseCommitStatus;
   commit_sha?: string;
   committed_at?: string;
@@ -122,6 +129,16 @@ export interface PhaseSession {
   // Sha against which the review was run — typically HEAD at submit
   // time, but recorded so the user can replay the same diff later.
   review_base?: string;
+  // Account-exhaustion tracking. Bumped by rl-watchdog on every tick
+  // where `shouldSwap` was true but `pickSwapAccount` returned null
+  // (every active account is in the burnt set or the daemon pool is
+  // empty). Reset to 0 on a successful swap, restart, or when the
+  // phase reaches a terminal commit_status. Once it crosses
+  // EXHAUSTION_TICK_THRESHOLD the watchdog stamps `exhausted_at` and
+  // the UI banners — the phase is still alive, just blocked until an
+  // account opens up or a new one is added.
+  exhausted_attempts?: number;
+  exhausted_at?: string;
 }
 
 export type PhaseReviewStatus = "running" | "complete" | "failed";
@@ -311,4 +328,25 @@ export interface PlanRecord {
   integration_review_base?: string;
   integration_review_head?: string;
   integration_review_branch?: string;
+  // Last attempt by `nudgeLeader` to wake the owner/leader chat at a
+  // milestone (all phases committed / merged / integration review done).
+  // Persisted so the UI can render an "open a chat and adopt this plan"
+  // banner when delivery fails — otherwise the plan silently stalls when
+  // the user has closed the leader chat. Overwritten on each new attempt;
+  // we don't keep history because the banner only cares about current
+  // reachability. Cleared once the leader takes over (adopt_plan or a
+  // successful subsequent nudge).
+  last_nudge?: LastNudge;
+}
+
+export type NudgeMilestone =
+  | "all_committed"
+  | "merged"
+  | "integration_review_done";
+
+export interface LastNudge {
+  milestone: NudgeMilestone;
+  delivered: boolean;
+  reason?: string;
+  at: string;
 }

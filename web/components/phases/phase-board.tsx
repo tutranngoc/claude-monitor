@@ -213,6 +213,12 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [pendingRestartSlug, setPendingRestartSlug] = useState<string | null>(
     null,
   );
+  // Last leader-nudge attempt — surfaced as a banner when delivery
+  // failed (leader chat closed/errored/missing). Cleared on adopt_plan
+  // or overwritten by the next successful nudge.
+  const [lastNudge, setLastNudge] = useState<PlanRecord["last_nudge"]>(
+    initialPlan.last_nudge,
+  );
   // Mirror the plan's merge fields locally so the panel updates without
   // a route nav after POST /merge returns. Default the input to the
   // last-used integration branch (or "main" on first run).
@@ -231,10 +237,13 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [mergeError, setMergeError] = useState<string | undefined>(
     initialPlan.merge_error,
   );
-  const [mergeBranch, setMergeBranch] = useState<string>(
-    initialPlan.merge_branch ?? "main",
+  // Branch the plan was last merged into (set by the leader's
+  // mcp__leader__merge_plan tool). Read-only display now that the UI
+  // doesn't drive merges directly — the panel surfaces it next to the
+  // head SHA so the user can verify where the integration landed.
+  const [mergeBranch, setMergeBranch] = useState<string | undefined>(
+    initialPlan.merge_branch,
   );
-  const [merging, setMerging] = useState(false);
   // Mirror plan.integration_review_* locally so the panel updates
   // without a route nav after POST /integration-review returns. The
   // poll below replaces phaseSessions AND splices these in too.
@@ -532,6 +541,16 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           setMaxConcurrent(next.max_concurrent ?? DEFAULT_MAX_CONCURRENT);
           setPaused(!!next.paused);
         }
+        // Merge state lives on the leader path now (mcp__leader__merge_plan).
+        // Mirror the wire fields so the panel reflects the merge as soon as
+        // the leader's tool returns — no UI button, no route nav.
+        setMergeStatus(next.merge_status);
+        setMergeResults(next.merge_results ?? []);
+        setMergeHeadSha(next.merge_head_sha);
+        setMergedAt(next.merged_at);
+        setMergeError(next.merge_error);
+        setMergeBranch(next.merge_branch);
+        setLastNudge(next.last_nudge);
       } catch {
         // ignore; tick again
       }
@@ -800,60 +819,11 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     [initialPlanId, pendingRestartSlug],
   );
 
-  // Plan-level merge — kicks the integration branch checkout +
-  // `git merge --no-ff` per phase branch. Server returns the canonical
-  // updated plan; we splice the merge fields into local state without
-  // touching phaseSessions (the route doesn't mutate them).
-  const handleMerge = useCallback(async () => {
-    setMerging(true);
-    setMergeError(undefined);
-    try {
-      const res = await fetch(
-        `/api/plans/${encodeURIComponent(initialPlanId)}/merge`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ integration_branch: mergeBranch }),
-        },
-      );
-      if (!res.ok) {
-        let detail = await res.text();
-        try {
-          // Server returns {error, ineligible?} for gating failures.
-          const parsed = JSON.parse(detail) as {
-            error?: string;
-            ineligible?: string[];
-          };
-          if (parsed.error) {
-            detail = parsed.ineligible?.length
-              ? `${parsed.error}: ${parsed.ineligible.join(", ")}`
-              : parsed.error;
-          }
-        } catch {
-          // not json — surface raw body
-        }
-        setMergeError(detail);
-        return;
-      }
-      const data = (await res.json()) as { plan: PlanRecord };
-      setMergeStatus(data.plan.merge_status);
-      setMergeResults(data.plan.merge_results ?? []);
-      setMergeHeadSha(data.plan.merge_head_sha);
-      setMergedAt(data.plan.merged_at);
-      setMergeError(data.plan.merge_error);
-      if (data.plan.merge_branch) setMergeBranch(data.plan.merge_branch);
-      // Server clears integration review on re-merge — mirror that
-      // here so the panel doesn't keep showing stale findings against
-      // the old diff range.
-      setIntegrationReview(snapshotIntegrationReview(data.plan));
-      setIntegrationReviewOpen(false);
-    } catch (err) {
-      console.error(`[phase-board] merge threw:`, err);
-      setMergeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setMerging(false);
-    }
-  }, [initialPlanId, mergeBranch]);
+  // Merge is leader-driven now: when the last phase commits, the
+  // /complete route nudges the leader chat (`buildAllCommittedNudge`)
+  // and the leader calls `mcp__leader__merge_plan`. The poll below
+  // mirrors plan.merge_* into local state so the panel reflects the
+  // merge as soon as the leader's tool returns — no UI button required.
 
   // Plan-level integration review. Like /complete and /review, the
   // server runs the agent in the background and persists findings to
@@ -1040,6 +1010,14 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         </div>
       </header>
 
+      <LeaderUnreachableBanner
+        lastNudge={lastNudge}
+        leaderHref={`/chat/${initialPlan.leader_session_id ?? initialPlan.session_id}`}
+        planId={initialPlan.id}
+      />
+
+      <AccountsExhaustedBanner phaseSessions={phaseSessions} />
+
       <MergePanel
         gate={mergeGate}
         status={mergeStatus}
@@ -1048,9 +1026,6 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         mergedAt={mergedAt}
         error={mergeError}
         branch={mergeBranch}
-        onBranchChange={setMergeBranch}
-        onMerge={handleMerge}
-        merging={merging}
         integrationReview={integrationReview}
         integrationReviewOpen={integrationReviewOpen}
         onToggleIntegrationReview={() =>
@@ -1932,16 +1907,125 @@ function PlanStatusBadge({ status }: { status: PlanRecord["status"] }) {
   return <Badge variant="secondary">awaiting approval</Badge>;
 }
 
-// MergePanel renders the plan-level merge affordance below the header.
-// Three states drive the layout:
-//   1. not-yet-eligible (some phases missing commit_status) → muted
-//      hint + disabled button so the user can see what's left.
-//   2. eligible, no merge yet → highlighted row with input + Merge
-//      button.
-//   3. post-merge → result chips per phase + retry button when status
-//      is "pending" or "failed".
-// We always render the strip when the plan has phases; collapsing the
-// row when not eligible would make the affordance harder to discover.
+// MergePanel renders the plan-level merge state below the header.
+// It is read-only — merging is leader-driven (mcp__leader__merge_plan
+// fires after the all-committed nudge). The panel surfaces:
+//   - readiness gauge (X/Y phases committed, what's still blocking)
+//   - merge status badge + integration branch label + head SHA
+//   - per-phase merge result chips + integration-review row
+// LeaderUnreachableBanner shows up when a milestone-driven nudge
+// (all_committed / merged / integration_review_done) failed to reach
+// the leader chat — the plan has stalled because no one's there to
+// drive merge / review / cleanup. The CTA points the user at
+// `mcp__leader__adopt_plan` from a fresh chat, which clears
+// `plan.last_nudge` and removes the banner. Returns null when the
+// last attempt succeeded (or no attempt has happened yet).
+function LeaderUnreachableBanner({
+  lastNudge,
+  leaderHref,
+  planId,
+}: {
+  lastNudge: PlanRecord["last_nudge"];
+  leaderHref: string;
+  planId: string;
+}) {
+  if (!lastNudge || lastNudge.delivered) return null;
+  const milestoneLabel: Record<NonNullable<PlanRecord["last_nudge"]>["milestone"], string> = {
+    all_committed: "all phases committed",
+    merged: "merge completed",
+    integration_review_done: "integration review done",
+  };
+  const at = (() => {
+    const t = Date.parse(lastNudge.at);
+    if (!Number.isFinite(t)) return lastNudge.at;
+    return new Date(t).toLocaleTimeString();
+  })();
+  return (
+    <section className="mx-4 mt-3 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="font-medium">
+            Leader unreachable — plan stalled at &ldquo;{milestoneLabel[lastNudge.milestone]}&rdquo;
+          </div>
+          <div className="mt-1 font-mono text-[11px] opacity-80">
+            {lastNudge.reason ?? "no reason recorded"} · {at}
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <Link
+              href={leaderHref}
+              className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-background px-2 py-1 font-mono text-[11px] hover:bg-rose-500/10"
+            >
+              try existing leader chat
+            </Link>
+            <span className="font-mono text-[11px] opacity-80">
+              or open a fresh chat and call{" "}
+              <code className="rounded bg-rose-500/10 px-1">
+                mcp__leader__adopt_plan(plan_id: &ldquo;{planId.slice(0, 8)}&rdquo;)
+              </code>
+            </span>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// AccountsExhaustedBanner fires when one or more phases have been
+// rate-limited long enough that the watchdog tried to swap accounts
+// but every active account in the daemon pool was already burnt
+// through (see EXHAUSTION_TICK_THRESHOLD in rl-watchdog). The plan
+// isn't broken — the watchdog keeps ticking and the banner clears
+// itself the moment any account in the pool reopens. Surfaces this
+// as the *reason* a plan is sitting still instead of the user
+// guessing.
+function AccountsExhaustedBanner({
+  phaseSessions,
+}: {
+  phaseSessions: PhaseSession[];
+}) {
+  const exhausted = phaseSessions.filter((s) => !!s.exhausted_at);
+  if (exhausted.length === 0) return null;
+  const earliest = exhausted.reduce<string | undefined>((acc, s) => {
+    if (!s.exhausted_at) return acc;
+    if (!acc) return s.exhausted_at;
+    return Date.parse(s.exhausted_at) < Date.parse(acc) ? s.exhausted_at : acc;
+  }, undefined);
+  const since = (() => {
+    if (!earliest) return "";
+    const t = Date.parse(earliest);
+    if (!Number.isFinite(t)) return earliest;
+    return new Date(t).toLocaleTimeString();
+  })();
+  return (
+    <section className="mx-4 mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="font-medium">
+            {exhausted.length} phase{exhausted.length === 1 ? "" : "s"} blocked
+            — every account in the pool has hit quota
+          </div>
+          <div className="mt-1 font-mono text-[11px] opacity-80">
+            blocked since {since} · watchdog auto-resumes when any account
+            reopens; add a new account to the daemon pool to unblock sooner
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {exhausted.map((s) => (
+              <span
+                key={s.phase_slug}
+                className="rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px]"
+              >
+                {s.phase_slug}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function MergePanel({
   gate,
   status,
@@ -1950,9 +2034,6 @@ function MergePanel({
   mergedAt,
   error,
   branch,
-  onBranchChange,
-  onMerge,
-  merging,
   integrationReview,
   integrationReviewOpen,
   onToggleIntegrationReview,
@@ -1965,10 +2046,7 @@ function MergePanel({
   headSha: string | undefined;
   mergedAt: string | undefined;
   error: string | undefined;
-  branch: string;
-  onBranchChange: (b: string) => void;
-  onMerge: () => void;
-  merging: boolean;
+  branch: string | undefined;
   integrationReview: IntegrationReviewSnapshot;
   integrationReviewOpen: boolean;
   onToggleIntegrationReview: () => void;
@@ -1980,13 +2058,6 @@ function MergePanel({
   const merged = results.filter((r) => r.status === "merged").length;
   const skipped = results.filter((r) => r.status === "skipped").length;
   const failed = results.filter((r) => r.status === "failed").length;
-
-  const buttonLabel =
-    status === "merged"
-      ? "Re-merge"
-      : status === "pending" || status === "failed"
-        ? "Retry merge"
-        : "Merge into";
 
   return (
     <section
@@ -2010,8 +2081,17 @@ function MergePanel({
               {gate.ready}/{gate.total} phases committed
             </span>
             {status && <MergeStatusBadge status={status} />}
+            {branch && (
+              <span
+                className="inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
+                title="integration branch chosen by the leader"
+              >
+                <GitMerge className="size-3" aria-hidden />
+                {branch}
+              </span>
+            )}
           </div>
-          {!gate.eligible && (
+          {!gate.eligible ? (
             <div className="mt-0.5 text-[11px] text-muted-foreground">
               waiting on{" "}
               <span className="font-mono">
@@ -2021,43 +2101,13 @@ function MergePanel({
               — click <span className="font-mono">commit &amp; complete</span> on
               each phase first.
             </div>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          <span className="font-mono text-[11px] text-muted-foreground">
-            {buttonLabel}
-          </span>
-          <input
-            type="text"
-            value={branch}
-            onChange={(e) => onBranchChange(e.target.value)}
-            disabled={merging}
-            spellCheck={false}
-            placeholder="main"
-            className={cn(
-              "h-7 w-32 rounded-md border bg-background px-2 font-mono text-[11px]",
-              "focus:outline-none focus:ring-1 focus:ring-ring",
-              "disabled:cursor-not-allowed disabled:opacity-60",
-            )}
-          />
-          <button
-            type="button"
-            onClick={onMerge}
-            disabled={!gate.eligible || merging || branch.trim().length === 0}
-            className={cn(
-              "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]",
-              "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20",
-              "dark:text-emerald-300",
-              "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-emerald-500/10",
-            )}
-          >
-            {merging ? (
-              <Loader2 className="size-3 animate-spin" aria-hidden />
-            ) : (
-              <GitMerge className="size-3" aria-hidden />
-            )}
-            <span className="font-mono">merge</span>
-          </button>
+          ) : !status ? (
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              all phases committed — leader will run{" "}
+              <span className="font-mono">mcp__leader__merge_plan</span> into a
+              feature branch and open a PR.
+            </div>
+          ) : null}
         </div>
       </div>
 

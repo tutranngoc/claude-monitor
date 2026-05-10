@@ -331,10 +331,12 @@ async function persistComplete(opts: PersistCompleteOpts): Promise<void> {
     delete p.integration_review_error;
   });
   // Hand the result back to the leader so it can decide whether to
-  // cleanup + archive or chase down the findings. Best-effort; if the
-  // owner session is gone the nudge no-ops with a log line.
-  void nudgeLeader({
+  // cleanup + archive or chase down the findings. Awaited so
+  // plan.last_nudge is persisted; if the owner session is gone the
+  // banner surfaces in the next plan poll.
+  await nudgeLeader({
     planId: updated.id,
+    milestone: "integration_review_done",
     message: buildIntegrationReviewDoneNudge({
       planTitle: updated.title,
       findingCount: updated.integration_review_findings?.length ?? 0,

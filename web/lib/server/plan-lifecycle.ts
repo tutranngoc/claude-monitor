@@ -36,7 +36,20 @@ export type LifecycleErrorCode =
   | "missing_merge_base"
   | "review_in_flight"
   | "validation"
+  | "forbidden_branch"
+  | "scope_violations"
   | "git_failed";
+
+// Branches the orchestrator must never fold phase work into directly.
+// Phases are merged into a fresh integration branch the leader will
+// then push and open a PR from — that PR is the only path into a
+// protected trunk.
+const FORBIDDEN_INTEGRATION_BRANCHES = new Set([
+  "main",
+  "master",
+  "develop",
+  "trunk",
+]);
 
 export interface LifecycleError {
   code: LifecycleErrorCode;
@@ -49,9 +62,18 @@ export interface LifecycleError {
 // /api/plans/[id]/merge route uses. Lifted out so the leader MCP tool
 // can drive merges from inside an agent without us duplicating the
 // gating + persistence logic.
+//
+// `acknowledgeScopeViolations` lists phase slugs whose post-commit
+// scope_violations the caller has reviewed and is choosing to merge
+// anyway. Phases with scope_violations.length > 0 NOT in this list
+// abort the merge with `code: "scope_violations"` so the leader (or
+// the user driving via /merge) is forced to surface the drift before
+// it lands in the integration branch. Empty/undefined = no
+// acknowledgments; phases with no violations don't need entries here.
 export async function runMergeForPlan(args: {
   planId: string;
   integrationBranch: string;
+  acknowledgeScopeViolations?: string[];
 }): Promise<
   | { ok: true; plan: PlanRecord; merge: Awaited<ReturnType<typeof mergePhaseBranches>> }
   | { ok: false; error: LifecycleError }
@@ -63,6 +85,15 @@ export async function runMergeForPlan(args: {
       error: {
         code: "validation",
         message: "integration_branch must match [a-zA-Z0-9._-/]+",
+      },
+    };
+  }
+  if (FORBIDDEN_INTEGRATION_BRANCHES.has(integrationBranch.toLowerCase())) {
+    return {
+      ok: false,
+      error: {
+        code: "forbidden_branch",
+        message: `integration_branch "${integrationBranch}" is protected — pick a feature branch (e.g. integration/<plan-slug>) and open a PR from it instead`,
       },
     };
   }
@@ -104,6 +135,34 @@ export async function runMergeForPlan(args: {
         code: "ineligible_phases",
         message: `not all phases committed: ${ineligible.join(", ")}`,
         details: { ineligible },
+      },
+    };
+  }
+
+  // Scope-violation gate. Phases that wrote files outside their
+  // declared `phase.scope.files` glob set `scope_violations` at
+  // /complete time. We block the merge until the caller explicitly
+  // acknowledges each offending phase via `acknowledgeScopeViolations`
+  // — that way the leader can't merge a wave of phases without
+  // surfacing scope creep first. Phases with no declared scope or
+  // empty violations are unaffected.
+  const acknowledged = new Set(args.acknowledgeScopeViolations ?? []);
+  const unacknowledged: Array<{ phase_slug: string; files: string[] }> = [];
+  for (const link of plan.phase_sessions ?? []) {
+    if (!link.scope_violations || link.scope_violations.length === 0) continue;
+    if (acknowledged.has(link.phase_slug)) continue;
+    unacknowledged.push({
+      phase_slug: link.phase_slug,
+      files: link.scope_violations,
+    });
+  }
+  if (unacknowledged.length > 0) {
+    return {
+      ok: false,
+      error: {
+        code: "scope_violations",
+        message: `${unacknowledged.length} phase(s) have unacknowledged scope_violations: ${unacknowledged.map((u) => u.phase_slug).join(", ")}. Inspect the diffs (e.g. mcp__leader__read_phase_diff), then re-run merge with these slugs in acknowledge_scope_violations to proceed.`,
+        details: { unacknowledged },
       },
     };
   }

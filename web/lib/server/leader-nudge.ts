@@ -1,6 +1,7 @@
 import "server-only";
 
-import { findPlanById } from "@/lib/server/plans";
+import type { NudgeMilestone } from "@/lib/plan-types";
+import { findPlanById, updatePlan } from "@/lib/server/plans";
 import { sendMessage, snapshotSession } from "@/lib/server/sessions";
 
 // Wakes the owner/leader chat by enqueuing a user-message into its
@@ -10,15 +11,19 @@ import { sendMessage, snapshotSession } from "@/lib/server/sessions";
 // leader still wants the prompt so it can drive the next step (run
 // integration review, decide on cleanup, archive, etc).
 //
-// Best-effort. Failure paths and what we do:
-//   - Plan not found on disk          → no-op + log
-//   - Owner session id missing        → no-op + log
-//   - sendMessage throws              → swallow + log
-//   - Owner session is closed/errored → swallow + log
-// We never bubble the failure up to the route caller; nudge is a
-// convenience, not a contract.
+// Best-effort delivery, but the result is always persisted to
+// `plan.last_nudge` so the UI can surface a banner when the leader is
+// unreachable ("open a fresh chat and run mcp__leader__adopt_plan").
+// Without that the plan silently stalls and the user has no signal.
+//
+// Failure paths and what we do:
+//   - Plan not found on disk          → return false, no persist (nothing to write to)
+//   - Owner session id missing        → persist + return false
+//   - Owner session is closed/errored → persist + return false
+//   - sendMessage throws              → persist + return false
 export async function nudgeLeader(args: {
   planId: string;
+  milestone: NudgeMilestone;
   message: string;
 }): Promise<{ delivered: boolean; reason?: string }> {
   const plan = await findPlanById(args.planId);
@@ -30,37 +35,61 @@ export async function nudgeLeader(args: {
   // leader_session_id. Falls back to the original submit_plan owner
   // when no adoption happened.
   const ownerId = plan.leader_session_id ?? plan.session_id;
+  let result: { delivered: boolean; reason?: string };
   if (!ownerId) {
-    return { delivered: false, reason: "plan has no session_id" };
-  }
-  // snapshotSession resolves both live and disk-only sessions. An
-  // interrupted (disk-only) session can still receive sendMessage
-  // because getOrResume reanimates on demand. A truly closed session
-  // (deleted from disk) returns undefined and we skip rather than
-  // throw — the user closed it intentionally.
-  const snap = snapshotSession(ownerId);
-  if (!snap) {
-    return { delivered: false, reason: "owner session not found" };
-  }
-  if (snap.summary.status === "closed" || snap.summary.status === "errored") {
-    return {
-      delivered: false,
-      reason: `owner session is ${snap.summary.status}`,
-    };
+    result = { delivered: false, reason: "plan has no session_id" };
+  } else {
+    // snapshotSession resolves both live and disk-only sessions. An
+    // interrupted (disk-only) session can still receive sendMessage
+    // because getOrResume reanimates on demand. A truly closed session
+    // (deleted from disk) returns undefined and we skip rather than
+    // throw — the user closed it intentionally.
+    const snap = snapshotSession(ownerId);
+    if (!snap) {
+      result = { delivered: false, reason: "owner session not found" };
+    } else if (
+      snap.summary.status === "closed" ||
+      snap.summary.status === "errored"
+    ) {
+      result = {
+        delivered: false,
+        reason: `owner session is ${snap.summary.status}`,
+      };
+    } else {
+      try {
+        sendMessage(ownerId, args.message);
+        result = { delivered: true };
+      } catch (err) {
+        console.warn(
+          `[leader-nudge] sendMessage to ${ownerId} for plan ${args.planId} failed:`,
+          err,
+        );
+        result = {
+          delivered: false,
+          reason: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
   }
   try {
-    sendMessage(ownerId, args.message);
-    return { delivered: true };
+    await updatePlan(plan.cwd, plan.id, (p) => {
+      p.last_nudge = {
+        milestone: args.milestone,
+        delivered: result.delivered,
+        reason: result.reason,
+        at: new Date().toISOString(),
+      };
+    });
   } catch (err) {
+    // Persistence is best-effort too: if the plan disappeared between
+    // our read and write we don't escalate — the route caller still
+    // gets the in-memory result.
     console.warn(
-      `[leader-nudge] sendMessage to ${ownerId} for plan ${args.planId} failed:`,
+      `[leader-nudge] persist last_nudge for plan ${args.planId} failed:`,
       err,
     );
-    return {
-      delivered: false,
-      reason: err instanceof Error ? err.message : String(err),
-    };
   }
+  return result;
 }
 
 // Convenience: build a milestone-specific nudge message. Each one ends
@@ -71,7 +100,11 @@ export function buildAllCommittedNudge(planTitle: string): string {
   return [
     `Plan _"${planTitle}"_ — every phase has reached a terminal commit_status.`,
     "",
-    "Decide whether to merge: call `mcp__leader__read_plan_state` to confirm scope/review state, then `mcp__leader__merge_plan` (default branch \"main\") if you're satisfied. If a phase is `failed` or has scope_violations you care about, surface the issue first instead of merging.",
+    "Decide whether to merge: call `mcp__leader__read_plan_state` to confirm scope/review state, then `mcp__leader__merge_plan` if you're satisfied. If a phase is `failed`, surface the issue first instead of merging.",
+    "",
+    "**Scope violations now block merge.** Any phase with `scope_violations.length > 0` must be inspected (e.g. `mcp__leader__read_phase_diff`) and explicitly acknowledged via `merge_plan(acknowledge_scope_violations: [<slug>, ...])` — per-slug, not blanket. Phases without violations don't need entries. Without acknowledgment the merge aborts with `code: \"scope_violations\"` and a list of offenders.",
+    "",
+    "**Never merge into `main` / `master`** — the server rejects protected trunks. Pick a fresh feature branch (e.g. `integration/<plan-slug>`) for `integration_branch`, then push it and open a PR with `gh pr create --base main --head <branch>` once the merge lands. The PR is the only path into trunk.",
   ].join("\n");
 }
 
@@ -84,7 +117,13 @@ export function buildMergedNudge(args: {
   return [
     `Plan _"${args.planTitle}"_ merged into \`${args.branch}\`${head}.`,
     "",
-    "Run `mcp__leader__run_integration_review` to read the cumulative diff and surface cross-phase issues. Once you've read the findings, you can `mcp__leader__cleanup_worktrees` and `mcp__leader__archive_plan` to close the plan out — but only after confirming the integration branch has been pushed (cleanup deletes local refs).",
+    `Next steps, in order:`,
+    `1. \`git push -u origin ${args.branch}\` to publish the integration branch.`,
+    `2. \`gh pr create --base main --head ${args.branch}\` (adjust base if the repo's trunk is named differently) — fill in title/body summarizing the merged phases.`,
+    `3. \`mcp__leader__run_integration_review\` to surface cumulative cross-phase issues; paste relevant findings into the PR.`,
+    `4. Once the PR is open and pushed, \`mcp__leader__cleanup_worktrees\` then \`mcp__leader__archive_plan\` to close the plan out.`,
+    "",
+    "Do not skip the PR step — merging this branch back into trunk happens via PR review, never via the orchestrator.",
   ].join("\n");
 }
 
