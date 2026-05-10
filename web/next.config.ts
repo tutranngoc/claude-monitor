@@ -16,6 +16,15 @@ const nextConfig: NextConfig = {
   // detects server.js and spawns `node server.js`; falls back to
   // `next start` for the legacy dev layout.
   output: "standalone",
+  // Vendored Claude Code skills (web/skills/*) ship with the daemon so
+  // the skills-installer can mirror them into ~/.claude/skills/ on
+  // first boot. Without this include the tracer drops the dir from
+  // the standalone bundle and the installer silently no-ops in
+  // production. Keyed off /api/** because that's the entry point the
+  // launcher hits on cold start, which is when init runs.
+  outputFileTracingIncludes: {
+    "/api/**": ["./skills/**"],
+  },
 };
 
 export default nextConfig;

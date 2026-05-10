@@ -42,6 +42,7 @@ import {
 } from "./session-store";
 import { listAllPlans } from "./plans";
 import { startRlResetWatchdog } from "./rl-watchdog";
+import { ensureSkillsInstalled } from "./skills-installer";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionEntry,
@@ -257,6 +258,17 @@ async function initFromDisk(): Promise<void> {
   // resetsAt window opens. Idempotent — only arms the timer once per
   // process, regardless of how often this module is re-evaluated.
   startRlResetWatchdog();
+
+  // Install vendored skills (web/skills/*) into ~/.claude/skills/ so
+  // every Claude Code session the orchestrator spawns can discover
+  // them via the native skill-trigger mechanism — phase agents pick
+  // them up by description match without us having to nail content
+  // into every kickoff prompt. Idempotent on unchanged content.
+  try {
+    await ensureSkillsInstalled();
+  } catch (err) {
+    console.warn("[sessions] ensureSkillsInstalled failed:", err);
+  }
 }
 
 async function rehydratePhaseSessions(): Promise<void> {

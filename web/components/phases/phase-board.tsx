@@ -1111,6 +1111,9 @@ function PhaseRowCard({
                 <span className="tabular-nums">{session.subagents.length}</span>
               </>
             )}
+            {session.context_usage && (
+              <ContextPctChip pct={session.context_usage.percentage} />
+            )}
           </div>
         )}
       </div>
@@ -1675,6 +1678,37 @@ function SessionStatusDot({ status }: { status: SessionStatus }) {
       title={status.replace("_", " ")}
       className={cn("mt-1.5 inline-block size-2 shrink-0 rounded-full", color)}
     />
+  );
+}
+
+// ContextPctChip surfaces the SDK's reported context-window usage so
+// the user can spot a phase that's about to push into degraded-output
+// territory. Tailwind tints by threshold: muted under 60%, amber 60-79
+// (start thinking about /compact or restart), destructive 80+ (the
+// model's reasoning quality typically drops sharply past this point;
+// in practice the user wants to summarize state and restart the phase
+// before letting it limp on).
+function ContextPctChip({ pct }: { pct: number }) {
+  const rounded = Math.round(pct);
+  const tone =
+    rounded >= 80
+      ? "border-destructive/40 bg-destructive/10 text-destructive"
+      : rounded >= 60
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-muted-foreground/30 bg-muted/40 text-muted-foreground";
+  return (
+    <>
+      <span className="mx-1">·</span>
+      <span
+        className={cn(
+          "inline-flex items-center gap-0.5 rounded border px-1 py-px tabular-nums",
+          tone,
+        )}
+        title={`context window: ${rounded}%${rounded >= 80 ? " — consider /compact or restart" : ""}`}
+      >
+        ctx {rounded}%
+      </span>
+    </>
   );
 }
 
