@@ -39,6 +39,7 @@ import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
 import { AskQuestionCard } from "./ask-question-card";
+import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
 import { shouldHideFromMainTimeline } from "@/lib/subagents";
 import {
@@ -55,6 +56,46 @@ interface Props {
 // preview, latest plan, and any error notices so they share the same
 // virtualized scroll viewport. Anything that needs to anchor at the
 // bottom is added as a trailing item.
+// classifyForRun decides whether a message can participate in a
+// "tool run" group:
+//   tool_asst   — assistant turn whose content is exclusively tool_use
+//                 (and optionally thinking); a real text reply ends a
+//                 run because that's where Claude is talking to the
+//                 user, not just operating.
+//   tool_user   — user message whose content is exclusively tool_result
+//                 echoes (the SDK's reply to a prior tool_use).
+//   other       — anything else (system, result-end, plain text, mixed).
+// Hidden subagent-internal messages are filtered upstream and never
+// reach this classifier.
+function classifyForRun(
+  msg: SDKMessage,
+): "tool_asst" | "tool_user" | "other" {
+  if (msg.type === "assistant") {
+    const content = msg.message.content;
+    let hasToolUse = false;
+    let hasNonToolNonThinking = false;
+    for (const b of content) {
+      if (b.type === "tool_use") hasToolUse = true;
+      else if (b.type === "thinking") {
+        // thinking blocks don't disqualify — they're hidden when empty
+        // and quietly italicised when not, so they sit naturally inside
+        // a tool run. Continue.
+      } else hasNonToolNonThinking = true;
+    }
+    return hasToolUse && !hasNonToolNonThinking ? "tool_asst" : "other";
+  }
+  if (msg.type === "user") {
+    const content = msg.message.content;
+    if (typeof content === "string") return "other";
+    if (content.length === 0) return "other";
+    for (const b of content) {
+      if (b.type !== "tool_result") return "other";
+    }
+    return "tool_user";
+  }
+  return "other";
+}
+
 type ChatItem =
   | { kind: "message"; msg: SDKMessage }
   | { kind: "streaming"; blocks: StreamingBlock[] }
@@ -62,7 +103,12 @@ type ChatItem =
   | { kind: "ask_question"; request: AskUserQuestionRequest }
   | { kind: "error"; message: string; index: number }
   | { kind: "command_output"; output: CommandOutput; id: string }
-  | { kind: "thinking" };
+  | { kind: "thinking" }
+  // tool_run collapses ≥2 contiguous tool-only turns (assistant emits
+  // only tool_use/thinking blocks, user echoes only tool_result) into
+  // one collapsible block. runId is the first message's uuid so the
+  // virtuoso key is stable across re-renders.
+  | { kind: "tool_run"; runId: string; messages: SDKMessage[] };
 
 interface CommandLog {
   id: string;
@@ -196,15 +242,72 @@ export function ChatPanel({ session }: Props) {
       }
     };
     flushCmdsUpTo(0);
+    // visibleClass marks each history index by what role it'd play in
+    // a tool-run: tool_assistant (assistant turn that's pure tool_use,
+    // optionally with thinking), tool_user_result (user message that
+    // carries only tool_result blocks), or other. Subagent-internal
+    // and otherwise-hidden messages are passed through as "skip" so
+    // they don't break a streak that surrounds them.
+    const klass: Array<"tool_asst" | "tool_user" | "skip" | "other"> = [];
     for (let i = 0; i < chat.history.length; i++) {
       const msg = chat.history[i];
-      // Children of a Task subagent live inside that subagent's card,
-      // not in the top-level viewport. Same for the user message that
-      // ferries a Task's tool_result back to the dispatcher.
-      if (!shouldHideFromMainTimeline(msg, subagentDerivation)) {
-        out.push({ kind: "message", msg });
+      if (shouldHideFromMainTimeline(msg, subagentDerivation)) {
+        klass.push("skip");
+        continue;
       }
+      klass.push(classifyForRun(msg));
+    }
+    let i = 0;
+    while (i < chat.history.length) {
+      const msg = chat.history[i];
+      if (klass[i] === "skip") {
+        flushCmdsUpTo(i + 1);
+        i++;
+        continue;
+      }
+      // Try to extend a tool-run starting at i. Pattern: a leading
+      // tool_asst, then any alternation of tool_user / tool_asst (skip
+      // entries pass through transparently). The streak ends at the
+      // first "other" (a real text turn or a system message we surface).
+      if (klass[i] === "tool_asst") {
+        let end = i + 1;
+        let toolTurns = 1;
+        while (end < chat.history.length) {
+          const c = klass[end];
+          if (c === "skip") {
+            end++;
+            continue;
+          }
+          if (c === "tool_user" || c === "tool_asst") {
+            if (c === "tool_asst") toolTurns++;
+            end++;
+            continue;
+          }
+          break;
+        }
+        // ≥2 tool-only assistant turns is the threshold for grouping —
+        // a single tool call doesn't benefit from being wrapped in a
+        // collapsible (it's already one short bubble).
+        if (toolTurns >= 2) {
+          const slice: SDKMessage[] = [];
+          for (let j = i; j < end; j++) {
+            if (klass[j] === "skip") continue;
+            slice.push(chat.history[j]);
+          }
+          const firstUuid = (slice[0] as { uuid?: string }).uuid;
+          out.push({
+            kind: "tool_run",
+            runId: firstUuid ?? `run:${i}`,
+            messages: slice,
+          });
+          flushCmdsUpTo(end);
+          i = end;
+          continue;
+        }
+      }
+      out.push({ kind: "message", msg });
       flushCmdsUpTo(i + 1);
+      i++;
     }
     flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
     if (chat.streamingBlocks.length > 0) {
@@ -532,6 +635,7 @@ function ItemRow({
       <div className="mx-auto max-w-3xl">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}
+        {item.kind === "tool_run" && <ToolRunCard messages={item.messages} />}
         {item.kind === "plan" && (
           <PlanCard
             plan={item.plan}
@@ -571,6 +675,8 @@ function itemKey(_: number, item: ChatItem): string {
       // Single sticky key — Virtuoso reuses the same DOM node as deltas
       // arrive, avoiding a re-mount per chunk.
       return "streaming";
+    case "tool_run":
+      return `run:${item.runId}`;
     case "plan":
       return `plan:${item.plan.id}`;
     case "ask_question":
