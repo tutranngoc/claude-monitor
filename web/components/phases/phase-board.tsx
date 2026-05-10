@@ -164,9 +164,11 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   // The page-level server component hydrates `initialPlan` once; the
   // commit/complete action mutates `phase_sessions[].commit_*` on the
   // server and returns the updated record. Mirror it locally so the
-  // badge updates without a route nav. Plan id/cwd/phases are
-  // immutable post-approval, so we only need to track the slice that
-  // can change.
+  // badge updates without a route nav. Plan id/cwd are immutable
+  // post-approval; `phases` was too until the DAG view added drag-to-
+  // edit deps — we now mirror that list as well so the new edges
+  // appear immediately after a PATCH.
+  const [phases, setPhases] = useState<Phase[]>(initialPlan.phases);
   const [phaseSessions, setPhaseSessions] = useState<PhaseSession[]>(
     initialPlan.phase_sessions ?? [],
   );
@@ -352,6 +354,9 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         // Pending phases shrink as dependents spawn — keep mirror
         // current so blocked/cleared transitions surface promptly.
         setPendingPhases(next.pending_phases ?? []);
+        // Phases.depends_on now mutates via /deps PATCH. The poll is
+        // also where another tab's edit becomes visible to this one.
+        setPhases(next.phases);
       } catch {
         // ignore; tick again
       }
@@ -487,7 +492,7 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     for (const s of phaseSessions) {
       commitByDep.set(s.phase_slug, s.commit_status);
     }
-    return initialPlan.phases.map((phase) => {
+    return phases.map((phase) => {
       const blockedDeps: string[] = [];
       for (const dep of phase.depends_on ?? []) {
         const status = commitByDep.get(dep);
@@ -503,13 +508,7 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         isPending: pendingSlugs.has(phase.slug),
       };
     });
-  }, [
-    phaseSessions,
-    pendingPhases,
-    initialPlan.phases,
-    sessions,
-    initialPlanId,
-  ]);
+  }, [phaseSessions, pendingPhases, phases, sessions, initialPlanId]);
 
   // Fire the commit action and merge the server's updated PhaseSession
   // back into local state. We don't refetch the whole plan — the route
@@ -714,6 +713,42 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     }
   }, [initialPlanId]);
 
+  // Drag-to-edit deps in the DAG view. PATCH the new depends_on list
+  // for `slug` and splice the server's canonical plan back into local
+  // state so the graph re-lays out instantly. Errors flow through
+  // depsError so DagView can surface them inline; cleared on the next
+  // successful edit or by the user.
+  const [depsError, setDepsError] = useState<string | null>(null);
+  const setPhaseDeps = useCallback(
+    async (slug: string, nextDeps: string[]) => {
+      setDepsError(null);
+      const res = await fetch(
+        `/api/plans/${encodeURIComponent(initialPlanId)}/phases/${encodeURIComponent(slug)}/deps`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ depends_on: nextDeps }),
+        },
+      );
+      if (!res.ok) {
+        let msg = `failed (${res.status})`;
+        try {
+          const parsed = (await res.json()) as { error?: string };
+          if (parsed.error) msg = parsed.error;
+        } catch {
+          // body wasn't JSON — keep the status fallback
+        }
+        setDepsError(msg);
+        throw new Error(msg);
+      }
+      const data = (await res.json()) as { plan: PlanRecord };
+      setPhases(data.plan.phases);
+      setPhaseSessions(data.plan.phase_sessions ?? []);
+      setPendingPhases(data.plan.pending_phases ?? []);
+    },
+    [initialPlanId],
+  );
+
   const buckets = useMemo(() => {
     const map: Record<Column, PhaseRow[]> = {
       todo: [],
@@ -738,7 +773,7 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     );
     let ready = 0;
     const pending: string[] = [];
-    for (const phase of initialPlan.phases) {
+    for (const phase of phases) {
       const link = linkBySlug.get(phase.slug);
       const status = link?.commit_status;
       if (status === "clean" || status === "committed") {
@@ -749,11 +784,11 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
     }
     return {
       ready,
-      total: initialPlan.phases.length,
+      total: phases.length,
       pending,
-      eligible: pending.length === 0 && initialPlan.phases.length > 0,
+      eligible: pending.length === 0 && phases.length > 0,
     };
-  }, [phaseSessions, initialPlan.phases]);
+  }, [phaseSessions, phases]);
 
   const counters = useMemo(() => {
     const total = phaseRows.length;
@@ -780,8 +815,8 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
             <PlanStatusBadge status={initialPlan.status} />
           </div>
           <div className="font-mono text-xs text-muted-foreground">
-            plan {initialPlan.id.slice(0, 8)} · {initialPlan.phases.length} phase
-            {initialPlan.phases.length === 1 ? "" : "s"} ·{" "}
+            plan {initialPlan.id.slice(0, 8)} · {phases.length} phase
+            {phases.length === 1 ? "" : "s"} ·{" "}
             <span className="select-all">{initialPlan.cwd}</span>
           </div>
         </div>
@@ -861,7 +896,14 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           ))}
         </div>
       ) : (
-        <DagView rows={phaseRows} />
+        <DagView
+          rows={phaseRows}
+          editor={{
+            setDeps: setPhaseDeps,
+            error: depsError,
+            onClearError: () => setDepsError(null),
+          }}
+        />
       )}
     </div>
   );
