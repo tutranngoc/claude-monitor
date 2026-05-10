@@ -29,6 +29,7 @@ import { ContextMeter } from "./context-meter";
 import { FolderPicker } from "./folder-picker";
 import { ModelEffortPicker } from "./model-effort-picker";
 import { ModePicker, type PermissionMode } from "./mode-picker";
+import { ModeBanner } from "./mode-banner";
 import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
 import { useGitBranch } from "@/hooks/use-git-branch";
 import { SlashCommandMenu } from "./slash-command-menu";
@@ -410,6 +411,12 @@ export function Composer(props: Props) {
           ))}
         </div>
       )}
+
+      {/* Permission-mode banner — mirrors the Claude Code CLI's
+          "⏸ plan mode on" / "⏵⏵ accept edits on" footer line. Only
+          renders when permMode != "default" so the chrome stays
+          quiet otherwise. */}
+      {props.permMode && <ModeBanner mode={props.permMode} />}
 
       {/* Textarea */}
       <textarea

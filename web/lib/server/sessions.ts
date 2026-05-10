@@ -1011,6 +1011,44 @@ export function createSession(opts: {
   return summarize(session);
 }
 
+// registerImportedSession slots a session built outside the orchestrator
+// (e.g. parsed from a Claude Code CLI jsonl by cli-import.ts) into the
+// interrupted-shadow map without spawning a Query. The session is
+// listed in the sidebar immediately; the SDK gets fired up only when
+// the user actually opens the tab — at which point getOrResume promotes
+// it via SDK `resume: <id>` and the binary loads the transcript from
+// ~/.claude/projects/<encoded-cwd>/<id>.jsonl on its own.
+//
+// Returns false when a session with the same id is already registered
+// (live or shadow); the caller decides whether that's an error or a
+// no-op. Persisted snapshot is written by cli-import.ts before this
+// call so a daemon restart picks the import back up via initFromDisk().
+export function registerImportedSession(stored: {
+  id: string;
+  cwd: string;
+  config_dir: string;
+  account_name?: string;
+  created_at: string;
+  model?: string;
+  permission_mode: PermissionMode;
+  history: SDKMessage[];
+}): boolean {
+  if (sessions.has(stored.id) || interruptedSessions.has(stored.id)) {
+    return false;
+  }
+  interruptedSessions.set(stored.id, {
+    id: stored.id,
+    cwd: stored.cwd,
+    configDir: stored.config_dir,
+    accountName: stored.account_name,
+    createdAt: new Date(stored.created_at),
+    model: stored.model,
+    permissionMode: stored.permission_mode,
+    history: stored.history,
+  });
+  return true;
+}
+
 // resumeSession promotes an InterruptedSession (loaded from disk on
 // startup) to a live ChatSession by re-spawning the SDK Query in
 // `resume` mode. We reuse the in-memory history so the chat panel

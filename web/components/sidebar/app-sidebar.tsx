@@ -1,8 +1,9 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Plus, X } from "lucide-react";
+import { History, Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Logo } from "@/components/logo";
@@ -12,6 +13,7 @@ import { useSidebar } from "@/lib/sidebar-context";
 import { SessionsList } from "./sessions-list";
 import { AccountChip } from "./account-chip";
 import { AttentionIndicator } from "./attention-indicator";
+import { RestoreSessionDialog } from "./restore-session-dialog";
 
 // AppSidebar: 18rem (288px) rail. Desktop pins it inline as a flex
 // child. Mobile turns it into a fixed-position drawer that slides in
@@ -20,6 +22,7 @@ export function AppSidebar() {
   const pathname = usePathname();
   const isHome = pathname === "/";
   const { open, setOpen } = useSidebar();
+  const [restoreOpen, setRestoreOpen] = useState(false);
 
   return (
     <SessionsProvider>
@@ -74,19 +77,32 @@ export function AppSidebar() {
           </div>
         </div>
 
-        <div className="px-3 pb-2">
+        <div className="flex gap-1.5 px-3 pb-2">
           <Link
             href="/"
             className={cn(
               buttonVariants({ variant: "outline" }),
-              "w-full justify-start gap-2",
+              "flex-1 justify-start gap-2",
               isHome && "bg-sidebar-accent",
             )}
           >
             <Plus className="size-4" />
             New chat
           </Link>
+          <Button
+            variant="outline"
+            size="icon"
+            aria-label="Restore CLI session by ID"
+            title="Restore a Claude Code CLI session by its ID"
+            onClick={() => setRestoreOpen(true)}
+          >
+            <History className="size-4" />
+          </Button>
         </div>
+        <RestoreSessionDialog
+          open={restoreOpen}
+          onOpenChange={setRestoreOpen}
+        />
 
         <div className="px-3 pt-3 pb-1 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
           Sessions

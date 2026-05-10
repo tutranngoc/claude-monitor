@@ -32,6 +32,7 @@ import {
   parseSlashCommand,
   type ParsedCommand,
 } from "@/lib/slash-commands";
+import { nextPermissionMode } from "@/lib/permission-mode";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { ThinkingIndicator } from "./thinking-indicator";
@@ -41,7 +42,7 @@ import { PlanCard } from "./plan-card";
 import { AskQuestionCard } from "./ask-question-card";
 import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
-import { shouldHideFromMainTimeline } from "@/lib/subagents";
+import { isSubagentDispatchTool, shouldHideFromMainTimeline } from "@/lib/subagents";
 import {
   CommandOutputBubble,
   type CommandOutput,
@@ -72,6 +73,24 @@ interface Props {
 //                 conversational beat that ends the streak.
 // Hidden subagent-internal messages are filtered upstream and never
 // reach this classifier.
+// Tools whose result the user mostly looks at *directly* (not as
+// supporting evidence for an investigation) — collapsing them into a
+// run hides the very thing the user wanted to see. TodoWrite is the
+// canonical example: the checklist IS the artifact, not a step toward
+// one. Add other "first-class output" tools here as they come up
+// (ExitPlanMode, AskUserQuestion would be siblings if they weren't
+// already lifted out via dedicated cards).
+const STANDALONE_TOOLS = new Set(["TodoWrite"]);
+
+function hasStandaloneTool(blocks: { type: string; name?: string }[]): boolean {
+  for (const b of blocks) {
+    if (b.type === "tool_use" && b.name && STANDALONE_TOOLS.has(b.name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function classifyForRun(
   msg: SDKMessage,
 ): "tool_asst" | "tool_user" | "skip" | "other" {
@@ -88,6 +107,13 @@ function classifyForRun(
     // operating commentary should NOT shatter a 10-call streak into
     // five tiny groups. A turn with text and NO tool_use stays
     // "other" so a real conversational reply still ends the run.
+    //
+    // EXCEPTION: a TodoWrite (or other STANDALONE_TOOLS) call must NOT
+    // be folded into a tool-run group — the checklist is what the user
+    // came here to see, and burying it inside a bash collapsible
+    // hides it. Treat it as "other" so it breaks the streak and
+    // renders as its own MessageBubble / TodoCard.
+    if (hasStandaloneTool(content)) return "other";
     return hasToolUse ? "tool_asst" : "other";
   }
   if (msg.type === "user") {
@@ -214,6 +240,35 @@ export function ChatPanel({ session }: Props) {
       setPermissionMode(prev.permissionMode);
     }
   };
+
+  // Shift+Tab cycles through permission modes the same way the Claude
+  // Code CLI does (default → acceptEdits → plan → bypassPermissions →
+  // default). Bound on `window` so it works whether the textarea has
+  // focus or not — preventDefault stops the browser's tab-rotation
+  // navigation. The fresh permissionMode read inside the handler avoids
+  // staleness without taking it as a dep (which would re-bind the
+  // listener on every keystroke).
+  const permissionModeRef = useRef(permissionMode);
+  useEffect(() => {
+    permissionModeRef.current = permissionMode;
+  }, [permissionMode]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.shiftKey || e.key !== "Tab") return;
+      // Don't fight other modifier-laden Tab combos (Ctrl+Shift+Tab is
+      // the browser's "previous tab" shortcut on most platforms).
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      e.preventDefault();
+      const next = nextPermissionMode(permissionModeRef.current);
+      void patchOptions({ permission_mode: next });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // patchOptions is recreated each render but stable in behavior;
+    // we read permission mode through the ref above. Empty deps keep
+    // the listener registered exactly once for the panel's lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // The SSR snapshot's `usage` is from session creation; once SSE starts
   // streaming, it becomes stale. Recompute from the latest `result` SDK
@@ -653,6 +708,28 @@ function HeaderSpacer() {
   return <div className="h-12" />;
 }
 
+// "Card" items render their own bordered surface — tool runs, plans,
+// ask-question, todo lists, subagent dispatches. Adjacent cards need
+// breathing room or the borders bleed into one wall. Tight rows (plain
+// text bubbles, streaming chips, command-output notices) stay close so
+// long conversational stretches don't turn into a sparse ladder.
+function isCardItem(item: ChatItem): boolean {
+  if (item.kind === "tool_run") return true;
+  if (item.kind === "plan") return true;
+  if (item.kind === "ask_question") return true;
+  if (item.kind === "message" && item.msg.type === "assistant") {
+    const content = item.msg.message.content;
+    for (const block of content) {
+      if (block.type !== "tool_use") continue;
+      // TodoWrite renders as TodoListBlock (boxed checklist), Task /
+      // Agent dispatches render as SubagentCard. Both are visual cards.
+      if (block.name === "TodoWrite") return true;
+      if (isSubagentDispatchTool(block.name)) return true;
+    }
+  }
+  return false;
+}
+
 function ItemRow({
   item,
   approvePlan,
@@ -669,12 +746,13 @@ function ItemRow({
   answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
 }) {
+  // Card rows get a wider gap so a TodoListBlock / ToolRunCard /
+  // PlanCard doesn't sit flush against its neighbour. Tight rows
+  // (plain assistant text, user echoes) keep the 2px padding so
+  // back-to-back replies still read as one block.
+  const padY = isCardItem(item) ? "py-1.5" : "py-0.5";
   return (
-    // Tool-call-heavy turns stream as one ItemRow per assistant message,
-    // so per-row vertical padding compounds fast — keep it at 2px so
-    // long Bash/Read sequences read as one tight block instead of a
-    // sparse ladder.
-    <div className="px-4 py-0.5">
+    <div className={`px-4 ${padY}`}>
       <div className="mx-auto max-w-3xl">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}

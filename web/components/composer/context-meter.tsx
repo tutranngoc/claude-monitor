@@ -279,8 +279,11 @@ function ContextBreakdown({
   const cacheRead = usage?.cache_read_input_tokens ?? 0;
   const cacheCreate = usage?.cache_creation_input_tokens ?? 0;
   const input = usage?.input_tokens ?? 0;
-  const output = usage?.output_tokens ?? 0;
-  const used = cacheRead + cacheCreate + input + output;
+  // Match Claude Code CLI's calculateContextPercentages: input + cache.
+  // output_tokens belongs to the response, not the input window — and
+  // it'll be counted as input on the next turn when the assistant
+  // message is replayed.
+  const used = cacheRead + cacheCreate + input;
   // 5% reserve, matching the CLI's autocompact default.
   const autocompact = Math.round(contextWindow * 0.05);
   const free = Math.max(0, contextWindow - used - autocompact);
@@ -305,12 +308,6 @@ function ContextBreakdown({
       tokens: input,
       dot: "bg-emerald-500",
       bar: "bg-emerald-500/70",
-    },
-    {
-      label: "Last assistant reply",
-      tokens: output,
-      dot: "bg-sky-500",
-      bar: "bg-sky-500/70",
     },
   ];
 
@@ -421,15 +418,17 @@ function StackedBar({
   );
 }
 
-// totalContextTokens mirrors what /context shows in the chat — every
-// category contributes to the budget the SDK tracks against the model
-// window, so the meter must agree with the /context view to avoid
-// confusing the user (40% in /context, "<1%" on the meter).
+// totalContextTokens mirrors Claude Code CLI's calculateContextPercentages
+// (src/utils/context.ts): the input window the model SAW on the latest
+// API call = input_tokens + cache_creation + cache_read. output_tokens
+// is deliberately excluded — those are tokens the model GENERATED, not
+// part of the input window. They become part of the *next* turn's
+// input_tokens when the assistant message gets replayed, so counting
+// them here would double-charge them on the next response.
 function totalContextTokens(u?: SessionUsage): number {
   if (!u) return 0;
   return (
     (u.input_tokens ?? 0) +
-    (u.output_tokens ?? 0) +
     (u.cache_read_input_tokens ?? 0) +
     (u.cache_creation_input_tokens ?? 0)
   );
