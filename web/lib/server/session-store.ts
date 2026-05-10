@@ -9,6 +9,7 @@ import type { SDKMessage, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type {
   ContextUsageBreakdown,
   PermissionMode,
+  RateLimitInfo,
   SessionUsage,
 } from "@/lib/chat-types";
 import type { PlanRecord } from "@/lib/plan-types";
@@ -35,6 +36,18 @@ export interface StoredSession {
   latest_usage?: SessionUsage;
   latest_context_usage?: ContextUsageBreakdown;
   latest_plan?: PlanRecord;
+  // Phase-executor metadata. Set when this session was spawned by the
+  // plan approve route to run a single phase. Persisted so the link
+  // survives a daemon restart — phase boards rebuild from
+  // PlanRecord.phase_sessions[], but the session row's grouping in the
+  // sidebar still reads these fields directly.
+  plan_id?: string;
+  phase_slug?: string;
+  // Most recent rate_limit_event observed on the session. Carried so
+  // a session that hit a 5-hour cap right before a restart still shows
+  // the badge / countdown after the daemon comes back.
+  rate_limit?: RateLimitInfo;
+  rate_limit_observed_at?: string;
 }
 
 // One JSON file per session keeps writes scoped (a 5MB conversation

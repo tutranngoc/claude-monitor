@@ -32,6 +32,7 @@ import {
   parseSlashCommand,
   type ParsedCommand,
 } from "@/lib/slash-commands";
+import { nextPermissionMode } from "@/lib/permission-mode";
 import { SidebarTrigger } from "@/components/sidebar/sidebar-trigger";
 import { MessageBubble, StreamingTurn } from "./message-bubble";
 import { ThinkingIndicator } from "./thinking-indicator";
@@ -39,8 +40,9 @@ import { QueueIndicator, computeQueuedMessages } from "./queue-indicator";
 import { PermissionDialog } from "./permission-dialog";
 import { PlanCard } from "./plan-card";
 import { AskQuestionCard } from "./ask-question-card";
+import { ToolRunCard } from "./tool-run-card";
 import { SubagentProvider } from "./subagent-context";
-import { shouldHideFromMainTimeline } from "@/lib/subagents";
+import { isSubagentDispatchTool, shouldHideFromMainTimeline } from "@/lib/subagents";
 import {
   CommandOutputBubble,
   type CommandOutput,
@@ -55,6 +57,89 @@ interface Props {
 // preview, latest plan, and any error notices so they share the same
 // virtualized scroll viewport. Anything that needs to anchor at the
 // bottom is added as a trailing item.
+// classifyForRun decides whether a message can participate in a
+// "tool run" group:
+//   tool_asst   — assistant turn whose content is exclusively tool_use
+//                 (and optionally thinking); a real text reply ends a
+//                 run because that's where Claude is talking to the
+//                 user, not just operating.
+//   tool_user   — user message whose content is exclusively tool_result
+//                 echoes (the SDK's reply to a prior tool_use).
+//   skip        — non-rendering noise (system hook events, result-end
+//                 markers, future unknown types). Passes transparently
+//                 through a streak so a single hook ping doesn't shred
+//                 a 10-call tool run into two visible groups.
+//   other       — real user text or assistant text — a genuine
+//                 conversational beat that ends the streak.
+// Hidden subagent-internal messages are filtered upstream and never
+// reach this classifier.
+// Tools whose result the user mostly looks at *directly* (not as
+// supporting evidence for an investigation) — collapsing them into a
+// run hides the very thing the user wanted to see. TodoWrite is the
+// canonical example: the checklist IS the artifact, not a step toward
+// one. Add other "first-class output" tools here as they come up
+// (ExitPlanMode, AskUserQuestion would be siblings if they weren't
+// already lifted out via dedicated cards).
+const STANDALONE_TOOLS = new Set(["TodoWrite"]);
+
+function hasStandaloneTool(blocks: { type: string; name?: string }[]): boolean {
+  for (const b of blocks) {
+    if (b.type === "tool_use" && b.name && STANDALONE_TOOLS.has(b.name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function classifyForRun(
+  msg: SDKMessage,
+): "tool_asst" | "tool_user" | "skip" | "other" {
+  if (msg.type === "assistant") {
+    const content = msg.message.content;
+    let hasToolUse = false;
+    for (const b of content) {
+      if (b.type === "tool_use") hasToolUse = true;
+    }
+    // Any assistant turn that calls at least one tool counts as part
+    // of a tool run, even if it leads with a brief text intro like
+    // "Let me check…". The text gets folded into the collapsible
+    // alongside the tool_use, which is what the user wants — short
+    // operating commentary should NOT shatter a 10-call streak into
+    // five tiny groups. A turn with text and NO tool_use stays
+    // "other" so a real conversational reply still ends the run.
+    //
+    // EXCEPTION: a TodoWrite (or other STANDALONE_TOOLS) call must NOT
+    // be folded into a tool-run group — the checklist is what the user
+    // came here to see, and burying it inside a bash collapsible
+    // hides it. Treat it as "other" so it breaks the streak and
+    // renders as its own MessageBubble / TodoCard.
+    if (hasStandaloneTool(content)) return "other";
+    return hasToolUse ? "tool_asst" : "other";
+  }
+  if (msg.type === "user") {
+    const content = msg.message.content;
+    if (typeof content === "string") {
+      // Plain user text is a real conversational beat — break streak.
+      // The synthetic <local-command-stdout> envelope renders as a
+      // small inline notice but it still represents a user gesture
+      // (slash command), so treat as "other" too.
+      return "other";
+    }
+    if (content.length === 0) return "other";
+    for (const b of content) {
+      if (b.type !== "tool_result") return "other";
+    }
+    return "tool_user";
+  }
+  // system (init, hook_started/hook_response/compact_boundary),
+  // result (turn-end), stream_event (partial deltas — but those are
+  // already filtered before they reach history), and any future SDK
+  // top-level types: don't render as standalone rows in the main
+  // timeline (or render as trivial chrome), so they shouldn't break
+  // a streak. Skip them.
+  return "skip";
+}
+
 type ChatItem =
   | { kind: "message"; msg: SDKMessage }
   | { kind: "streaming"; blocks: StreamingBlock[] }
@@ -62,7 +147,12 @@ type ChatItem =
   | { kind: "ask_question"; request: AskUserQuestionRequest }
   | { kind: "error"; message: string; index: number }
   | { kind: "command_output"; output: CommandOutput; id: string }
-  | { kind: "thinking" };
+  | { kind: "thinking" }
+  // tool_run collapses ≥2 contiguous tool-only turns (assistant emits
+  // only tool_use/thinking blocks, user echoes only tool_result) into
+  // one collapsible block. runId is the first message's uuid so the
+  // virtuoso key is stable across re-renders.
+  | { kind: "tool_run"; runId: string; messages: SDKMessage[] };
 
 interface CommandLog {
   id: string;
@@ -151,6 +241,35 @@ export function ChatPanel({ session }: Props) {
     }
   };
 
+  // Shift+Tab cycles through permission modes the same way the Claude
+  // Code CLI does (default → acceptEdits → plan → bypassPermissions →
+  // default). Bound on `window` so it works whether the textarea has
+  // focus or not — preventDefault stops the browser's tab-rotation
+  // navigation. The fresh permissionMode read inside the handler avoids
+  // staleness without taking it as a dep (which would re-bind the
+  // listener on every keystroke).
+  const permissionModeRef = useRef(permissionMode);
+  useEffect(() => {
+    permissionModeRef.current = permissionMode;
+  }, [permissionMode]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.shiftKey || e.key !== "Tab") return;
+      // Don't fight other modifier-laden Tab combos (Ctrl+Shift+Tab is
+      // the browser's "previous tab" shortcut on most platforms).
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      e.preventDefault();
+      const next = nextPermissionMode(permissionModeRef.current);
+      void patchOptions({ permission_mode: next });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // patchOptions is recreated each render but stable in behavior;
+    // we read permission mode through the ref above. Empty deps keep
+    // the listener registered exactly once for the panel's lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // The SSR snapshot's `usage` is from session creation; once SSE starts
   // streaming, it becomes stale. Recompute from the latest `result` SDK
   // message in history so the context meter reflects live tokens. React
@@ -196,15 +315,97 @@ export function ChatPanel({ session }: Props) {
       }
     };
     flushCmdsUpTo(0);
+    // visibleClass marks each history index by what role it'd play in
+    // a tool-run: tool_assistant (assistant turn that's pure tool_use,
+    // optionally with thinking), tool_user_result (user message that
+    // carries only tool_result blocks), or other. Subagent-internal
+    // and otherwise-hidden messages are passed through as "skip" so
+    // they don't break a streak that surrounds them.
+    const klass: Array<"tool_asst" | "tool_user" | "skip" | "other"> = [];
     for (let i = 0; i < chat.history.length; i++) {
       const msg = chat.history[i];
-      // Children of a Task subagent live inside that subagent's card,
-      // not in the top-level viewport. Same for the user message that
-      // ferries a Task's tool_result back to the dispatcher.
-      if (!shouldHideFromMainTimeline(msg, subagentDerivation)) {
-        out.push({ kind: "message", msg });
+      if (shouldHideFromMainTimeline(msg, subagentDerivation)) {
+        klass.push("skip");
+        continue;
       }
+      klass.push(classifyForRun(msg));
+    }
+    let i = 0;
+    while (i < chat.history.length) {
+      const msg = chat.history[i];
+      if (klass[i] === "skip") {
+        flushCmdsUpTo(i + 1);
+        i++;
+        continue;
+      }
+      // Try to extend a tool-run starting at i. Pattern: a leading
+      // tool_asst, then any alternation of tool_user / tool_asst (skip
+      // entries pass through transparently). A pure-text assistant
+      // turn ("Now let me check the config…") gets folded INTO the
+      // streak iff another tool_asst follows within the same window —
+      // that interstitial commentary is part of the same investigation
+      // and forcing it to break a run leaves a forest of tiny groups
+      // standing next to each other. Real user input ends the run
+      // unconditionally (that's a new query).
+      if (klass[i] === "tool_asst") {
+        let end = i + 1;
+        let toolTurns = 1;
+        while (end < chat.history.length) {
+          const c = klass[end];
+          if (c === "skip") {
+            end++;
+            continue;
+          }
+          if (c === "tool_user" || c === "tool_asst") {
+            if (c === "tool_asst") toolTurns++;
+            end++;
+            continue;
+          }
+          // c === "other". Lookahead: if this is an assistant-only-
+          // text turn AND a tool_asst still follows (ignoring skip),
+          // absorb it into the run. User-text "other" stops the
+          // streak — the user is talking, not Claude.
+          if (chat.history[end].type === "assistant") {
+            let look = end + 1;
+            while (
+              look < chat.history.length &&
+              klass[look] === "skip"
+            ) {
+              look++;
+            }
+            if (
+              look < chat.history.length &&
+              klass[look] === "tool_asst"
+            ) {
+              end++;
+              continue;
+            }
+          }
+          break;
+        }
+        // ≥2 tool-only assistant turns is the threshold for grouping —
+        // a single tool call doesn't benefit from being wrapped in a
+        // collapsible (it's already one short bubble).
+        if (toolTurns >= 2) {
+          const slice: SDKMessage[] = [];
+          for (let j = i; j < end; j++) {
+            if (klass[j] === "skip") continue;
+            slice.push(chat.history[j]);
+          }
+          const firstUuid = (slice[0] as { uuid?: string }).uuid;
+          out.push({
+            kind: "tool_run",
+            runId: firstUuid ?? `run:${i}`,
+            messages: slice,
+          });
+          flushCmdsUpTo(end);
+          i = end;
+          continue;
+        }
+      }
+      out.push({ kind: "message", msg });
       flushCmdsUpTo(i + 1);
+      i++;
     }
     flushCmdsUpTo(Number.MAX_SAFE_INTEGER);
     if (chat.streamingBlocks.length > 0) {
@@ -414,6 +615,16 @@ export function ChatPanel({ session }: Props) {
                 <ItemRow
                   item={item}
                   approvePlan={chat.approvePlan}
+                  discussPlan={async (_planId, feedback) => {
+                    // Discuss-further on PlanCard pipes the user's
+                    // note straight back into the chat as a regular
+                    // user message. The model is still in plan mode
+                    // (read-only), so it can refine and call
+                    // submit_plan again — at which point the plan
+                    // pointer flips and PlanCard re-renders with the
+                    // new revision.
+                    await chat.send(feedback);
+                  }}
                   answerQuestion={chat.answer}
                   cancelQuestion={chat.cancelQuestion}
                 />
@@ -467,7 +678,7 @@ export function ChatPanel({ session }: Props) {
               effort={effort}
               onEffortChange={(e) => void patchOptions({ effort: e })}
               permMode={permissionMode}
-              onPermModeChange={(m) => void patchOptions({ permission_mode: m })}
+              onPermModeChange={(m) => patchOptions({ permission_mode: m })}
               onSubmit={onSubmit}
               disabled={closed}
               usage={liveUsage}
@@ -497,24 +708,61 @@ function HeaderSpacer() {
   return <div className="h-12" />;
 }
 
+// "Card" items render their own bordered surface — tool runs, plans,
+// ask-question, todo lists, subagent dispatches. Adjacent cards need
+// breathing room or the borders bleed into one wall. Tight rows (plain
+// text bubbles, streaming chips, command-output notices) stay close so
+// long conversational stretches don't turn into a sparse ladder.
+function isCardItem(item: ChatItem): boolean {
+  if (item.kind === "tool_run") return true;
+  if (item.kind === "plan") return true;
+  if (item.kind === "ask_question") return true;
+  if (item.kind === "message" && item.msg.type === "assistant") {
+    const content = item.msg.message.content;
+    for (const block of content) {
+      if (block.type !== "tool_use") continue;
+      // TodoWrite renders as TodoListBlock (boxed checklist), Task /
+      // Agent dispatches render as SubagentCard. Both are visual cards.
+      if (block.name === "TodoWrite") return true;
+      if (isSubagentDispatchTool(block.name)) return true;
+    }
+  }
+  return false;
+}
+
 function ItemRow({
   item,
   approvePlan,
+  discussPlan,
   answerQuestion,
   cancelQuestion,
 }: {
   item: ChatItem;
-  approvePlan: (planId: string) => Promise<void>;
+  approvePlan: (
+    planId: string,
+    overrides?: import("@/lib/plan-types").PhaseOverrides,
+  ) => Promise<void>;
+  discussPlan: (planId: string, feedback: string) => Promise<void>;
   answerQuestion: (answers: AskUserQuestionAnswers) => Promise<void>;
   cancelQuestion: (message?: string) => Promise<void>;
 }) {
+  // Card rows get a wider gap so a TodoListBlock / ToolRunCard /
+  // PlanCard doesn't sit flush against its neighbour. Tight rows
+  // (plain assistant text, user echoes) keep the 2px padding so
+  // back-to-back replies still read as one block.
+  const padY = isCardItem(item) ? "py-1.5" : "py-0.5";
   return (
-    <div className="px-4 py-1">
+    <div className={`px-4 ${padY}`}>
       <div className="mx-auto max-w-3xl">
         {item.kind === "message" && <MessageBubble msg={item.msg} />}
         {item.kind === "streaming" && <StreamingTurn blocks={item.blocks} />}
+        {item.kind === "tool_run" && <ToolRunCard messages={item.messages} />}
         {item.kind === "plan" && (
-          <PlanCard plan={item.plan} onApprove={approvePlan} />
+          <PlanCard
+            plan={item.plan}
+            onApprove={approvePlan}
+            onDiscuss={discussPlan}
+          />
         )}
         {item.kind === "ask_question" && (
           <AskQuestionCard
@@ -548,6 +796,8 @@ function itemKey(_: number, item: ChatItem): string {
       // Single sticky key — Virtuoso reuses the same DOM node as deltas
       // arrive, avoiding a re-mount per chunk.
       return "streaming";
+    case "tool_run":
+      return `run:${item.runId}`;
     case "plan":
       return `plan:${item.plan.id}`;
     case "ask_question":

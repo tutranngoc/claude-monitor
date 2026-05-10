@@ -22,11 +22,32 @@ import {
   SUBMIT_PLAN_FQN,
 } from "./plan-mcp";
 import {
+  createNotesMcpServer,
+  LIST_NOTES_FQN,
+  NOTES_MCP_SERVER_NAME,
+  SUBMIT_NOTE_FQN,
+} from "./notes-mcp";
+import {
+  ADOPT_PLAN_FQN,
+  ARCHIVE_PLAN_FQN,
+  createLeaderMcpServer,
+  LEADER_LIST_NOTES_FQN,
+  LEADER_MCP_SERVER_NAME,
+  MERGE_PLAN_FQN,
+  READ_PHASE_DIFF_FQN,
+  READ_PLAN_STATE_FQN,
+  RECORD_SHARED_CONTEXT_FQN,
+  RUN_INTEGRATION_REVIEW_FQN,
+} from "./leader-mcp";
+import {
   deleteStoredSession,
   loadAllStoredSessions,
   persistStoredSession,
   type StoredSession,
 } from "./session-store";
+import { listAllPlans } from "./plans";
+import { startRlResetWatchdog } from "./rl-watchdog";
+import { ensureSkillsInstalled } from "./skills-installer";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionEntry,
@@ -37,6 +58,7 @@ import type {
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
+  RateLimitInfo,
   SessionSnapshot,
   SessionStatus,
   SessionSummary,
@@ -74,6 +96,11 @@ interface ChatSession {
   model?: string;
   effort?: EffortLevel;
   permissionMode: PermissionMode;
+  // Set when this session is a phase executor (spawned from plan approve).
+  // Sidebar uses these to group phase sessions under their owning plan;
+  // PhaseBoard joins on (plan_id, phase_slug) to attach live status.
+  planId?: string;
+  phaseSlug?: string;
 
   inputQueue: AsyncQueue<SDKUserMessage>;
   query: Query;
@@ -114,6 +141,11 @@ interface ChatSession {
   // circuit identical Bash invocations regardless of what the binary
   // decides — matching the user's mental model of "I clicked Always".
   alwaysAllowRules: PermissionRuleValue[];
+  // Most recent rate_limit_event observed. The SDK auto-retries
+  // internally — we just hold this so the UI can render a countdown
+  // and the field survives restart via session-store.
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -135,6 +167,10 @@ interface InterruptedSession {
   latestUsage?: SessionUsage;
   latestContextUsage?: ContextUsageBreakdown;
   latestPlan?: PlanRecord;
+  planId?: string;
+  phaseSlug?: string;
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -196,6 +232,10 @@ async function initFromDisk(): Promise<void> {
         latestUsage: s.latest_usage,
         latestContextUsage: s.latest_context_usage,
         latestPlan: s.latest_plan,
+        planId: s.plan_id,
+        phaseSlug: s.phase_slug,
+        rateLimit: s.rate_limit,
+        rateLimitObservedAt: s.rate_limit_observed_at,
       });
     }
     if (stored.length > 0) {
@@ -204,9 +244,87 @@ async function initFromDisk(): Promise<void> {
   } catch (err) {
     console.warn("[sessions] disk hydrate failed:", err);
   }
+
+  // Eagerly re-spawn phase sessions for every approved plan. Without
+  // this, a session that was rate-limited / mid-turn when the daemon
+  // went down stays as a shadow until the user navigates to its tab —
+  // which defeats the whole point of unattended phase scheduling.
+  // Promoting via getOrResume re-launches the SDK Query in `resume`
+  // mode so the claude binary picks the transcript back up; whether it
+  // re-emits a stalled turn is the binary's job.
+  //
+  // Skipped: phases that already committed (clean / committed). Those
+  // are done — re-hydrating wastes a Query. failed/unset stay eligible
+  // because the user may still want to retry.
+  await rehydratePhaseSessions();
+
+  // Background watchdog: phase sessions that hit a hard rate limit and
+  // exhausted the SDK's internal retries get auto-restarted once their
+  // resetsAt window opens. Idempotent — only arms the timer once per
+  // process, regardless of how often this module is re-evaluated.
+  startRlResetWatchdog();
+
+  // Install vendored skills (web/skills/*) into ~/.claude/skills/ so
+  // every Claude Code session the orchestrator spawns can discover
+  // them via the native skill-trigger mechanism — phase agents pick
+  // them up by description match without us having to nail content
+  // into every kickoff prompt. Idempotent on unchanged content.
+  try {
+    await ensureSkillsInstalled();
+  } catch (err) {
+    console.warn("[sessions] ensureSkillsInstalled failed:", err);
+  }
+}
+
+async function rehydratePhaseSessions(): Promise<void> {
+  let revived = 0;
+  try {
+    const plans = await listAllPlans();
+    for (const plan of plans) {
+      if (plan.status !== "approved") continue;
+      for (const link of plan.phase_sessions ?? []) {
+        if (link.commit_status === "clean" || link.commit_status === "committed") {
+          continue;
+        }
+        // Already live? Nothing to do. Only the shadow path needs a kick.
+        if (sessions.has(link.session_id)) continue;
+        if (!interruptedSessions.has(link.session_id)) continue;
+        try {
+          getOrResume(link.session_id);
+          revived++;
+        } catch (err) {
+          console.warn(
+            `[sessions] re-hydrate ${link.session_id} (plan ${plan.id} / phase ${link.phase_slug}) failed:`,
+            err,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[sessions] phase re-hydrate sweep failed:", err);
+    return;
+  }
+  if (revived > 0) {
+    console.log(`[sessions] re-hydrated ${revived} phase session(s) from approved plans`);
+  }
 }
 
 const PERSIST_DEBOUNCE_MS = 500;
+
+// Appended to every owner/leader session's system prompt. Default
+// behavior is unchanged — act like a normal Claude Code session. The
+// only addition is recognizing the explicit multi-phase directive the
+// composer's MultiPhaseToggle prepends to a user message.
+//
+// We deliberately don't teach the model to triage or volunteer the
+// multi-phase path on its own — the user has the toggle in the
+// composer for that. Phase sessions don't see this append: they have
+// a curated kickoff prompt and a single-purpose scope.
+const OWNER_TRIAGE_APPEND = `## Orchestrator: multi-phase directive
+
+This chat runs inside the claude-monitor orchestrator. By default behave as a normal Claude Code single-session agent — plan, edit, and run tools in this chat as usual.
+
+If a user message arrives with a leading \`<orchestrator-intent>multi-phase</orchestrator-intent>\` directive, the chat has already been flipped into Plan mode (\`permissionMode: "plan"\`) by the composer — Edit / Write / Bash file-modifying tools are blocked. Use the read-only window to research the codebase (Read, Grep, Glob), then draft the phases and call the \`mcp__plans__submit_plan\` MCP tool with them. \`submit_plan\` is auto-approved past Plan mode's read-only gate; it serves as your plan-mode exit and writes the structured plan into the orchestrator. After it returns, the user reviews and approves the plan in the chat panel; phase agents then spawn into their own git worktrees and this chat becomes the leader (\`mcp__leader__*\` tools). Without the directive, do NOT volunteer the multi-phase path or call \`submit_plan\`.`;
 
 // schedulePersist coalesces rapid changes (token deltas + history pushes
 // + status flips during a single turn) into one write. The first
@@ -244,6 +362,10 @@ async function persistNow(id: string): Promise<void> {
       latest_usage: s.latestUsage,
       latest_context_usage: s.latestContextUsage,
       latest_plan: s.latestPlan,
+      plan_id: s.planId,
+      phase_slug: s.phaseSlug,
+      rate_limit: s.rateLimit,
+      rate_limit_observed_at: s.rateLimitObservedAt,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -291,7 +413,56 @@ function summarize(session: ChatSession): SessionSummary {
     usage: session.latestUsage,
     context_usage: session.latestContextUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
+    plan_id: session.planId,
+    phase_slug: session.phaseSlug,
+    rate_limit: session.rateLimit,
+    rate_limit_observed_at: session.rateLimitObservedAt,
   };
+}
+
+// handleRateLimitEvent translates an SDKRateLimitEvent into our
+// snake_case wire shape, persists it on the session for restart-
+// survivability, and emits a `rate_limit` SSE event. Status flips to
+// `rate_limited` only on the `rejected` outcome — `allowed_warning` is
+// a heads-up the badge can show without claiming the agent is paused;
+// `allowed` is silent (we still record it so a UI countdown clock has
+// something to display once it expires, but no SSE noise).
+function handleRateLimitEvent(
+  session: ChatSession,
+  msg: Extract<SDKMessage, { type: "rate_limit_event" }>,
+): void {
+  const raw = msg.rate_limit_info;
+  const info: RateLimitInfo = {
+    status: raw.status,
+    resetsAt: raw.resetsAt,
+    rate_limit_type: raw.rateLimitType,
+    utilization: raw.utilization,
+    overage_status: raw.overageStatus,
+    overage_resets_at: raw.overageResetsAt,
+    is_using_overage: raw.isUsingOverage,
+    surpassed_threshold: raw.surpassedThreshold,
+  };
+  const observedAt = new Date().toISOString();
+  session.rateLimit = info;
+  session.rateLimitObservedAt = observedAt;
+  schedulePersist(session.id);
+  emit(session, {
+    type: "rate_limit",
+    data: { info, observed_at: observedAt },
+  });
+  if (info.status === "rejected") {
+    // Don't trample awaiting_permission — a pending tool dialog is
+    // strictly more important and the user-facing state stays accurate
+    // (the dialog will resolve, then the next turn either gets through
+    // or hits the same rate limit and re-emits).
+    if (
+      session.status !== "awaiting_permission" &&
+      session.status !== "errored" &&
+      session.status !== "closed"
+    ) {
+      setStatus(session, "rate_limited");
+    }
+  }
 }
 
 // refreshContextUsage queries the SDK control channel for an
@@ -464,6 +635,30 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
     if (toolName === SUBMIT_PLAN_FQN) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
+    // Phase notes are sibling broadcasts — the MCP closure scopes them
+    // to this session's plan + phase, so there is no privileged surface
+    // for the user to gate. Auto-allow both the writer and the reader
+    // for the same reason submit_plan is auto-allowed.
+    if (toolName === SUBMIT_NOTE_FQN || toolName === LIST_NOTES_FQN) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
+    // Leader read tools + plan-scoped writes (shared brief, merge,
+    // integration review, archive flag) auto-allow — they touch plan.json
+    // and the integration branch the owner already controls. Cleanup
+    // (cleanup_worktrees) intentionally falls through to the user
+    // dialog because it deletes worktree dirs and phase branches.
+    if (
+      toolName === READ_PLAN_STATE_FQN ||
+      toolName === LEADER_LIST_NOTES_FQN ||
+      toolName === READ_PHASE_DIFF_FQN ||
+      toolName === RECORD_SHARED_CONTEXT_FQN ||
+      toolName === MERGE_PLAN_FQN ||
+      toolName === RUN_INTEGRATION_REVIEW_FQN ||
+      toolName === ARCHIVE_PLAN_FQN ||
+      toolName === ADOPT_PLAN_FQN
+    ) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
     // AskUserQuestion is a conversational tool, not a privileged action.
     // Route it through its own form UI instead of the generic permission
     // gate — the user picks an option, and we ship the answers back to
@@ -606,6 +801,49 @@ function makePlanMcp(session: ChatSession) {
   });
 }
 
+// makeNotesMcp returns a session-bound phase-notes MCP server. Only
+// meaningful for phase sessions (planId + phaseSlug both set); the
+// caller checks before invoking. Closure pins the planId/phaseSlug at
+// build time so submit_phase_note can append without the agent having
+// to identify itself in every call.
+function makeNotesMcp(session: ChatSession) {
+  if (!session.planId || !session.phaseSlug) {
+    throw new Error(
+      "makeNotesMcp requires session.planId and session.phaseSlug",
+    );
+  }
+  return createNotesMcpServer({
+    planId: session.planId,
+    phaseSlug: session.phaseSlug,
+  });
+}
+
+// makeLeaderMcp builds the cross-phase read-only toolkit for an owner
+// session — the chat that submitted the plan. Closures over the live
+// session so resolveCurrentPlanId tracks whatever submit_plan most
+// recently wrote without the leader having to thread plan_id through
+// every call. snapshotPhaseSession is wired through `summarize` so
+// read_plan_state surfaces live SDK status (thinking/idle/...) and
+// context_usage alongside the on-disk plan record.
+function makeLeaderMcp(session: ChatSession) {
+  return createLeaderMcpServer({
+    sessionId: session.id,
+    resolveCurrentPlanId: () => session.latestPlan?.id,
+    snapshotPhaseSession: (sid) => {
+      const s = sessions.get(sid);
+      return s ? summarize(s) : undefined;
+    },
+    // adopt_plan calls this so the live ChatSession's latestPlan flips
+    // to the adopted plan; subsequent leader tool calls then resolve
+    // plan_id automatically. schedulePersist mirrors the change to
+    // session-store so it survives daemon restarts.
+    bindCurrentPlan: (plan) => {
+      session.latestPlan = plan;
+      schedulePersist(session.id);
+    },
+  });
+}
+
 interface BuildLiveInit {
   id: string;
   cwd: string;
@@ -619,6 +857,10 @@ interface BuildLiveInit {
   latestUsage?: SessionUsage;
   latestContextUsage?: ContextUsageBreakdown;
   latestPlan?: PlanRecord;
+  planId?: string;
+  phaseSlug?: string;
+  rateLimit?: RateLimitInfo;
+  rateLimitObservedAt?: string;
   // isResume → query() is launched with `resume` instead of
   // `sessionId`, telling the claude binary to load the session's
   // transcript from ~/.claude/projects/<dir>/<id>.jsonl and continue
@@ -648,6 +890,8 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     model: init.model,
     effort: init.effort,
     permissionMode: init.permissionMode,
+    planId: init.planId,
+    phaseSlug: init.phaseSlug,
     inputQueue,
     history: init.history,
     status: "starting",
@@ -658,6 +902,8 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     latestContextUsage: init.latestContextUsage,
     latestPlan: init.latestPlan,
     alwaysAllowRules: [],
+    rateLimit: init.rateLimit,
+    rateLimitObservedAt: init.rateLimitObservedAt,
     query: undefined as unknown as Query, // assigned below
   };
 
@@ -679,7 +925,17 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       // environment block (cwd/OS/git), tool tactics, and CLAUDE.md
       // dynamic injection — output drifts toward generic Claude. Opt
       // in to match the `claude` CLI.
-      systemPrompt: { type: "preset", preset: "claude_code" },
+      //
+      // For owner/leader sessions (no phaseSlug → there is no parent
+      // plan agent driving them) we append a triage instruction so the
+      // model offers the user an explicit single-vs-multi-phase choice
+      // before doing work. Phase sessions get a curated kickoff prompt
+      // and shouldn't see this.
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        ...(init.phaseSlug ? {} : { append: OWNER_TRIAGE_APPEND }),
+      },
       permissionMode: init.permissionMode,
       // bypassPermissions ("Auto / Yolo" in the UI) requires the
       // session to be launched with this opt-in. Without it the SDK
@@ -689,7 +945,23 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
       // `--allow-dangerously-skip-permissions` flag.
       allowDangerouslySkipPermissions: true,
       canUseTool: makeCanUseTool(session),
-      mcpServers: { [PLAN_MCP_SERVER_NAME]: makePlanMcp(session) },
+      mcpServers: {
+        [PLAN_MCP_SERVER_NAME]: makePlanMcp(session),
+        // Notes server only registers for phase sessions; owner sessions
+        // (no planId) skip it because there are no siblings to broadcast
+        // to and the tools would be no-ops.
+        ...(session.planId && session.phaseSlug
+          ? { [NOTES_MCP_SERVER_NAME]: makeNotesMcp(session) }
+          : {}),
+        // Leader toolkit is the inverse: registers ONLY for owner
+        // sessions (no phaseSlug). A phase agent doesn't need to query
+        // its siblings' state — that's the planner's job, and giving
+        // every phase the cross-phase read surface would dilute the
+        // sibling-isolation discipline the kickoff prompt sets up.
+        ...(session.phaseSlug
+          ? {}
+          : { [LEADER_MCP_SERVER_NAME]: makeLeaderMcp(session) }),
+      },
       abortController,
       // Resume vs fresh: `resume` loads the session's transcript via
       // claude's own jsonl on disk; `sessionId` opens a fresh session
@@ -717,6 +989,8 @@ export function createSession(opts: {
   model?: string;
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
+  planId?: string;
+  phaseSlug?: string;
 }): SessionSummary {
   const id = randomUUID();
   const session = buildLiveSession({
@@ -728,11 +1002,51 @@ export function createSession(opts: {
     model: opts.model,
     effort: opts.effort,
     permissionMode: opts.permissionMode ?? "default",
+    planId: opts.planId,
+    phaseSlug: opts.phaseSlug,
     history: [],
     isResume: false,
   });
   schedulePersist(id);
   return summarize(session);
+}
+
+// registerImportedSession slots a session built outside the orchestrator
+// (e.g. parsed from a Claude Code CLI jsonl by cli-import.ts) into the
+// interrupted-shadow map without spawning a Query. The session is
+// listed in the sidebar immediately; the SDK gets fired up only when
+// the user actually opens the tab — at which point getOrResume promotes
+// it via SDK `resume: <id>` and the binary loads the transcript from
+// ~/.claude/projects/<encoded-cwd>/<id>.jsonl on its own.
+//
+// Returns false when a session with the same id is already registered
+// (live or shadow); the caller decides whether that's an error or a
+// no-op. Persisted snapshot is written by cli-import.ts before this
+// call so a daemon restart picks the import back up via initFromDisk().
+export function registerImportedSession(stored: {
+  id: string;
+  cwd: string;
+  config_dir: string;
+  account_name?: string;
+  created_at: string;
+  model?: string;
+  permission_mode: PermissionMode;
+  history: SDKMessage[];
+}): boolean {
+  if (sessions.has(stored.id) || interruptedSessions.has(stored.id)) {
+    return false;
+  }
+  interruptedSessions.set(stored.id, {
+    id: stored.id,
+    cwd: stored.cwd,
+    configDir: stored.config_dir,
+    accountName: stored.account_name,
+    createdAt: new Date(stored.created_at),
+    model: stored.model,
+    permissionMode: stored.permission_mode,
+    history: stored.history,
+  });
+  return true;
 }
 
 // resumeSession promotes an InterruptedSession (loaded from disk on
@@ -751,10 +1065,14 @@ function resumeSession(stored: InterruptedSession): ChatSession {
     model: stored.model,
     effort: stored.effort,
     permissionMode: stored.permissionMode,
+    planId: stored.planId,
+    phaseSlug: stored.phaseSlug,
     history: stored.history,
     latestUsage: stored.latestUsage,
     latestContextUsage: stored.latestContextUsage,
     latestPlan: stored.latestPlan,
+    rateLimit: stored.rateLimit,
+    rateLimitObservedAt: stored.rateLimitObservedAt,
     isResume: true,
   });
   interruptedSessions.delete(stored.id);
@@ -830,9 +1148,18 @@ async function driveSession(session: ChatSession): Promise<void> {
       if (msg.type === "result") {
         setStatus(session, "idle");
         void refreshContextUsage(session);
+      } else if (msg.type === "rate_limit_event") {
+        // SDK auto-retries internally up to CLAUDE_CODE_MAX_RETRIES;
+        // we observe so the UI can render a countdown. We DON'T
+        // pause input or change the abort signal — that would compete
+        // with the SDK's own retry. Status flip is purely informational
+        // and reverts on the next assistant/stream_event.
+        handleRateLimitEvent(session, msg);
       } else if (
         (msg.type === "assistant" || msg.type === "stream_event") &&
-        (session.status === "starting" || session.status === "idle")
+        (session.status === "starting" ||
+          session.status === "idle" ||
+          session.status === "rate_limited")
       ) {
         // Real model output is starting — Claude is working. Earlier
         // we flipped on *any* non-result message, but the SDK also
@@ -840,6 +1167,9 @@ async function driveSession(session: ChatSession): Promise<void> {
         // setPermissionMode acknowledgements; flipping on those left
         // the session stuck on "thinking" after a mode change with
         // no actual turn in flight.
+        // Including "rate_limited" here lets the SDK's successful
+        // internal retry naturally clear the badge state when output
+        // resumes.
         setStatus(session, "thinking");
       }
     }
@@ -879,6 +1209,10 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     usage: s.latestUsage,
     context_usage: s.latestContextUsage,
     subagents: subagents.length > 0 ? subagents : undefined,
+    plan_id: s.planId,
+    phase_slug: s.phaseSlug,
+    rate_limit: s.rateLimit,
+    rate_limit_observed_at: s.rateLimitObservedAt,
   };
 }
 

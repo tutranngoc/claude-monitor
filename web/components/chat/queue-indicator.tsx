@@ -10,6 +10,7 @@ import {
   X,
   Check,
 } from "lucide-react";
+import { stripCliEnvelopes } from "@/lib/cli-envelope";
 import { cn } from "@/lib/utils";
 
 interface QueuedMessage {
@@ -24,9 +25,11 @@ interface QueuedMessage {
 }
 
 // queuedMessages walks the transcript and pulls out user messages that
-// haven't been answered yet. The SDK delimits each completed turn with
-// a `result` SDKMessage, so anything between the last result and the
-// end of history is in flight or queued.
+// haven't been answered yet. A user message is considered answered as
+// soon as ANY assistant message lands after it — the trailing `result`
+// is just turn-end metadata, and sessions imported from the CLI jsonl
+// (cli-import.ts) carry no `result` events at all, which used to leave
+// every past prompt eternally queued.
 //
 // Tool-result user messages (sent by the SDK to relay tool output back
 // to the model) are skipped — those aren't user-typed input and don't
@@ -35,15 +38,16 @@ export function computeQueuedMessages(
   history: SDKMessage[],
   thinking: boolean,
 ): QueuedMessage[] {
-  let lastResultIdx = -1;
+  let lastAnsweredIdx = -1;
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].type === "result") {
-      lastResultIdx = i;
+    const t = history[i].type;
+    if (t === "assistant" || t === "result") {
+      lastAnsweredIdx = i;
       break;
     }
   }
   const out: QueuedMessage[] = [];
-  for (let i = lastResultIdx + 1; i < history.length; i++) {
+  for (let i = lastAnsweredIdx + 1; i < history.length; i++) {
     const m = history[i];
     if (m.type !== "user") continue;
     const content = m.message.content;
@@ -62,7 +66,13 @@ export function computeQueuedMessages(
       if (!text) continue;
       preview = text.text;
     }
-    const trimmed = preview.replace(/\s+/g, " ").trim();
+    // Synthetic CLI envelopes (/clear, /model, local-command-stdout, …)
+    // resolve locally without an SDK turn, so no `result` ever arrives
+    // to clear them — strip the envelope wrappers and skip if nothing
+    // user-typed remains. Otherwise the queue would pile up forever.
+    const stripped = stripCliEnvelopes(preview);
+    if (!stripped) continue;
+    const trimmed = stripped.replace(/\s+/g, " ").trim();
     if (!trimmed) continue;
     out.push({
       id: (m as { uuid?: string }).uuid ?? `pos-${i}`,

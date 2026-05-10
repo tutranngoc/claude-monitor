@@ -51,3 +51,69 @@ export async function updatePlan(
   await writePlan(plan);
   return plan;
 }
+
+// findPlanById walks every project's plans/ directory under
+// ~/.claude/projects/*/plans/ looking for <planId>.json. The PhaseBoard
+// page identifies plans by id only — the encoded-cwd part of the path
+// is recoverable from the plan body, so we don't burden URLs with it.
+// O(projects) directory reads per lookup, but the on-disk layout is
+// shallow (one plan dir per project) and the user typically has fewer
+// than a dozen indexed projects, so the cost is fine for an interactive
+// page-load.
+export async function findPlanById(planId: string): Promise<PlanRecord | null> {
+  const projectsRoot = path.join(homedir(), ".claude", "projects");
+  let projects: string[];
+  try {
+    projects = await fs.readdir(projectsRoot);
+  } catch {
+    return null;
+  }
+  for (const project of projects) {
+    const file = path.join(projectsRoot, project, "plans", `${planId}.json`);
+    try {
+      const buf = await fs.readFile(file, "utf8");
+      return JSON.parse(buf) as PlanRecord;
+    } catch {
+      // ENOENT for this project — try next.
+      continue;
+    }
+  }
+  return null;
+}
+
+// listAllPlans returns every PlanRecord stored under
+// ~/.claude/projects/*/plans/*.json. Used at daemon startup to find
+// approved plans whose phase sessions need re-hydrating so phases keep
+// running unattended after a restart. Malformed files are skipped with
+// a warning rather than aborting the whole walk — one bad plan
+// shouldn't stop the rest from resuming.
+export async function listAllPlans(): Promise<PlanRecord[]> {
+  const projectsRoot = path.join(homedir(), ".claude", "projects");
+  let projects: string[];
+  try {
+    projects = await fs.readdir(projectsRoot);
+  } catch {
+    return [];
+  }
+  const out: PlanRecord[] = [];
+  for (const project of projects) {
+    const dir = path.join(projectsRoot, project, "plans");
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue;
+      const file = path.join(dir, name);
+      try {
+        const buf = await fs.readFile(file, "utf8");
+        out.push(JSON.parse(buf) as PlanRecord);
+      } catch (err) {
+        console.warn(`[plans] failed to load ${file}:`, err);
+      }
+    }
+  }
+  return out;
+}

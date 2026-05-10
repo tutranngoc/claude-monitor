@@ -10,6 +10,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import type { PermissionMode } from "@/lib/chat-types";
+import { permissionModeSymbol, type ModeTone } from "@/lib/permission-mode";
 
 // Re-export so existing import paths (`from "./mode-picker"`) keep working
 // without each composer site touching chat-types.
@@ -24,9 +25,11 @@ export interface ModeMeta {
   icon: typeof Lock;
   // Tone tag drives the chip background when active. acceptEdits is
   // amber (caution); bypassPermissions is destructive (full yolo).
-  tone: "neutral" | "info" | "warn" | "danger";
+  tone: ModeTone;
 }
 
+// Labels mirror Claude Code CLI's permissionModeTitle output so the
+// picker, banner, and the terminal client speak the same vocabulary.
 const MODES: ModeMeta[] = [
   {
     id: "default",
@@ -47,16 +50,16 @@ const MODES: ModeMeta[] = [
   {
     id: "acceptEdits",
     label: "Accept edits",
-    short: "Edits ✓",
+    short: "Edits",
     hint: "Auto-allow file edits. Bash and other risky tools still ask.",
     icon: Pencil,
     tone: "warn",
   },
   {
     id: "bypassPermissions",
-    label: "Auto / Yolo",
-    short: "Auto",
-    hint: "Skip every prompt. Use only for trusted, sandboxed work.",
+    label: "Bypass permissions",
+    short: "Bypass",
+    hint: "Skip every prompt (Yolo). Use only for trusted, sandboxed work.",
     icon: Play,
     tone: "danger",
   },
@@ -74,6 +77,7 @@ export function ModePicker({ mode, onChange }: Props) {
   const [open, setOpen] = useState(false);
   const active = MODES.find((m) => m.id === mode) ?? MODES[0];
   const Icon = active.icon;
+  const symbol = permissionModeSymbol(active.id);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -90,13 +94,27 @@ export function ModePicker({ mode, onChange }: Props) {
           />
         }
       >
-        <Icon className="size-3 shrink-0" aria-hidden />
+        {symbol ? (
+          <span aria-hidden className="font-mono text-[11px] leading-none">
+            {symbol}
+          </span>
+        ) : (
+          <Icon className="size-3 shrink-0" aria-hidden />
+        )}
         <span>{active.short}</span>
         <ChevronDown className="size-3 opacity-70" aria-hidden />
       </PopoverTrigger>
       <PopoverContent align="end" sideOffset={6} className="w-72 p-1.5">
-        <div className="px-2 pb-1.5 pt-1 text-[10px] font-semibold tracking-wider uppercase text-muted-foreground">
-          Permission mode
+        <div className="flex items-center justify-between px-2 pb-1.5 pt-1">
+          <span className="text-[10px] font-semibold tracking-wider uppercase text-muted-foreground">
+            Permission mode
+          </span>
+          <span className="text-[10px] text-muted-foreground">
+            <kbd className="rounded border px-1 py-px font-mono text-[9px]">
+              shift+tab
+            </kbd>{" "}
+            to cycle
+          </span>
         </div>
         <ul className="space-y-0.5">
           {MODES.map((m) => {
