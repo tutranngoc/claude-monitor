@@ -83,10 +83,22 @@ export function buildPhasePrompt(
         ].join("\n")
       : "";
 
+  // Plan-level shared context the owner/leader recorded via
+  // mcp__leader__record_shared_context. Frozen at spawn time — phases
+  // already running do NOT see edits; only phases spawned after the
+  // edit pick up the new content. Render before the per-phase brief so
+  // the agent reads the global anchors first.
+  const sharedBrief = plan.shared_brief?.trim();
+  const sharedSection =
+    sharedBrief && sharedBrief.length > 0
+      ? ["", "## Shared context (plan-level — applies to every phase)", sharedBrief].join("\n")
+      : "";
+
   return [
     `# Phase: ${phase.title}`,
     "",
     `You are the agent assigned to execute phase **${phase.slug}** of plan _"${plan.title}"_.`,
+    sharedSection,
     "",
     "## Your brief",
     phase.description,

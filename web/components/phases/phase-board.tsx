@@ -39,7 +39,16 @@ import type {
   ReviewFinding,
   ReviewSeverity,
 } from "@/lib/plan-types";
-import type { RateLimitInfo, SessionStatus, SessionSummary } from "@/lib/chat-types";
+import type {
+  ContextUsageBreakdown,
+  RateLimitInfo,
+  SessionStatus,
+  SessionSummary,
+} from "@/lib/chat-types";
+import {
+  actionHintForMaxTokens,
+  classifyContextZone,
+} from "@/lib/context-thresholds";
 import { Badge } from "@/components/ui/badge";
 import { DagView } from "./dag-view";
 
@@ -1112,7 +1121,7 @@ function PhaseRowCard({
               </>
             )}
             {session.context_usage && (
-              <ContextPctChip pct={session.context_usage.percentage} />
+              <ContextPctChip usage={session.context_usage} />
             )}
           </div>
         )}
@@ -1683,19 +1692,18 @@ function SessionStatusDot({ status }: { status: SessionStatus }) {
 
 // ContextPctChip surfaces the SDK's reported context-window usage so
 // the user can spot a phase that's about to push into degraded-output
-// territory. Tailwind tints by threshold: muted under 60%, amber 60-79
-// (start thinking about /compact or restart), destructive 80+ (the
-// model's reasoning quality typically drops sharply past this point;
-// in practice the user wants to summarize state and restart the phase
-// before letting it limp on).
-function ContextPctChip({ pct }: { pct: number }) {
-  const rounded = Math.round(pct);
+// territory. Threshold is model-aware (see lib/context-thresholds.ts):
+// 200k models act at 50% used; 1M models hold longer and act at ~75%.
+function ContextPctChip({ usage }: { usage: ContextUsageBreakdown }) {
+  const rounded = Math.round(usage.percentage);
+  const zone = classifyContextZone(usage.percentage, usage.max_tokens);
   const tone =
-    rounded >= 80
+    zone === "act"
       ? "border-destructive/40 bg-destructive/10 text-destructive"
-      : rounded >= 60
+      : zone === "warn"
         ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
         : "border-muted-foreground/30 bg-muted/40 text-muted-foreground";
+  const hint = zone === "act" ? ` — ${actionHintForMaxTokens(usage.max_tokens)}` : "";
   return (
     <>
       <span className="mx-1">·</span>
@@ -1704,7 +1712,7 @@ function ContextPctChip({ pct }: { pct: number }) {
           "inline-flex items-center gap-0.5 rounded border px-1 py-px tabular-nums",
           tone,
         )}
-        title={`context window: ${rounded}%${rounded >= 80 ? " — consider /compact or restart" : ""}`}
+        title={`context window: ${rounded}% of ${usage.max_tokens.toLocaleString()}${hint}`}
       >
         ctx {rounded}%
       </span>

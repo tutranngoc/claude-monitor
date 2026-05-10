@@ -33,6 +33,7 @@ import {
   LEADER_MCP_SERVER_NAME,
   READ_PHASE_DIFF_FQN,
   READ_PLAN_STATE_FQN,
+  RECORD_SHARED_CONTEXT_FQN,
 } from "./leader-mcp";
 import {
   deleteStoredSession,
@@ -623,12 +624,15 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
     // Leader tools are read-only snapshots over plan.json + git diffs
-    // in worktrees the owner already approved. No mutation surface, so
-    // auto-allow alongside the other plan-orchestration tools.
+    // in worktrees the owner already approved, plus record_shared_context
+    // which writes a single string field on plan.json. No surface beyond
+    // plan-scoped data the owner already controls — auto-allow alongside
+    // the other plan-orchestration tools.
     if (
       toolName === READ_PLAN_STATE_FQN ||
       toolName === LEADER_LIST_NOTES_FQN ||
-      toolName === READ_PHASE_DIFF_FQN
+      toolName === READ_PHASE_DIFF_FQN ||
+      toolName === RECORD_SHARED_CONTEXT_FQN
     ) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }

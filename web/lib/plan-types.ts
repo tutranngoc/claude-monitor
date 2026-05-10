@@ -231,6 +231,16 @@ export interface PlanRecord {
   // promotes any phase whose deps are now in {clean, committed} into
   // a real PhaseSession.
   pending_phases?: PhasePending[];
+  // Architecture-aware primer the owner/leader writes once via
+  // `record_shared_context` (mcp__leader__record_shared_context). Every
+  // spawned phase splices it into its kickoff prompt under "Shared
+  // context", so plan-specific facts (file paths, conventions, contracts,
+  // gotchas) reach all phases without the user retyping them per phase.
+  // Sibling to the karpathy-guidelines skill: skill = generic LLM
+  // guidance, brief = plan-specific anchors. Leader can rewrite at any
+  // time; phases spawned after the rewrite see the new content.
+  shared_brief?: string;
+  shared_brief_updated_at?: string;
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;

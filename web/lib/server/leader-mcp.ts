@@ -6,7 +6,8 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { PhaseNote, PhaseSession, PlanRecord } from "@/lib/plan-types";
 import type { SessionSummary } from "@/lib/chat-types";
-import { findPlanById } from "@/lib/server/plans";
+import { classifyContextZone } from "@/lib/context-thresholds";
+import { findPlanById, updatePlan } from "@/lib/server/plans";
 
 const exec = promisify(execFile);
 
@@ -14,8 +15,11 @@ const exec = promisify(execFile);
 //   mcp__leader__read_plan_state
 //   mcp__leader__list_phase_notes
 //   mcp__leader__read_phase_diff
-// All three are read-only and auto-allowed in canUseTool — they never
-// mutate plan.json or any worktree.
+//   mcp__leader__record_shared_context
+// First three are read-only snapshots; record_shared_context writes a
+// single string field (plan.shared_brief) that every phase's kickoff
+// prompt splices in. All four auto-allowed in canUseTool — the data is
+// purely plan-scoped and the owner is the human-trusted session anyway.
 //
 // "Leader" because the owner session that submit_plan'd is now the
 // natural place to ask cross-phase questions: "what's blocking phase
@@ -27,9 +31,18 @@ export const LEADER_MCP_SERVER_NAME = "leader";
 export const READ_PLAN_STATE_TOOL_NAME = "read_plan_state";
 export const LEADER_LIST_NOTES_TOOL_NAME = "list_phase_notes";
 export const READ_PHASE_DIFF_TOOL_NAME = "read_phase_diff";
+export const RECORD_SHARED_CONTEXT_TOOL_NAME = "record_shared_context";
 export const READ_PLAN_STATE_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PLAN_STATE_TOOL_NAME}`;
 export const LEADER_LIST_NOTES_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${LEADER_LIST_NOTES_TOOL_NAME}`;
 export const READ_PHASE_DIFF_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PHASE_DIFF_TOOL_NAME}`;
+export const RECORD_SHARED_CONTEXT_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${RECORD_SHARED_CONTEXT_TOOL_NAME}`;
+
+// Cap on shared_brief body. The brief is spliced into every phase's
+// kickoff prompt, so a 50KB primer would multiply across phases. 8KB is
+// roughly two screens of dense markdown — enough for architecture
+// pointers, contracts, and gotchas, not enough to attempt a full
+// CLAUDE.md replacement (that's what the user's CLAUDE.md is for).
+const SHARED_BRIEF_BYTE_CAP = 8 * 1024;
 
 export interface LeaderMcpContext {
   // Owner session id. Used purely for diagnostics today; reserved so
@@ -206,10 +219,66 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
     },
   );
 
+  const recordSharedContext = tool(
+    RECORD_SHARED_CONTEXT_TOOL_NAME,
+    "Write the plan-level shared brief. Every phase's kickoff prompt splices this in under 'Shared context', so use it for plan-specific anchors that would otherwise be retyped per phase: file paths, established conventions, contract shapes between phases, gotchas you have already discovered. This OVERWRITES any prior brief — read the current one via read_plan_state first if you mean to extend rather than replace. Phases already running do NOT see edits; only phases spawned after this call pick up the new brief. Cap: 8KB. Pass `body: \"\"` to clear.",
+    {
+      plan_id: z
+        .string()
+        .optional()
+        .describe(
+          "Plan id to write the brief on. Defaults to the owner session's latest submitted plan.",
+        ),
+      body: z
+        .string()
+        .max(SHARED_BRIEF_BYTE_CAP, {
+          message: `body must be at most ${SHARED_BRIEF_BYTE_CAP} bytes`,
+        })
+        .describe(
+          "Markdown body. Stays in plan.shared_brief on disk. Empty string clears the brief.",
+        ),
+    },
+    async ({ plan_id, body }) => {
+      const r = await resolvePlan(plan_id);
+      if ("error" in r) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: r.error }],
+        };
+      }
+      const trimmed = body.trim();
+      const updated = await updatePlan(r.plan.cwd, r.plan.id, (p) => {
+        if (trimmed.length === 0) {
+          delete p.shared_brief;
+          delete p.shared_brief_updated_at;
+        } else {
+          p.shared_brief = trimmed;
+          p.shared_brief_updated_at = new Date().toISOString();
+        }
+      });
+      const sizeMsg =
+        trimmed.length === 0
+          ? "Cleared shared brief."
+          : `Recorded shared brief — ${trimmed.length} bytes. Phases spawned after this point will splice it into their kickoff prompt.`;
+      const stillPending = (updated.pending_phases?.length ?? 0) > 0;
+      const reminder = stillPending
+        ? ` ${updated.pending_phases?.length} phase(s) are still pending and will pick up the new brief on spawn.`
+        : "";
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: sizeMsg + reminder,
+          },
+        ],
+      };
+    },
+  );
+
   return createSdkMcpServer({
     name: LEADER_MCP_SERVER_NAME,
     version: "0.1.0",
-    tools: [readPlanState, listNotes, readDiff],
+    tools: [readPlanState, listNotes, readDiff, recordSharedContext],
   });
 }
 
@@ -245,14 +314,19 @@ function formatPlanState(
     const runStatus = pendingSet.has(phase.slug)
       ? "pending"
       : (live?.status ?? (link ? "unknown" : "—"));
-    // Context window usage from the SDK's /context channel. Surface as
-    // "n%" so the leader can spot a phase that's about to blow past
-    // the model's effective reasoning window — by the time a session
-    // pushes ~80% the user typically wants to summarize/restart it
-    // instead of letting it limp on degraded output.
-    const ctx = live?.context_usage?.percentage;
-    const ctxCell =
-      ctx === undefined ? "—" : `${Math.round(ctx)}%${ctx >= 80 ? " ⚠" : ""}`;
+    // Context window usage from the SDK's /context channel. Threshold
+    // is model-aware (lib/context-thresholds.ts): 200k models flag at
+    // ~50% used, 1M models at ~75%. ⚠ marks the act zone, ! the warn
+    // band — the leader uses these to decide whether to nudge a phase
+    // toward /compact or memory-update + restart.
+    const usage = live?.context_usage;
+    const ctxCell = (() => {
+      if (!usage) return "—";
+      const rounded = Math.round(usage.percentage);
+      const zone = classifyContextZone(usage.percentage, usage.max_tokens);
+      const flag = zone === "act" ? " ⚠" : zone === "warn" ? " !" : "";
+      return `${rounded}%${flag}`;
+    })();
     const commit = link?.commit_status
       ? link.commit_status === "committed"
         ? `committed ${link.commit_sha?.slice(0, 7) ?? ""}`
@@ -323,6 +397,19 @@ function formatPlanState(
         lines.push(`- **${f.severity}** ${f.title}${loc}`);
       }
     }
+  }
+
+  if (plan.shared_brief && plan.shared_brief.length > 0) {
+    const updated = plan.shared_brief_updated_at
+      ? ` _(updated ${plan.shared_brief_updated_at})_`
+      : "";
+    lines.push("", `## Shared brief${updated}`, "", plan.shared_brief);
+  } else {
+    lines.push(
+      "",
+      "## Shared brief",
+      "_(none — call `record_shared_context` to seed plan-level anchors that every phase splices into its kickoff prompt)_",
+    );
   }
 
   const notes = plan.notes ?? [];
