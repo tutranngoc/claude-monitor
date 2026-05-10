@@ -64,36 +64,55 @@ interface Props {
 //                 user, not just operating.
 //   tool_user   — user message whose content is exclusively tool_result
 //                 echoes (the SDK's reply to a prior tool_use).
-//   other       — anything else (system, result-end, plain text, mixed).
+//   skip        — non-rendering noise (system hook events, result-end
+//                 markers, future unknown types). Passes transparently
+//                 through a streak so a single hook ping doesn't shred
+//                 a 10-call tool run into two visible groups.
+//   other       — real user text or assistant text — a genuine
+//                 conversational beat that ends the streak.
 // Hidden subagent-internal messages are filtered upstream and never
 // reach this classifier.
 function classifyForRun(
   msg: SDKMessage,
-): "tool_asst" | "tool_user" | "other" {
+): "tool_asst" | "tool_user" | "skip" | "other" {
   if (msg.type === "assistant") {
     const content = msg.message.content;
     let hasToolUse = false;
-    let hasNonToolNonThinking = false;
+    let hasUserVisibleNonTool = false;
     for (const b of content) {
       if (b.type === "tool_use") hasToolUse = true;
-      else if (b.type === "thinking") {
-        // thinking blocks don't disqualify — they're hidden when empty
-        // and quietly italicised when not, so they sit naturally inside
-        // a tool run. Continue.
-      } else hasNonToolNonThinking = true;
+      else if (b.type === "text") {
+        // Only a text block really breaks a run — the assistant is
+        // now communicating with the user, not just operating.
+        // thinking / redacted_thinking / server_tool_use / *_tool_result
+        // / compaction / future SDK block types pass through silently.
+        hasUserVisibleNonTool = true;
+      }
     }
-    return hasToolUse && !hasNonToolNonThinking ? "tool_asst" : "other";
+    return hasToolUse && !hasUserVisibleNonTool ? "tool_asst" : "other";
   }
   if (msg.type === "user") {
     const content = msg.message.content;
-    if (typeof content === "string") return "other";
+    if (typeof content === "string") {
+      // Plain user text is a real conversational beat — break streak.
+      // The synthetic <local-command-stdout> envelope renders as a
+      // small inline notice but it still represents a user gesture
+      // (slash command), so treat as "other" too.
+      return "other";
+    }
     if (content.length === 0) return "other";
     for (const b of content) {
       if (b.type !== "tool_result") return "other";
     }
     return "tool_user";
   }
-  return "other";
+  // system (init, hook_started/hook_response/compact_boundary),
+  // result (turn-end), stream_event (partial deltas — but those are
+  // already filtered before they reach history), and any future SDK
+  // top-level types: don't render as standalone rows in the main
+  // timeline (or render as trivial chrome), so they shouldn't break
+  // a streak. Skip them.
+  return "skip";
 }
 
 type ChatItem =
