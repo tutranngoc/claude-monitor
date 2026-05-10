@@ -275,6 +275,15 @@ export interface PlanRecord {
   // plans without losing the on-disk record. Reversible — clear via
   // the same tool with archive=false.
   archived_at?: string;
+  // Reassignable leader. The chat session that ran `submit_plan` lives
+  // in `session_id` permanently; `leader_session_id` overrides it as
+  // the target for nudges and the "open leader" link when a new chat
+  // adopts the plan. Adoption: any non-phase session can call
+  // `mcp__leader__adopt_plan(plan_id)` to claim leader, which sets
+  // both this field on the plan and that session's `latestPlan`. Lets
+  // the lifecycle continue across daemon restarts or after the
+  // original leader was closed.
+  leader_session_id?: string;
   error?: string;
   merge_status?: PlanMergeStatus;
   merge_branch?: string;

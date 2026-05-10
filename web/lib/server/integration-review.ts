@@ -15,6 +15,10 @@ import { AsyncQueue } from "./async-queue";
 import { findClaudeBinary } from "./claude-binary";
 import { findPlanById, updatePlan } from "./plans";
 import {
+  buildIntegrationReviewDoneNudge,
+  nudgeLeader,
+} from "./leader-nudge";
+import {
   createReviewMcpServer,
   REVIEW_MCP_SERVER_NAME,
   SUBMIT_REVIEW_FQN,
@@ -315,7 +319,7 @@ interface PersistCompleteOpts {
 async function persistComplete(opts: PersistCompleteOpts): Promise<void> {
   const plan = await findPlanById(opts.planId);
   if (!plan) return;
-  await updatePlan(plan.cwd, plan.id, (p: PlanRecord) => {
+  const updated = await updatePlan(plan.cwd, plan.id, (p: PlanRecord) => {
     p.integration_review_status = "complete";
     p.integration_review_started_at = opts.startedAt;
     p.integration_review_completed_at = new Date().toISOString();
@@ -325,6 +329,17 @@ async function persistComplete(opts: PersistCompleteOpts): Promise<void> {
     p.integration_review_head = opts.headSha;
     p.integration_review_branch = opts.integrationBranch;
     delete p.integration_review_error;
+  });
+  // Hand the result back to the leader so it can decide whether to
+  // cleanup + archive or chase down the findings. Best-effort; if the
+  // owner session is gone the nudge no-ops with a log line.
+  void nudgeLeader({
+    planId: updated.id,
+    message: buildIntegrationReviewDoneNudge({
+      planTitle: updated.title,
+      findingCount: updated.integration_review_findings?.length ?? 0,
+      summary: updated.integration_review_summary,
+    }),
   });
 }
 

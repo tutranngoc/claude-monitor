@@ -46,6 +46,7 @@ export const MERGE_PLAN_TOOL_NAME = "merge_plan";
 export const RUN_INTEGRATION_REVIEW_TOOL_NAME = "run_integration_review";
 export const CLEANUP_WORKTREES_TOOL_NAME = "cleanup_worktrees";
 export const ARCHIVE_PLAN_TOOL_NAME = "archive_plan";
+export const ADOPT_PLAN_TOOL_NAME = "adopt_plan";
 export const READ_PLAN_STATE_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PLAN_STATE_TOOL_NAME}`;
 export const LEADER_LIST_NOTES_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${LEADER_LIST_NOTES_TOOL_NAME}`;
 export const READ_PHASE_DIFF_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${READ_PHASE_DIFF_TOOL_NAME}`;
@@ -54,6 +55,7 @@ export const MERGE_PLAN_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${MERGE_PLAN_TOOL
 export const RUN_INTEGRATION_REVIEW_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${RUN_INTEGRATION_REVIEW_TOOL_NAME}`;
 export const CLEANUP_WORKTREES_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${CLEANUP_WORKTREES_TOOL_NAME}`;
 export const ARCHIVE_PLAN_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${ARCHIVE_PLAN_TOOL_NAME}`;
+export const ADOPT_PLAN_FQN = `mcp__${LEADER_MCP_SERVER_NAME}__${ADOPT_PLAN_TOOL_NAME}`;
 
 // Cap on shared_brief body. The brief is spliced into every phase's
 // kickoff prompt, so a 50KB primer would multiply across phases. 8KB is
@@ -76,6 +78,11 @@ export interface LeaderMcpContext {
   // rate_limited/...). Wired to sessions.snapshotSession at call site
   // so we don't take a circular import on this module.
   snapshotPhaseSession: (sessionId: string) => SessionSummary | undefined;
+  // Sets `session.latestPlan` so subsequent leader-tool calls in this
+  // chat resolve the plan_id automatically. Used by `adopt_plan` so a
+  // fresh chat can claim leader without threading plan_id through
+  // every subsequent tool call.
+  bindCurrentPlan: (plan: PlanRecord) => void;
 }
 
 // Cap on diff body. The SDK ships every tool result through the model
@@ -482,6 +489,42 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
     },
   );
 
+  const adoptPlanTool = tool(
+    ADOPT_PLAN_TOOL_NAME,
+    "Claim leader for a plan. Sets plan.leader_session_id to the current chat AND binds plan to this session so subsequent leader tools auto-resolve plan_id without threading it. Use this when picking up a plan whose original chat (the one that submitted it) is gone — e.g. after a daemon restart or when continuing in a fresh tab. Read-and-write: reads the plan, writes leader_session_id. Idempotent — re-adopting the same plan in the same session is a no-op.",
+    {
+      plan_id: z
+        .string()
+        .min(1)
+        .describe(
+          "Plan id to adopt. The leader's current latestPlan will be replaced.",
+        ),
+    },
+    async ({ plan_id }) => {
+      const plan = await findPlanById(plan_id);
+      if (!plan) {
+        return {
+          isError: true,
+          content: [
+            { type: "text" as const, text: `Plan ${plan_id} not found.` },
+          ],
+        };
+      }
+      const updated = await updatePlan(plan.cwd, plan.id, (p) => {
+        p.leader_session_id = ctx.sessionId;
+      });
+      ctx.bindCurrentPlan(updated);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Adopted plan _"${updated.title}"_ (id ${updated.id.slice(0, 8)}, ${updated.phases.length} phases). Leader nudges will now route to this chat. Original submit_plan owner: ${updated.session_id.slice(0, 8)}.`,
+          },
+        ],
+      };
+    },
+  );
+
   return createSdkMcpServer({
     name: LEADER_MCP_SERVER_NAME,
     version: "0.1.0",
@@ -494,6 +537,7 @@ export function createLeaderMcpServer(ctx: LeaderMcpContext) {
       runIntegrationReviewTool,
       cleanupWorktrees,
       archivePlanTool,
+      adoptPlanTool,
     ],
   });
 }

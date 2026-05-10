@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
 import { autoCommitWorktree, checkPhaseScope } from "@/lib/server/git";
+import {
+  buildAllCommittedNudge,
+  nudgeLeader,
+} from "@/lib/server/leader-nudge";
 import { findPlanById, updatePlan } from "@/lib/server/plans";
 import { spawnReadyPending } from "@/lib/server/plan-scheduler";
 import type { PhaseSession, PlanRecord } from "@/lib/plan-types";
@@ -138,6 +142,34 @@ export async function POST(_req: Request, { params }: Ctx) {
       newlySpawned = spawnReadyPending(p);
     }
   });
+
+  // Detect the all-committed milestone: if every phase now has a
+  // terminal commit_status (clean or committed) AND there are no
+  // pending phases waiting to spawn, the leader should know — they may
+  // want to merge. Fire a one-shot nudge unless the plan was already
+  // past this milestone before /complete ran (don't spam on retry).
+  const allTerminalNow =
+    updated.phases.every((ph) => {
+      const cs = updated.phase_sessions?.find(
+        (s) => s.phase_slug === ph.slug,
+      )?.commit_status;
+      return cs === "clean" || cs === "committed";
+    }) &&
+    (updated.pending_phases?.length ?? 0) === 0;
+  const allTerminalBefore =
+    plan.phases.every((ph) => {
+      const cs = plan.phase_sessions?.find(
+        (s) => s.phase_slug === ph.slug,
+      )?.commit_status;
+      return cs === "clean" || cs === "committed";
+    }) &&
+    (plan.pending_phases?.length ?? 0) === 0;
+  if (allTerminalNow && !allTerminalBefore) {
+    void nudgeLeader({
+      planId: updated.id,
+      message: buildAllCommittedNudge(updated.title),
+    });
+  }
 
   return NextResponse.json({
     plan: updated,

@@ -1,4 +1,8 @@
 import { NextResponse } from "next/server";
+import {
+  buildMergedNudge,
+  nudgeLeader,
+} from "@/lib/server/leader-nudge";
 import { runMergeForPlan } from "@/lib/server/plan-lifecycle";
 
 export const runtime = "nodejs";
@@ -49,5 +53,20 @@ export async function POST(req: Request, { params }: Ctx) {
       { status },
     );
   }
+  // Successful merge → ping the leader so it knows to run integration
+  // review (or surface a merge_status === "pending" / "failed" report
+  // for the user). Skip nudge on partial/failed runs to avoid pulling
+  // the leader into a broken state without a clear next action.
+  if (r.plan.merge_status === "merged" && r.plan.merge_branch) {
+    void nudgeLeader({
+      planId: r.plan.id,
+      message: buildMergedNudge({
+        planTitle: r.plan.title,
+        branch: r.plan.merge_branch,
+        headSha: r.plan.merge_head_sha,
+      }),
+    });
+  }
+
   return NextResponse.json({ plan: r.plan, merge: r.merge });
 }

@@ -22,10 +22,12 @@ import {
   Loader2,
   Megaphone,
   MessageSquareText,
+  ListTree,
   Network,
   Pause,
   Play,
   RotateCw,
+  Sparkles,
   ScanLine,
   ShieldCheck,
   XCircle,
@@ -286,6 +288,10 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
   const [sharedBriefOpen, setSharedBriefOpen] = useState<boolean>(
     !!initialPlan.shared_brief,
   );
+  // Plan detail collapsible — shows phase descriptions, scope, deps,
+  // model/effort overrides. Closed by default; user expands when they
+  // need to remind themselves what each phase was supposed to do.
+  const [planDetailOpen, setPlanDetailOpen] = useState(false);
   // Worker-pool controls. `maxConcurrent` mirrors plan.max_concurrent
   // (undefined → DEFAULT_MAX_CONCURRENT); `paused` mirrors plan.paused.
   // The PoolControls header strip writes to /settings; the cascade in
@@ -982,6 +988,21 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
           <div className="flex items-center gap-2">
             <h1 className="truncate text-base font-semibold">{initialPlan.title}</h1>
             <PlanStatusBadge status={initialPlan.status} />
+            <Link
+              href={`/chat/${initialPlan.leader_session_id ?? initialPlan.session_id}`}
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-mono transition-colors",
+                "border-primary/40 bg-primary/5 text-primary hover:bg-primary/10",
+              )}
+              title={
+                initialPlan.leader_session_id
+                  ? "Open the leader chat (adopted leader). Drive merge / review / cleanup via mcp__leader__* tools."
+                  : "Open the leader chat — the session that submitted this plan. Use it to drive merge / integration review / cleanup via mcp__leader__* tools."
+              }
+            >
+              <Sparkles className="size-3" aria-hidden />
+              <span>leader</span>
+            </Link>
           </div>
           <div className="font-mono text-xs text-muted-foreground">
             plan {initialPlan.id.slice(0, 8)} · {phases.length} phase
@@ -1037,6 +1058,12 @@ export function PhaseBoard({ plan: initialPlan }: { plan: PlanRecord }) {
         }
         onIntegrationReview={handleIntegrationReview}
         integrationReviewPending={integrationReviewPending}
+      />
+
+      <PlanDetailPanel
+        phases={phases}
+        open={planDetailOpen}
+        onToggle={() => setPlanDetailOpen((v) => !v)}
       />
 
       <SharedBriefPanel
@@ -2462,6 +2489,104 @@ function MergeResultChip({ result }: { result: PhaseMergeResult }) {
       <span>{result.phase_slug}</span>
       <span className="opacity-70">· {detail}</span>
     </span>
+  );
+}
+
+// PlanDetailPanel renders the read-only plan structure: every phase
+// with its slug, title, description, depends_on, file scope, and any
+// per-phase model/effort/tdd overrides. Designed for the human glancing
+// in to remind themselves "what is phase auth-refactor supposed to do
+// again?" without having to dig into the leader chat or the plan JSON
+// on disk. Sits below MergePanel, collapsed by default.
+function PlanDetailPanel({
+  phases,
+  open,
+  onToggle,
+}: {
+  phases: Phase[];
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="border-b bg-slate-500/5 px-6 py-2 text-xs">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ListTree className="size-3.5 text-slate-500" aria-hidden />
+        <span className="font-medium uppercase tracking-wide">Plan detail</span>
+        <span className="rounded-full bg-slate-500/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-slate-600 dark:text-slate-300">
+          {phases.length}
+        </span>
+        {open ? (
+          <ChevronDown className="ml-auto size-3.5" aria-hidden />
+        ) : (
+          <ChevronRight className="ml-auto size-3.5" aria-hidden />
+        )}
+      </button>
+      {open && (
+        <ul className="mt-2 space-y-2 pb-1">
+          {phases.map((p) => (
+            <li
+              key={p.slug}
+              className="rounded-md border border-slate-500/20 bg-background/40 p-2"
+            >
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="rounded bg-slate-500/15 px-1.5 py-0.5 font-mono text-[10.5px] text-slate-700 dark:text-slate-200">
+                  {p.slug}
+                </span>
+                <span className="font-medium">{p.title}</span>
+                {p.depends_on && p.depends_on.length > 0 && (
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    depends_on:{" "}
+                    {p.depends_on.map((d, i) => (
+                      <span key={d}>
+                        {i > 0 && ", "}
+                        <code className="rounded bg-muted/60 px-1">{d}</code>
+                      </span>
+                    ))}
+                  </span>
+                )}
+                {p.model && (
+                  <span className="rounded border border-blue-500/30 bg-blue-500/5 px-1.5 py-0 font-mono text-[10px] text-blue-700 dark:text-blue-300">
+                    {p.model}
+                  </span>
+                )}
+                {p.effort && (
+                  <span className="rounded border bg-muted/40 px-1.5 py-0 font-mono text-[10px] text-muted-foreground">
+                    effort:{p.effort}
+                  </span>
+                )}
+                {p.tdd_mode && (
+                  <span className="rounded border border-emerald-500/30 bg-emerald-500/5 px-1.5 py-0 font-mono text-[10px] text-emerald-700 dark:text-emerald-300">
+                    tdd
+                  </span>
+                )}
+              </div>
+              {p.description && (
+                <p className="mt-1.5 whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/80">
+                  {p.description}
+                </p>
+              )}
+              {p.scope?.files && p.scope.files.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1 text-[10px]">
+                  <span className="text-muted-foreground">scope:</span>
+                  {p.scope.files.map((g) => (
+                    <code
+                      key={g}
+                      className="rounded bg-muted/60 px-1 font-mono"
+                    >
+                      {g}
+                    </code>
+                  ))}
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

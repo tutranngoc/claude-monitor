@@ -28,6 +28,7 @@ import {
   SUBMIT_NOTE_FQN,
 } from "./notes-mcp";
 import {
+  ADOPT_PLAN_FQN,
   ARCHIVE_PLAN_FQN,
   createLeaderMcpServer,
   LEADER_LIST_NOTES_FQN,
@@ -638,7 +639,8 @@ function makeCanUseTool(session: ChatSession): CanUseTool {
       toolName === RECORD_SHARED_CONTEXT_FQN ||
       toolName === MERGE_PLAN_FQN ||
       toolName === RUN_INTEGRATION_REVIEW_FQN ||
-      toolName === ARCHIVE_PLAN_FQN
+      toolName === ARCHIVE_PLAN_FQN ||
+      toolName === ADOPT_PLAN_FQN
     ) {
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
@@ -815,6 +817,14 @@ function makeLeaderMcp(session: ChatSession) {
     snapshotPhaseSession: (sid) => {
       const s = sessions.get(sid);
       return s ? summarize(s) : undefined;
+    },
+    // adopt_plan calls this so the live ChatSession's latestPlan flips
+    // to the adopted plan; subsequent leader tool calls then resolve
+    // plan_id automatically. schedulePersist mirrors the change to
+    // session-store so it survives daemon restarts.
+    bindCurrentPlan: (plan) => {
+      session.latestPlan = plan;
+      schedulePersist(session.id);
     },
   });
 }
