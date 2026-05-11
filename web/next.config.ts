@@ -16,28 +16,21 @@ const nextConfig: NextConfig = {
   // detects server.js and spawns `node server.js`; falls back to
   // `next start` for the legacy dev layout.
   output: "standalone",
-  // @openai/codex-sdk spawns the codex binary via
-  // createRequire(import.meta.url).resolve(`@openai/codex-${platform}-${arch}/package.json`).
-  // The platform package id is built at runtime from process.platform +
-  // process.arch, so Next's static tracer can't follow it — the
-  // codex-darwin-arm64 / codex-linux-x64 / ... packages get dropped
-  // from the standalone bundle, and findCodexPath() throws "Unable to
-  // locate Codex CLI binaries" on the first turn.
+  // @openai/codex-sdk would normally locate the codex binary via
+  // createRequire(import.meta.url).resolve(`@openai/codex-${platform}-${arch}/package.json`),
+  // a dynamic resolve Next's tracer can't follow. We bypass it
+  // entirely by passing an `executablePath` to `new Codex()` in
+  // codex-driver.ts (resolved from $CODEX_PATH or `which codex`).
+  // That keeps the bundle lean — no ~30MB platform binary per
+  // release — at the cost of requiring users to install codex
+  // themselves (`npm i -g @openai/codex` or equivalent).
   //
-  // serverExternalPackages keeps the SDK as a real CommonJS require at
-  // runtime instead of inlining it, so createRequire(import.meta.url)
-  // points at the real .next/standalone/node_modules layout. Combined
-  // with the explicit outputFileTracingIncludes entries below, the
-  // binary survives the build.
+  // serverExternalPackages keeps the SDK as a real CommonJS require
+  // so its own internal createRequire(import.meta.url) calls (used
+  // for things like config-file resolution) work against the real
+  // .next/standalone/node_modules layout.
   serverExternalPackages: [
     "@openai/codex-sdk",
-    "@openai/codex",
-    "@openai/codex-darwin-arm64",
-    "@openai/codex-darwin-x64",
-    "@openai/codex-linux-arm64",
-    "@openai/codex-linux-x64",
-    "@openai/codex-win32-arm64",
-    "@openai/codex-win32-x64",
   ],
   // Vendored Claude Code skills (web/skills/*) ship with the daemon so
   // the skills-installer can mirror them into ~/.claude/skills/ on
@@ -45,22 +38,9 @@ const nextConfig: NextConfig = {
   // the standalone bundle and the installer silently no-ops in
   // production. Keyed off /api/** because that's the entry point the
   // launcher hits on cold start, which is when init runs.
-  //
-  // The @openai/codex* globs cover both the wrapper package and every
-  // platform-specific binary package; the tracer keeps whatever's
-  // actually installed on the build host (so a darwin-arm64 dev
-  // machine ships only that binary, not the 6-platform full set).
   outputFileTracingIncludes: {
     "/api/**": [
       "./skills/**",
-      "./node_modules/@openai/codex/**",
-      "./node_modules/@openai/codex-sdk/**",
-      "./node_modules/@openai/codex-darwin-arm64/**",
-      "./node_modules/@openai/codex-darwin-x64/**",
-      "./node_modules/@openai/codex-linux-arm64/**",
-      "./node_modules/@openai/codex-linux-x64/**",
-      "./node_modules/@openai/codex-win32-arm64/**",
-      "./node_modules/@openai/codex-win32-x64/**",
     ],
   },
 };

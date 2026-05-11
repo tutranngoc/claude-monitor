@@ -1,6 +1,8 @@
 import "server-only";
 
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -169,7 +171,7 @@ async function driveOneCodexTurn(
   // skips inheriting from process.env, so we merge in the parent env
   // by hand.
   const env = buildEnv(session.handoff.codex_config_dir);
-  const codex = new Codex({ env });
+  const codex = new Codex({ env, codexPathOverride: resolveCodexBinary() });
 
   // Resolve thread options fresh per turn so model/effort hot-swaps
   // land on the very next API call.
@@ -757,6 +759,51 @@ function todoListToToolUse(item: TodoListItem): {
 }
 
 // === Helpers ===
+
+// resolveCodexBinary locates a codex CLI binary on the host instead of
+// bundling one inside the release tarball. Lookup order:
+//   1. $CODEX_PATH — explicit override.
+//   2. PATH — via `which codex` (posix) or `where codex` (win32).
+// Throws with install hints if neither yields a runnable binary so the
+// chat panel surfaces a user-fixable error rather than the SDK's
+// generic "Unable to locate Codex CLI binaries" message (which we'd
+// never see anyway since we pass `executablePath` and skip the SDK's
+// internal lookup). Cached at module-level since the binary path
+// can't change without a server restart.
+let cachedCodexPath: string | undefined;
+export function resolveCodexBinary(): string {
+  if (cachedCodexPath) return cachedCodexPath;
+  const envPath = process.env.CODEX_PATH?.trim();
+  if (envPath) {
+    if (!existsSync(envPath)) {
+      throw new CodexDriverError(
+        `CODEX_PATH=${envPath} does not exist. Point it at a codex binary or unset it to fall back to PATH lookup.`,
+      );
+    }
+    cachedCodexPath = envPath;
+    return envPath;
+  }
+  const which = process.platform === "win32" ? "where" : "which";
+  try {
+    const out = execFileSync(which, ["codex"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // `where` on Windows can return multiple lines if codex is in
+    // several PATH entries; take the first match.
+    const first = out.split(/\r?\n/)[0]?.trim();
+    if (first && existsSync(first)) {
+      cachedCodexPath = first;
+      return first;
+    }
+  } catch {
+    // fall through to the install hint below
+  }
+  throw new CodexDriverError(
+    "codex CLI not found on PATH. Install it with `npm install -g @openai/codex` " +
+      "(or `brew install codex`), or set CODEX_PATH to an existing binary.",
+  );
+}
 
 function buildEnv(configDir: string): Record<string, string> {
   // We must pass env exhaustively — when SDK sees a non-undefined env,

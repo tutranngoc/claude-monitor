@@ -33,6 +33,16 @@ claude-monitor reads OAuth tokens from the same OS credential store Claude Code 
 
 Each account must have logged in once so its OAuth token is stored. The dashboard's `[a]` hotkey provisions a new `~/.claude-<name>` and hands off to `claude auth login` for you; `[L]` does the same for a row whose token has expired.
 
+### Optional: Codex CLI for ChatGPT chat
+
+The orchestrator's ChatGPT (Codex) chat hands off to the [OpenAI Codex CLI](https://github.com/openai/codex). Install it once on the host so the codex binary is on your `PATH`:
+
+```sh
+npm install -g @openai/codex   # or: brew install codex
+```
+
+claude-monitor invokes whatever `codex` resolves to on `PATH`. Override with `CODEX_PATH=/abs/path/to/codex` if you keep multiple installs. Without codex installed, ChatGPT chats fail with a clear install hint — the Claude side is unaffected.
+
 ## Install
 
 **macOS / Linux:**
