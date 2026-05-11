@@ -61,6 +61,7 @@ type Action =
   | { kind: "queue_edited"; msg: SDKMessage }
   | { kind: "queue_cancelled"; uuid: string }
   | { kind: "handoff"; record: HandoffRecord }
+  | { kind: "turn_interrupted" }
   | { kind: "hydrated" }
   // Wipe state back to the initial shape. Dispatched whenever the
   // hook's `sessionId` argument changes — defensive against the page-
@@ -247,6 +248,8 @@ function reducer(state: State, action: Action): State {
       if (exists) return state;
       return { ...state, handoffs: [...state.handoffs, action.record] };
     }
+    case "turn_interrupted":
+      return { ...state, streamingBlocks: [] };
     case "hydrated":
       // Idempotent — repeated history_replayed events (shouldn't
       // happen, but guards reconnects) keep state stable.
@@ -284,6 +287,7 @@ export interface UseChatSession extends State {
     overrides?: import("@/lib/plan-types").PhaseOverrides,
   ) => Promise<void>;
   stop: () => Promise<void>;
+  interrupt: () => Promise<void>;
   // Queue mutators — only valid for user messages still waiting in
   // the SDK input queue. The server enforces that constraint and
   // returns 409 once a message is in flight.
@@ -404,6 +408,9 @@ export function useChatSession(sessionId: string): UseChatSession {
         );
       }
     });
+    es.addEventListener("turn_interrupted", () => {
+      dispatch({ kind: "turn_interrupted" });
+    });
     es.addEventListener("history_replayed", () => {
       dispatch({ kind: "hydrated" });
     });
@@ -515,6 +522,10 @@ export function useChatSession(sessionId: string): UseChatSession {
     await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
   };
 
+  const interrupt = async () => {
+    await fetch(`/api/chat/${sessionId}/interrupt`, { method: "POST" });
+  };
+
   // editQueued + cancelQueued mutate a user message that's still
   // sitting in the SDK input queue. The server returns 409 if the SDK
   // already pulled it (in-flight) — we surface that as a chat_error so
@@ -573,6 +584,7 @@ export function useChatSession(sessionId: string): UseChatSession {
     cancelQuestion,
     approvePlan,
     stop,
+    interrupt,
     editQueued,
     cancelQueued,
     subagents: derived.list,
