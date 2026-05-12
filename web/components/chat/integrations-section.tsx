@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   CheckCircle2,
+  CheckSquare,
   ChevronDown,
   ChevronRight,
   Hash,
@@ -26,7 +27,7 @@ import { cn } from "@/lib/utils";
 // add a new service, extend the Service union, the renderer in
 // ServiceForm, and the Stanza branch on the Go side.
 
-type Service = "slack";
+type Service = "slack" | "clickup";
 
 interface Integration {
   id: string;
@@ -36,6 +37,10 @@ interface Integration {
   // so the form can render "token is set" without exposing it.
   slack_token?: string;
   slack_add_message_tool?: boolean;
+  // ClickUp — api key is redacted ("pk_XX***"); team id is not a
+  // secret and round-trips in cleartext.
+  clickup_api_key?: string;
+  clickup_team_id?: string;
 }
 
 interface ListResponse {
@@ -97,7 +102,7 @@ export function IntegrationsSection() {
             <div className="rounded border bg-background px-2.5 py-2 text-xs text-muted-foreground">
               No integrations yet. Use{" "}
               <span className="font-mono">Add integration</span> below to wire
-              up Slack (more services soon).
+              up Slack or ClickUp (more services soon).
             </div>
           )}
 
@@ -251,6 +256,13 @@ function summarise(i: Integration): string {
     const post = i.slack_add_message_tool ? " · post: on" : "";
     return `${mode}${post}`;
   }
+  if (i.service === "clickup") {
+    // Team id is not a secret — echo it so the user can tell which
+    // workspace this row points at without having to open Edit.
+    const team = i.clickup_team_id ? `team ${i.clickup_team_id}` : "no team";
+    const key = i.clickup_api_key ? " · key set" : " · no key";
+    return `${team}${key}`;
+  }
   return "";
 }
 
@@ -261,6 +273,13 @@ const SERVICE_BADGE: Record<Service, { label: string; cls: string; Icon: typeof 
     // Lucide doesn't ship a Slack glyph, but Hash (#) is the
     // universally legible "Slack channel" symbol.
     Icon: Hash,
+  },
+  clickup: {
+    label: "clickup",
+    cls: "bg-pink-500/15 text-pink-700 dark:text-pink-300",
+    // No ClickUp glyph in lucide either; CheckSquare matches the
+    // task-management mental model the user already has for ClickUp.
+    Icon: CheckSquare,
   },
 };
 
@@ -308,6 +327,10 @@ function IntegrationForm({
   const [slackAddMessage, setSlackAddMessage] = useState(
     initial?.slack_add_message_tool ?? false,
   );
+  // ClickUp — api key is the only secret; team id round-trips in
+  // cleartext so we can seed it from the existing record on edit.
+  const [clickupKey, setClickupKey] = useState("");
+  const [clickupTeam, setClickupTeam] = useState(initial?.clickup_team_id ?? "");
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
 
@@ -322,6 +345,13 @@ function IntegrationForm({
         ...base,
         slack_token: slackToken,
         slack_add_message_tool: slackAddMessage,
+      };
+    }
+    if (service === "clickup") {
+      return {
+        ...base,
+        clickup_api_key: clickupKey,
+        clickup_team_id: clickupTeam.trim(),
       };
     }
     return base;
@@ -394,13 +424,23 @@ function IntegrationForm({
     }
   };
 
-  // Slack-specific validity. When editing, the existing token is
+  // Per-service validity. When editing, the existing secret is
   // preserved server-side on empty input, so an update-mode form is
-  // valid with just a name + the existing token (which we never see
+  // valid with just a name + the existing secret (which we never see
   // in cleartext).
   const slackValid =
-    mode === "update" || slackToken.trim().startsWith("xoxp-") || slackToken.trim().startsWith("xoxb-");
-  const valid = name.trim().length > 0 && (service === "slack" ? slackValid : false);
+    mode === "update" ||
+    slackToken.trim().startsWith("xoxp-") ||
+    slackToken.trim().startsWith("xoxb-");
+  // ClickUp team id is numeric and not a secret — must always be
+  // present (no preserve-on-empty sentinel for it). The API key has
+  // the same sentinel treatment as the Slack token.
+  const clickupTeamValid = /^\d+$/.test(clickupTeam.trim());
+  const clickupKeyValid = mode === "update" || clickupKey.trim().startsWith("pk_");
+  const clickupValid = clickupTeamValid && clickupKeyValid;
+  const serviceValid =
+    service === "slack" ? slackValid : service === "clickup" ? clickupValid : false;
+  const valid = name.trim().length > 0 && serviceValid;
 
   return (
     <div className="space-y-2">
@@ -409,7 +449,7 @@ function IntegrationForm({
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="team_slack"
+            placeholder={service === "clickup" ? "team_tasks" : "team_slack"}
             className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
             autoComplete="off"
           />
@@ -422,6 +462,7 @@ function IntegrationForm({
             className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-60"
           >
             <option value="slack">Slack</option>
+            <option value="clickup">ClickUp</option>
           </select>
         </Field>
       </div>
@@ -434,6 +475,17 @@ function IntegrationForm({
           setToken={setSlackToken}
           addMessage={slackAddMessage}
           setAddMessage={setSlackAddMessage}
+        />
+      )}
+
+      {service === "clickup" && (
+        <ClickUpFields
+          mode={mode}
+          existingKeyRedacted={initial?.clickup_api_key}
+          apiKey={clickupKey}
+          setApiKey={setClickupKey}
+          teamId={clickupTeam}
+          setTeamId={setClickupTeam}
         />
       )}
 
@@ -543,6 +595,66 @@ function SlackFields({
   );
 }
 
+function ClickUpFields({
+  mode,
+  existingKeyRedacted,
+  apiKey,
+  setApiKey,
+  teamId,
+  setTeamId,
+}: {
+  mode: "create" | "update";
+  existingKeyRedacted?: string;
+  apiKey: string;
+  setApiKey: (v: string) => void;
+  teamId: string;
+  setTeamId: (v: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <Field
+        label="API key"
+        hint={
+          mode === "update"
+            ? `leave empty to keep existing (${existingKeyRedacted ?? "set"})`
+            : "pk_… (personal API token from ClickUp settings)"
+        }
+      >
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder={
+            mode === "update" ? existingKeyRedacted ?? "" : "pk_…"
+          }
+          className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+          autoComplete="off"
+        />
+      </Field>
+
+      <Field label="Team / Workspace ID" hint="numeric — from your ClickUp URL">
+        <input
+          inputMode="numeric"
+          value={teamId}
+          onChange={(e) => setTeamId(e.target.value)}
+          placeholder="e.g. 12345678"
+          className="w-full rounded border bg-background px-2 py-1 font-mono text-xs"
+          autoComplete="off"
+        />
+      </Field>
+
+      <div className="rounded-md border border-dashed bg-muted/10 px-2 py-1.5 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground">How to get these:</span>{" "}
+        <span className="font-mono">API key</span> — ClickUp → your avatar →
+        Settings → Apps → Generate. <span className="font-mono">Team ID</span> —
+        the number in <span className="font-mono">app.clickup.com/&lt;TEAM_ID&gt;/…</span>.
+        The key never leaves your machine — only the model running on this
+        account&apos;s session sees the resulting tool surface.
+      </div>
+    </div>
+  );
+}
+
 function TestResultBanner({
   state,
   fingerprint,
@@ -562,7 +674,7 @@ function TestResultBanner({
     return (
       <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2 py-1.5 text-[11px] text-muted-foreground">
         <Loader2 className="size-3 animate-spin" />
-        Spawning npx slack-mcp-server and probing the server…
+        Spawning the MCP server via npx and probing it…
       </div>
     );
   }

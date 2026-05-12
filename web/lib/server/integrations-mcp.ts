@@ -26,10 +26,13 @@ type StdioStanza = {
 type IntegrationDisk = {
   id?: string;
   name?: string;
-  service?: "slack";
+  service?: "slack" | "clickup";
   // Slack
   slack_token?: string;
   slack_add_message_tool?: boolean;
+  // ClickUp
+  clickup_api_key?: string;
+  clickup_team_id?: string;
 };
 
 type Envelope = {
@@ -87,10 +90,31 @@ function slackStanza(i: IntegrationDisk): StdioStanza | null {
   };
 }
 
+// clickupStanza must produce a byte-identical shape to the Go side's
+// clickupStanza in internal/mcp/integrations/integrations.go. Both
+// surfaces (daemon-injected .claude.json and SDK-spawned mcpServers)
+// need to address the same npx package with the same env vars.
+function clickupStanza(i: IntegrationDisk): StdioStanza | null {
+  const key = i.clickup_api_key?.trim();
+  const team = i.clickup_team_id?.trim();
+  if (!key || !team) return null;
+  return {
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@taazkareem/clickup-mcp-server@latest"],
+    env: {
+      CLICKUP_API_KEY: key,
+      CLICKUP_TEAM_ID: team,
+    },
+  };
+}
+
 function stanzaFor(i: IntegrationDisk): StdioStanza | null {
   switch (i.service) {
     case "slack":
       return slackStanza(i);
+    case "clickup":
+      return clickupStanza(i);
     default:
       return null;
   }

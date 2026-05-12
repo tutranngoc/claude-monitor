@@ -131,6 +131,131 @@ func TestStanza_Slack_EmptyTokenYieldsNil(t *testing.T) {
 	}
 }
 
+func TestValidate_ClickUp(t *testing.T) {
+	t.Run("requires api key", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpTeamID: "12345"}).Validate(); err == nil {
+			t.Fatalf("expected error for missing api key")
+		}
+	})
+	t.Run("rejects bad prefix", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpAPIKey: "sk-abcdef1234", ClickUpTeamID: "12345"}).Validate(); err == nil {
+			t.Fatalf("expected error for non-pk_ key")
+		}
+	})
+	t.Run("accepts pk_ key", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpAPIKey: "pk_1234567890_ABCDEF", ClickUpTeamID: "12345"}).Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("rejects too short key", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpAPIKey: "pk_", ClickUpTeamID: "12345"}).Validate(); err == nil {
+			t.Fatalf("expected error for short key")
+		}
+	})
+	t.Run("requires team id", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpAPIKey: "pk_1234567890_ABCDEF"}).Validate(); err == nil {
+			t.Fatalf("expected error for missing team id")
+		}
+	})
+	t.Run("rejects non-numeric team id", func(t *testing.T) {
+		if err := (Integration{Name: "cu", Service: ServiceClickUp, ClickUpAPIKey: "pk_1234567890_ABCDEF", ClickUpTeamID: "abc123"}).Validate(); err == nil {
+			t.Fatalf("expected error for non-numeric team id")
+		}
+	})
+}
+
+func TestStanza_ClickUp(t *testing.T) {
+	in := Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpAPIKey: "pk_1234567890_ABCDEF",
+		ClickUpTeamID: "987654321",
+	}
+	s := in.Stanza()
+	if s == nil {
+		t.Fatal("expected non-nil stanza")
+	}
+	if s["command"] != "npx" {
+		t.Fatalf("command: %v", s["command"])
+	}
+	args, _ := s["args"].([]string)
+	wantArgs := []string{"-y", "@taazkareem/clickup-mcp-server@latest"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args length mismatch: got %v", args)
+	}
+	for i, a := range wantArgs {
+		if args[i] != a {
+			t.Fatalf("args[%d]=%q want %q", i, args[i], a)
+		}
+	}
+	env, _ := s["env"].(map[string]string)
+	if env["CLICKUP_API_KEY"] != "pk_1234567890_ABCDEF" {
+		t.Fatalf("api key not set: %#v", env)
+	}
+	if env["CLICKUP_TEAM_ID"] != "987654321" {
+		t.Fatalf("team id not set: %#v", env)
+	}
+}
+
+func TestStanza_ClickUp_MissingFieldsYieldNil(t *testing.T) {
+	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpTeamID: "1"}).Stanza(); s != nil {
+		t.Fatalf("expected nil stanza for missing key, got %#v", s)
+	}
+	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpAPIKey: "pk_x"}).Stanza(); s != nil {
+		t.Fatalf("expected nil stanza for missing team id, got %#v", s)
+	}
+}
+
+func TestRedacted_ClickUp(t *testing.T) {
+	in := Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpAPIKey: "pk_1234_secret_ABCDEF",
+		ClickUpTeamID: "987654321",
+	}
+	r := in.Redacted()
+	if r.ClickUpAPIKey == in.ClickUpAPIKey {
+		t.Fatalf("api key should be redacted")
+	}
+	if !strings.Contains(r.ClickUpAPIKey, "***") {
+		t.Fatalf("redaction should contain ***: %q", r.ClickUpAPIKey)
+	}
+	// Team ID is not secret — must round-trip in cleartext so the
+	// edit form can prefill it without making the user re-enter.
+	if r.ClickUpTeamID != in.ClickUpTeamID {
+		t.Fatalf("team id should not be redacted: got %q want %q", r.ClickUpTeamID, in.ClickUpTeamID)
+	}
+}
+
+func TestUpdate_PreservesClickUpKey(t *testing.T) {
+	setupHome(t)
+	saved, _, mErr := CreateAndApply("", Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpAPIKey: "pk_1234_secret",
+		ClickUpTeamID: "111",
+	})
+	if mErr != nil {
+		t.Fatalf("create: %v", mErr)
+	}
+	// Empty key in update body = "keep existing". Change only team
+	// id; verify key persists.
+	updated, _, mErr := UpdateAndApply("", saved.ID, Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpTeamID: "222",
+	})
+	if mErr != nil {
+		t.Fatalf("update: %v", mErr)
+	}
+	if updated.ClickUpAPIKey != "pk_1234_secret" {
+		t.Fatalf("api key not preserved: %q", updated.ClickUpAPIKey)
+	}
+	if updated.ClickUpTeamID != "222" {
+		t.Fatalf("team id not updated: %q", updated.ClickUpTeamID)
+	}
+}
+
 func TestRedacted_Slack(t *testing.T) {
 	in := Integration{Name: "team", Service: ServiceSlack, SlackToken: "xoxp-1-2-secret"}
 	r := in.Redacted()

@@ -44,7 +44,8 @@ var mu sync.Mutex
 type Service string
 
 const (
-	ServiceSlack Service = "slack"
+	ServiceSlack   Service = "slack"
+	ServiceClickUp Service = "clickup"
 )
 
 // Integration is one user-configured service. Field set is the union
@@ -67,6 +68,13 @@ type Integration struct {
 	// follow-up — for now this is a binary toggle that sets the env
 	// var to "true" (= every channel the token can post to).
 	SlackAddMessageTool bool `json:"slack_add_message_tool,omitempty"`
+
+	// ClickUp — personal API key (pk_…) + workspace/team id. Both are
+	// required for the stdio entry point; the OAuth flow upstream
+	// supports is remote-only and isn't relevant for the local
+	// stdio MCP we spawn here. Tokens live in env, not args.
+	ClickUpAPIKey string `json:"clickup_api_key,omitempty"`
+	ClickUpTeamID string `json:"clickup_team_id,omitempty"`
 }
 
 // driverKey is the top-level key in mcp.json. Sibling to "connections".
@@ -95,6 +103,8 @@ func (i Integration) Validate() error {
 	switch i.Service {
 	case ServiceSlack:
 		return validateSlack(i)
+	case ServiceClickUp:
+		return validateClickUp(i)
 	default:
 		return fmt.Errorf("unknown service: %q", i.Service)
 	}
@@ -115,6 +125,35 @@ func validateSlack(i Integration) error {
 	return nil
 }
 
+// validateClickUp gates the local-stdio config: both API key and team
+// ID are required. The remote-MCP / OAuth path the upstream also
+// supports isn't reachable through this struct — keeping it strict
+// here means a passing Test maps 1:1 to a working stdio spawn.
+func validateClickUp(i Integration) error {
+	key := strings.TrimSpace(i.ClickUpAPIKey)
+	if key == "" {
+		return errors.New("clickup_api_key is required")
+	}
+	if !strings.HasPrefix(key, "pk_") {
+		return errors.New("clickup_api_key must start with pk_ (ClickUp personal API token)")
+	}
+	if len(key) < 10 {
+		return errors.New("clickup_api_key looks too short to be valid")
+	}
+	team := strings.TrimSpace(i.ClickUpTeamID)
+	if team == "" {
+		return errors.New("clickup_team_id is required")
+	}
+	// Workspace IDs in ClickUp are numeric. Reject anything else
+	// early so we don't spawn npx just to have the upstream bail.
+	for _, r := range team {
+		if r < '0' || r > '9' {
+			return errors.New("clickup_team_id must be numeric (find it in your ClickUp workspace URL)")
+		}
+	}
+	return nil
+}
+
 // Stanza emits the mcpServers entry for this integration. Returns nil
 // when the integration isn't materially configured — callers treat
 // nil as "skip this entry / strip any existing".
@@ -122,6 +161,8 @@ func (i Integration) Stanza() map[string]any {
 	switch i.Service {
 	case ServiceSlack:
 		return slackStanza(i)
+	case ServiceClickUp:
+		return clickupStanza(i)
 	}
 	return nil
 }
@@ -165,6 +206,32 @@ func slackStanza(i Integration) map[string]any {
 	}
 }
 
+// clickupStanza wires up @taazkareem/clickup-mcp-server. Stdio is the
+// upstream's default transport so we don't pass an explicit flag (the
+// CLI rejects unknown flags). Both env vars are required — validate
+// already gated this, but defend in depth: if either is empty after
+// trim, return nil so the caller strips the entry rather than
+// spawning a server with broken auth.
+func clickupStanza(i Integration) map[string]any {
+	key := strings.TrimSpace(i.ClickUpAPIKey)
+	team := strings.TrimSpace(i.ClickUpTeamID)
+	if key == "" || team == "" {
+		return nil
+	}
+	return map[string]any{
+		"type":    "stdio",
+		"command": "npx",
+		"args": []string{
+			"-y",
+			"@taazkareem/clickup-mcp-server@latest",
+		},
+		"env": map[string]string{
+			"CLICKUP_API_KEY": key,
+			"CLICKUP_TEAM_ID": team,
+		},
+	}
+}
+
 // Redacted returns a copy with secret token replaced by "***". Used
 // by the listing API so the web UI can render "yes, configured"
 // without exposing the secret.
@@ -173,6 +240,12 @@ func (i Integration) Redacted() Integration {
 	if out.SlackToken != "" {
 		out.SlackToken = redactToken(out.SlackToken)
 	}
+	if out.ClickUpAPIKey != "" {
+		out.ClickUpAPIKey = redactToken(out.ClickUpAPIKey)
+	}
+	// Team ID is not a secret — it's a workspace identifier visible
+	// in every ClickUp URL — so leave it in cleartext so the UI can
+	// echo it back without making the user re-enter it on edit.
 	return out
 }
 
@@ -330,12 +403,18 @@ func UpdateAndApply(rootSpec, id string, in Integration) (saved Integration, app
 	if idx < 0 {
 		return Integration{}, nil, fmt.Errorf("integration %q not found", id)
 	}
-	// Preserve secret sentinel: empty token in the body means "keep
-	// the existing one" — UI sends "" for unchanged fields so a
-	// rename or toggle-only edit doesn't require re-pasting the
-	// token.
-	if in.Service == ServiceSlack && strings.TrimSpace(in.SlackToken) == "" {
-		in.SlackToken = prev[idx].SlackToken
+	// Preserve secret sentinel: empty token/key in the body means
+	// "keep the existing one" — UI sends "" for unchanged secrets so
+	// a rename or toggle-only edit doesn't require re-pasting them.
+	switch in.Service {
+	case ServiceSlack:
+		if strings.TrimSpace(in.SlackToken) == "" {
+			in.SlackToken = prev[idx].SlackToken
+		}
+	case ServiceClickUp:
+		if strings.TrimSpace(in.ClickUpAPIKey) == "" {
+			in.ClickUpAPIKey = prev[idx].ClickUpAPIKey
+		}
 	}
 	in.ID = id
 	if err := in.Validate(); err != nil {

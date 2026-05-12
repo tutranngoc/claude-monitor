@@ -154,8 +154,15 @@ func (s *Server) handleMcpIntegrationsTest(w http.ResponseWriter, r *http.Reques
 			})
 			return
 		} else if ok {
-			if body.Service == integrations.ServiceSlack && strings.TrimSpace(body.SlackToken) == "" {
-				body.SlackToken = existing.SlackToken
+			switch body.Service {
+			case integrations.ServiceSlack:
+				if strings.TrimSpace(body.SlackToken) == "" {
+					body.SlackToken = existing.SlackToken
+				}
+			case integrations.ServiceClickUp:
+				if strings.TrimSpace(body.ClickUpAPIKey) == "" {
+					body.ClickUpAPIKey = existing.ClickUpAPIKey
+				}
 			}
 		}
 	}
