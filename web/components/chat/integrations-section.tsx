@@ -11,6 +11,7 @@ import {
   Pencil,
   Plug,
   Plus,
+  Power,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -33,6 +34,9 @@ interface Integration {
   id: string;
   name: string;
   service: Service;
+  // disabled = parked; the daemon strips its stanza from every
+  // account so the LLM doesn't see the tool surface.
+  disabled?: boolean;
   // Slack — token is redacted on the wire ("xoxp-***" / "xoxb-***")
   // so the form can render "token is set" without exposing it.
   slack_token?: string;
@@ -41,6 +45,8 @@ interface Integration {
   // secret and round-trips in cleartext.
   clickup_api_key?: string;
   clickup_team_id?: string;
+  // ClickUp — opt-in writes. Default = read-only (auditor persona).
+  clickup_allow_write?: boolean;
 }
 
 interface ListResponse {
@@ -170,12 +176,12 @@ function IntegrationRow({
   onDone: () => void;
   onError: (msg: string) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"toggle" | "delete" | null>(null);
   const summary = summarise(integration);
 
   const remove = async () => {
     if (!confirm(`Delete integration "${integration.name}"?`)) return;
-    setBusy(true);
+    setBusy("delete");
     try {
       const res = await fetch(
         `/daemon/api/mcp/integrations/${encodeURIComponent(integration.id)}`,
@@ -190,22 +196,76 @@ function IntegrationRow({
     } catch (err) {
       onError((err as Error).message);
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
+  const toggle = async () => {
+    setBusy("toggle");
+    try {
+      const res = await fetch(
+        `/daemon/api/mcp/integrations/${encodeURIComponent(integration.id)}/toggle`,
+        { method: "POST" },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        onError(body.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      const body = (await res.json()) as { warning?: string };
+      if (body.warning) onError(`toggled with warning: ${body.warning}`);
+      onDone();
+    } catch (err) {
+      onError((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const disabled = integration.disabled ?? false;
+
   return (
-    <div className="rounded border bg-background px-2.5 py-2">
+    <div
+      className={cn(
+        "rounded border bg-background px-2.5 py-2",
+        disabled && "opacity-60",
+      )}
+    >
       <div className="flex items-center gap-2 text-sm">
         <ServiceBadge service={integration.service} />
-        <span className="font-medium">{integration.name}</span>
+        <span
+          className={cn(
+            "font-medium",
+            disabled && "line-through decoration-muted-foreground/60",
+          )}
+        >
+          {integration.name}
+        </span>
         <span className="truncate font-mono text-xs text-muted-foreground">
-          {summary}
+          {disabled ? "disabled" : summary}
         </span>
         <button
           type="button"
+          onClick={toggle}
+          disabled={busy !== null}
+          title={disabled ? "Enable integration" : "Disable integration"}
+          className={cn(
+            "ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50",
+            disabled
+              ? "text-muted-foreground"
+              : "text-emerald-600 dark:text-emerald-400",
+          )}
+        >
+          {busy === "toggle" ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <Power className="size-3" />
+          )}
+        </button>
+        <button
+          type="button"
           onClick={onToggleEdit}
-          className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted"
+          className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-muted"
         >
           {editing ? (
             "Close"
@@ -218,10 +278,10 @@ function IntegrationRow({
         <button
           type="button"
           onClick={remove}
-          disabled={busy}
+          disabled={busy !== null}
           className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
         >
-          {busy ? (
+          {busy === "delete" ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Trash2 className="size-3" />
@@ -261,7 +321,8 @@ function summarise(i: Integration): string {
     // workspace this row points at without having to open Edit.
     const team = i.clickup_team_id ? `team ${i.clickup_team_id}` : "no team";
     const key = i.clickup_api_key ? " · key set" : " · no key";
-    return `${team}${key}`;
+    const mode = i.clickup_allow_write ? " · write: on" : " · read-only";
+    return `${team}${key}${mode}`;
   }
   return "";
 }
@@ -331,6 +392,9 @@ function IntegrationForm({
   // cleartext so we can seed it from the existing record on edit.
   const [clickupKey, setClickupKey] = useState("");
   const [clickupTeam, setClickupTeam] = useState(initial?.clickup_team_id ?? "");
+  const [clickupAllowWrite, setClickupAllowWrite] = useState(
+    initial?.clickup_allow_write ?? false,
+  );
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [test, setTest] = useState<TestState>({ status: "idle" });
 
@@ -352,6 +416,7 @@ function IntegrationForm({
         ...base,
         clickup_api_key: clickupKey,
         clickup_team_id: clickupTeam.trim(),
+        clickup_allow_write: clickupAllowWrite,
       };
     }
     return base;
@@ -486,6 +551,8 @@ function IntegrationForm({
           setApiKey={setClickupKey}
           teamId={clickupTeam}
           setTeamId={setClickupTeam}
+          allowWrite={clickupAllowWrite}
+          setAllowWrite={setClickupAllowWrite}
         />
       )}
 
@@ -602,6 +669,8 @@ function ClickUpFields({
   setApiKey,
   teamId,
   setTeamId,
+  allowWrite,
+  setAllowWrite,
 }: {
   mode: "create" | "update";
   existingKeyRedacted?: string;
@@ -609,6 +678,8 @@ function ClickUpFields({
   setApiKey: (v: string) => void;
   teamId: string;
   setTeamId: (v: string) => void;
+  allowWrite: boolean;
+  setAllowWrite: (v: boolean) => void;
 }) {
   return (
     <div className="space-y-2">
@@ -642,6 +713,24 @@ function ClickUpFields({
           autoComplete="off"
         />
       </Field>
+
+      <label className="flex items-start gap-2 rounded-md border bg-muted/30 px-2 py-1.5 text-xs">
+        <input
+          type="checkbox"
+          checked={allowWrite}
+          onChange={(e) => setAllowWrite(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          <span className="font-medium">Allow write operations</span>
+          <span className="ml-1 text-muted-foreground">
+            (off by default — server pins{" "}
+            <span className="font-mono">auditor</span> persona; read-only tools
+            only. Turn on to enable create/update/delete tasks, comments,
+            lists…)
+          </span>
+        </span>
+      </label>
 
       <div className="rounded-md border border-dashed bg-muted/10 px-2 py-1.5 text-[11px] text-muted-foreground">
         <span className="font-medium text-foreground">How to get these:</span>{" "}

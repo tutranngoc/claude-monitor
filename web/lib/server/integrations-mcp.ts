@@ -27,12 +27,18 @@ type IntegrationDisk = {
   id?: string;
   name?: string;
   service?: "slack" | "clickup";
+  // Disabled = parked. Stripped from the spawn map but kept on
+  // disk so re-enable doesn't require re-entering secrets.
+  disabled?: boolean;
   // Slack
   slack_token?: string;
   slack_add_message_tool?: boolean;
   // ClickUp
   clickup_api_key?: string;
   clickup_team_id?: string;
+  // ClickUp — opt-in writes. Default (undefined/false) means
+  // CLICKUP_MCP_PERSONA=auditor → read-only tool surface.
+  clickup_allow_write?: boolean;
 };
 
 type Envelope = {
@@ -98,14 +104,21 @@ function clickupStanza(i: IntegrationDisk): StdioStanza | null {
   const key = i.clickup_api_key?.trim();
   const team = i.clickup_team_id?.trim();
   if (!key || !team) return null;
+  const env: Record<string, string> = {
+    CLICKUP_API_KEY: key,
+    CLICKUP_TEAM_ID: team,
+  };
+  // Read-only is the default — must produce byte-identical env to
+  // the Go side's clickupStanza so the daemon-injected stanza and
+  // the SDK-spawned stanza both narrow to the auditor persona.
+  if (!i.clickup_allow_write) {
+    env.CLICKUP_MCP_PERSONA = "auditor";
+  }
   return {
     type: "stdio",
     command: "npx",
     args: ["-y", "@taazkareem/clickup-mcp-server@latest"],
-    env: {
-      CLICKUP_API_KEY: key,
-      CLICKUP_TEAM_ID: team,
-    },
+    env,
   };
 }
 
@@ -134,6 +147,10 @@ export function getIntegrationsMcpEntries(): Record<string, StdioStanza> {
   const out: Record<string, StdioStanza> = {};
   for (const i of items) {
     if (!i.name) continue;
+    // Parked entry — keep its secrets on disk but don't expose any
+    // tool surface for it. Mirrors the Go side's apply path which
+    // strips the stanza from each account's .claude.json.
+    if (i.disabled) continue;
     const stanza = stanzaFor(i);
     if (stanza) out[i.name] = stanza;
   }

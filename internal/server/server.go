@@ -170,6 +170,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/mcp/connections", s.handleMcpConnectionsCreate)
 	mux.HandleFunc("PUT /api/mcp/connections/{id}", s.handleMcpConnectionsUpdate)
 	mux.HandleFunc("DELETE /api/mcp/connections/{id}", s.handleMcpConnectionsDelete)
+	mux.HandleFunc("POST /api/mcp/connections/{id}/toggle", s.handleMcpConnectionsToggle)
 	mux.HandleFunc("POST /api/mcp/connections/test", s.handleMcpConnectionsTest)
 	// Per-service MCP integrations (Slack, …). Same persistence +
 	// inject pattern as connections, but secrets/auth shapes are
@@ -179,6 +180,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/mcp/integrations", s.handleMcpIntegrationsCreate)
 	mux.HandleFunc("PUT /api/mcp/integrations/{id}", s.handleMcpIntegrationsUpdate)
 	mux.HandleFunc("DELETE /api/mcp/integrations/{id}", s.handleMcpIntegrationsDelete)
+	mux.HandleFunc("POST /api/mcp/integrations/{id}/toggle", s.handleMcpIntegrationsToggle)
 	mux.HandleFunc("POST /api/mcp/integrations/test", s.handleMcpIntegrationsTest)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("POST /api/worktrees", s.handleCreateWorktrees)

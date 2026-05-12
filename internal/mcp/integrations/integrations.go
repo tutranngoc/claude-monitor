@@ -56,6 +56,14 @@ type Integration struct {
 	Name    string  `json:"name"`
 	Service Service `json:"service"`
 
+	// Disabled lets the user park an integration without deleting it
+	// — keeps secrets on disk for re-enable while stripping the
+	// stanza from every account's .claude.json and skipping it in
+	// SDK-spawned sessions. omitempty so the on-disk envelope stays
+	// minimal for the common (enabled) case and legacy records load
+	// as enabled by default.
+	Disabled bool `json:"disabled,omitempty"`
+
 	// Slack — user pastes a single token. We auto-detect xoxp/xoxb
 	// from the prefix and map to the matching SLACK_MCP_*_TOKEN env
 	// var the upstream server reads. Browser-token mode (xoxc + xoxd)
@@ -75,6 +83,14 @@ type Integration struct {
 	// stdio MCP we spawn here. Tokens live in env, not args.
 	ClickUpAPIKey string `json:"clickup_api_key,omitempty"`
 	ClickUpTeamID string `json:"clickup_team_id,omitempty"`
+	// ClickUpAllowWrite opts into the upstream's full tool surface.
+	// Off by default mirrors the Slack pattern (write requires
+	// explicit opt-in). When false we pin
+	// CLICKUP_MCP_PERSONA=auditor so the upstream only registers
+	// read tools. ClickUp's personal API token is workspace-scoped
+	// and has the user's full edit/delete rights — without this
+	// guard, a single misfired tool call could destroy real data.
+	ClickUpAllowWrite bool `json:"clickup_allow_write,omitempty"`
 }
 
 // driverKey is the top-level key in mcp.json. Sibling to "connections".
@@ -218,6 +234,19 @@ func clickupStanza(i Integration) map[string]any {
 	if key == "" || team == "" {
 		return nil
 	}
+	env := map[string]string{
+		"CLICKUP_API_KEY": key,
+		"CLICKUP_TEAM_ID": team,
+	}
+	// Read-only is the default. CLICKUP_MCP_PERSONA=auditor pins
+	// the upstream to the curated read-only tool list (get_task,
+	// list_lists, get_workspace, …) — see the upstream's
+	// docs/reference/personas.md "Auditor" entry. When the user
+	// explicitly opts into writes we omit the env var so all tools
+	// register.
+	if !i.ClickUpAllowWrite {
+		env["CLICKUP_MCP_PERSONA"] = "auditor"
+	}
 	return map[string]any{
 		"type":    "stdio",
 		"command": "npx",
@@ -225,10 +254,7 @@ func clickupStanza(i Integration) map[string]any {
 			"-y",
 			"@taazkareem/clickup-mcp-server@latest",
 		},
-		"env": map[string]string{
-			"CLICKUP_API_KEY": key,
-			"CLICKUP_TEAM_ID": team,
-		},
+		"env": env,
 	}
 }
 
@@ -345,7 +371,15 @@ func ApplyAllToAccounts(rootSpec string, previousNames []string) error {
 		}
 	}
 	for _, i := range all {
-		stanza := i.Stanza()
+		// Disabled = strip from every account's .claude.json. The
+		// record stays on disk (preserving secrets) so a future
+		// toggle-back doesn't require re-entry. Passing nil stanza
+		// to ApplyStanzaToAllAccounts is the same path used by
+		// delete.
+		var stanza map[string]any
+		if !i.Disabled {
+			stanza = i.Stanza()
+		}
 		if err := store.ApplyStanzaToAllAccounts(rootSpec, i.Name, stanza); err != nil {
 			errs = append(errs, err)
 		}
@@ -461,6 +495,37 @@ func DeleteAndApply(rootSpec, id string) (removed Integration, ok bool, applyErr
 		return existing, true, applyLocked(rootSpec, namesOf(prev)), nil
 	}
 	return Integration{}, false, nil, nil
+}
+
+// ToggleAndApply flips the Disabled flag on the integration with the
+// given id and re-applies the full set to every managed account.
+// Returns the resulting record (with the new Disabled value) so the
+// caller can echo it back to the UI. Same lock + non-fatal applyErr
+// semantics as the other *AndApply helpers.
+func ToggleAndApply(rootSpec, id string) (saved Integration, applyErr error, mutateErr error) {
+	mu.Lock()
+	defer mu.Unlock()
+	prev, err := loadAllLocked()
+	if err != nil {
+		return Integration{}, nil, err
+	}
+	idx := -1
+	for i, existing := range prev {
+		if existing.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return Integration{}, nil, fmt.Errorf("integration %q not found", id)
+	}
+	next := make([]Integration, len(prev))
+	copy(next, prev)
+	next[idx].Disabled = !next[idx].Disabled
+	if err := store.Write(driverKey, envelope{Integrations: next}); err != nil {
+		return Integration{}, nil, fmt.Errorf("write integrations: %w", err)
+	}
+	return next[idx], applyLocked(rootSpec, namesOf(prev)), nil
 }
 
 func loadAllLocked() ([]Integration, error) {

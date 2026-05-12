@@ -99,6 +99,35 @@ func (s *Server) handleMcpIntegrationsUpdate(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// handleMcpIntegrationsToggle flips the integration's Disabled flag
+// and re-applies the full set. UI uses this to park an integration
+// (strip from all accounts) without losing the configured secrets.
+func (s *Server) handleMcpIntegrationsToggle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
+		return
+	}
+	saved, applyErr, mutateErr := integrations.ToggleAndApply(s.rootSpec, id)
+	if mutateErr != nil {
+		if strings.Contains(mutateErr.Error(), "not found") {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": mutateErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": mutateErr.Error()})
+		return
+	}
+	var warning string
+	if applyErr != nil {
+		s.logger.Warn("integrations toggle apply failed", "err", applyErr)
+		warning = applyErr.Error()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"integration": saved.Redacted(),
+		"warning":     warning,
+	})
+}
+
 func (s *Server) handleMcpIntegrationsDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {

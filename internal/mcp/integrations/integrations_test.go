@@ -197,6 +197,33 @@ func TestStanza_ClickUp(t *testing.T) {
 	}
 }
 
+func TestStanza_ClickUp_DefaultsToReadOnly(t *testing.T) {
+	in := Integration{
+		Name:          "tasks",
+		Service:       ServiceClickUp,
+		ClickUpAPIKey: "pk_x",
+		ClickUpTeamID: "1",
+	}
+	env, _ := in.Stanza()["env"].(map[string]string)
+	if env["CLICKUP_MCP_PERSONA"] != "auditor" {
+		t.Fatalf("expected auditor persona by default, got %#v", env)
+	}
+}
+
+func TestStanza_ClickUp_AllowWriteOmitsPersona(t *testing.T) {
+	in := Integration{
+		Name:              "tasks",
+		Service:           ServiceClickUp,
+		ClickUpAPIKey:     "pk_x",
+		ClickUpTeamID:     "1",
+		ClickUpAllowWrite: true,
+	}
+	env, _ := in.Stanza()["env"].(map[string]string)
+	if _, has := env["CLICKUP_MCP_PERSONA"]; has {
+		t.Fatalf("expected no persona when allow_write=true, got %#v", env)
+	}
+}
+
 func TestStanza_ClickUp_MissingFieldsYieldNil(t *testing.T) {
 	if s := (Integration{Name: "tasks", Service: ServiceClickUp, ClickUpTeamID: "1"}).Stanza(); s != nil {
 		t.Fatalf("expected nil stanza for missing key, got %#v", s)
@@ -224,6 +251,47 @@ func TestRedacted_ClickUp(t *testing.T) {
 	// edit form can prefill it without making the user re-enter.
 	if r.ClickUpTeamID != in.ClickUpTeamID {
 		t.Fatalf("team id should not be redacted: got %q want %q", r.ClickUpTeamID, in.ClickUpTeamID)
+	}
+}
+
+func TestToggle_FlipsDisabledFlag(t *testing.T) {
+	setupHome(t)
+	saved, _, mErr := CreateAndApply("", Integration{
+		Name:       "team",
+		Service:    ServiceSlack,
+		SlackToken: "xoxp-abc-def",
+	})
+	if mErr != nil {
+		t.Fatalf("create: %v", mErr)
+	}
+	if saved.Disabled {
+		t.Fatalf("new integration should not start disabled")
+	}
+	flipped, _, mErr := ToggleAndApply("", saved.ID)
+	if mErr != nil {
+		t.Fatalf("toggle: %v", mErr)
+	}
+	if !flipped.Disabled {
+		t.Fatalf("expected disabled=true after first toggle")
+	}
+	// Secret must still be present after toggle — that's the whole
+	// point of "park, don't delete".
+	if flipped.SlackToken != "xoxp-abc-def" {
+		t.Fatalf("toggle clobbered secret: %q", flipped.SlackToken)
+	}
+	flippedBack, _, mErr := ToggleAndApply("", saved.ID)
+	if mErr != nil {
+		t.Fatalf("toggle back: %v", mErr)
+	}
+	if flippedBack.Disabled {
+		t.Fatalf("expected disabled=false after second toggle")
+	}
+}
+
+func TestToggle_UnknownIDErrors(t *testing.T) {
+	setupHome(t)
+	if _, _, err := ToggleAndApply("", "no-such-id"); err == nil {
+		t.Fatalf("expected error for unknown id")
 	}
 }
 
